@@ -43,6 +43,7 @@
 #include "BodySchema.h"
 #include "BehaviorEngine.h"
 #include "ReflexiveControl.h"  // NEW: Reflexive tracking layer
+#include "AIBridge.h"          // AI serial command integration
 
 // ============================================
 // VISION DATA STRUCTURES (PACKAGE 3)
@@ -96,6 +97,7 @@ ServoController servoController;
 AnimationController animator(servoController);
 BehaviorEngine behaviorEngine;
 ReflexiveControl reflexController;  // NEW: Reflexive tracking layer
+AIBridge aiBridge;                  // AI serial command bridge
 
 // Face tracking mode toggle
 bool faceTrackingMode = false;
@@ -455,7 +457,11 @@ void setup() {
   
   Serial.println("  ✓ Behavior engine ready");
   delay(100);
-  
+
+  // Initialize AI Bridge
+  aiBridge.init(&behaviorEngine, &servoController, &animator, &reflexController);
+  Serial.println("  ✓ AI Bridge initialized (use ! prefix for AI commands)");
+
   // Checkpoint 7
   Serial.println("[7/8] Performing startup animation...");
   Serial.flush();
@@ -855,6 +861,9 @@ void loop() {
     lastSave = now;
   }
 
+  // AI Bridge: Send streaming state if enabled (every 500ms)
+  aiBridge.updateStreaming();
+
   // ═══════════════════════════════════════════════════════════════
   // LOOP RATE LIMITING: Match Teensy's natural throttling
   // ═══════════════════════════════════════════════════════════════
@@ -1053,6 +1062,18 @@ void serialEvent() {
         printHelp();
         break;
 
+      case '!':
+        {
+          // AI Bridge command - read rest of line with short timeout
+          unsigned long savedTimeout = Serial.getTimeout();
+          Serial.setTimeout(100);
+          String cmdLine = Serial.readStringUntil('\n');
+          Serial.setTimeout(savedTimeout);
+          cmdLine.trim();
+          aiBridge.handleCommand(cmdLine.c_str());
+        }
+        break;
+
       default:
         Serial.println("Unknown command. Press 'h' for help.");
         break;
@@ -1244,6 +1265,16 @@ void printHelp() {
   Serial.println("        (Tracking only, no behavior system)");
   Serial.println("");
   Serial.println("  h/H - Show this help menu");
+  Serial.println("");
+  Serial.println("AI BRIDGE (prefix !):");
+  Serial.println("  !QUERY            - Get state JSON");
+  Serial.println("  !LOOK:base,nod    - Move servos");
+  Serial.println("  !SATISFY:need,amt - Satisfy need");
+  Serial.println("  !PRESENCE         - Detect human");
+  Serial.println("  !EXPRESS:emotion  - Express emotion");
+  Serial.println("  !NOD:count        - Nod yes");
+  Serial.println("  !SHAKE:count      - Shake no");
+  Serial.println("  !STREAM:on/off    - Toggle streaming");
   Serial.println("════════════════════════════════════\n");
 }
 
