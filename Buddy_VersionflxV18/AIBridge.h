@@ -191,7 +191,8 @@ private:
         style.speed = 0.5;
         style.smoothness = 0.8;
         style.amplitude = 1.0;
-        style.jitter = 0.0;
+        style.directness = 0.8;
+        style.hesitation = 0.0;
       }
 
       int currentBase, currentNod, currentTilt;
