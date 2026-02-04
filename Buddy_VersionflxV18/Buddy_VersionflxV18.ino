@@ -588,8 +588,12 @@ void loop() {
       int baseAngle = servoController.getBasePos();
       int nodAngle = servoController.getNodPos();
 
-      // Update behavior engine (this drives everything)
-      behaviorEngine.update(distance, baseAngle, nodAngle);
+      // Skip behavior engine during AI looping animations to prevent
+      // smoothMoveTo blocking the loop and fighting with directWrite
+      if (!aiBridge.isAIAnimating()) {
+        // Update behavior engine (this drives everything)
+        behaviorEngine.update(distance, baseAngle, nodAngle);
+      }
       behaviorTime = micros() - behaviorStart;
 
       // NEW: Check reflex timeout (disables reflex if no face data)
@@ -860,6 +864,9 @@ void loop() {
     behaviorEngine.saveState();
     lastSave = now;
   }
+
+  // AI Bridge: Update looping animations (THINKING/SPEAKING) at 20Hz
+  aiBridge.updateLoopingAnimation();
 
   // AI Bridge: Send streaming state if enabled (every 500ms)
   aiBridge.updateStreaming();
@@ -1269,11 +1276,20 @@ void printHelp() {
   Serial.println("AI BRIDGE (prefix !):");
   Serial.println("  !QUERY            - Get state JSON");
   Serial.println("  !LOOK:base,nod    - Move servos");
+  Serial.println("  !ATTENTION:dir    - Look direction");
   Serial.println("  !SATISFY:need,amt - Satisfy need");
   Serial.println("  !PRESENCE         - Detect human");
   Serial.println("  !EXPRESS:emotion  - Express emotion");
   Serial.println("  !NOD:count        - Nod yes");
   Serial.println("  !SHAKE:count      - Shake no");
+  Serial.println("  !LISTENING        - Attentive pose");
+  Serial.println("  !THINKING         - Pondering loop");
+  Serial.println("  !STOP_THINKING    - Stop pondering");
+  Serial.println("  !SPEAKING         - Speaking loop");
+  Serial.println("  !STOP_SPEAKING    - Stop speaking");
+  Serial.println("  !ACKNOWLEDGE      - Quick nod");
+  Serial.println("  !CELEBRATE        - Happy bounce");
+  Serial.println("  !IDLE             - Return to normal");
   Serial.println("  !STREAM:on/off    - Toggle streaming");
   Serial.println("════════════════════════════════════\n");
 }
