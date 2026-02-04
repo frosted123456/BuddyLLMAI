@@ -394,7 +394,12 @@ public:
   void enable() {
     state.shouldBeActive = true;
     if (!state.active) {
-      state.active = true;
+      // Only actually activate if we have recent face data
+      // Otherwise, updateFaceData() will activate when fresh data arrives
+      unsigned long now = millis();
+      if (state.lastFaceTime > 0 && (now - state.lastFaceTime) < 2000) {
+        state.active = true;
+      }
     }
   }
 
@@ -421,12 +426,20 @@ public:
     }
     lastCheck = now;
 
-    // Original timeout logic
-    if (state.lastFaceTime > 0) {
-      unsigned long timeSinceFace = now - state.lastFaceTime;
-      if (timeSinceFace > 2000) {  // 2000ms (2 second) timeout - allows tolerance during tracking
-        state.active = false;
-      }
+    // No face data ever received - should not be active
+    if (state.lastFaceTime == 0) {
+      Serial.println("[REFLEX] Timeout: active with no face data, disabling");
+      state.active = false;
+      state.shouldBeActive = false;
+      return;
+    }
+
+    // Face data timeout - no fresh data for 2 seconds
+    unsigned long timeSinceFace = now - state.lastFaceTime;
+    if (timeSinceFace > 2000) {
+      Serial.println("[REFLEX] Timeout: no face data for 2s, disabling");
+      state.active = false;
+      state.shouldBeActive = false;  // Prevent behavior system from re-enabling
     }
   }
 
