@@ -75,9 +75,9 @@
 #define REFERENCE_FACE_WIDTH 55.0        // Reference face size for depth scaling
 
 // Stale data detection (PRESERVED from original - critical for Pi)
-#define STALE_DATA_THRESHOLD 3           // Pixel change threshold
-#define STALE_DATA_TIMEOUT_MS 300        // Max time without coordinate change
-#define STALE_DATA_MAX_COUNT 5           // Max consecutive stale updates
+#define STALE_DATA_THRESHOLD 6           // Pixel change threshold
+#define STALE_DATA_TIMEOUT_MS 600        // Max time without coordinate change
+#define STALE_DATA_MAX_COUNT 10          // Max consecutive stale updates
 
 
 // ============================================================================

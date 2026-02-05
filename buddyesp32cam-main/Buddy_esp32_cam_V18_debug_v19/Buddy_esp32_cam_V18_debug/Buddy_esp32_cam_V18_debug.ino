@@ -140,6 +140,16 @@
 #include "esp_task_wdt.h"    // Watchdog timer control
 #include "esp_heap_caps.h"   // Heap/PSRAM monitoring
 
+// ============================================
+// TEENSY COMMUNICATION SERIAL (UART1)
+// ============================================
+// ESP32 TX (GPIO43) -> Teensy RX1 (pin 0)
+// ESP32 RX (GPIO44) -> Teensy TX1 (pin 1)
+// Common GND required
+#define TEENSY_TX_PIN 43
+#define TEENSY_RX_PIN 44
+HardwareSerial TeensySerial(1);
+
 using eloq::camera;
 using eloq::face::detection;
 
@@ -493,6 +503,12 @@ void setup() {
   Serial.begin(SERIAL_BAUD);
   delay(2000);
 
+  // Initialize Teensy UART communication
+  TeensySerial.begin(SERIAL_BAUD, SERIAL_8N1, TEENSY_RX_PIN, TEENSY_TX_PIN);
+  delay(100);
+  TeensySerial.println("ESP32_READY");
+  Serial.println("Teensy UART initialized (TX:43, RX:44)");
+
   Serial.println("\n╔════════════════════════════════════════╗");
   Serial.println("║  BUDDY ESP32-CAM v8.1.0               ║");
   Serial.println("║  Face Detection + HTTP Server         ║");
@@ -769,28 +785,40 @@ void loop() {
   }
   
   // ═══════════════════════════════════════════════════════
+  // READ COMMANDS FROM TEENSY
+  // ═══════════════════════════════════════════════════════
+  while (TeensySerial.available()) {
+    String cmd = TeensySerial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "TEENSY_READY") {
+      Serial.println("[TEENSY] Connected and ready");
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════
   // OUTPUT @ 50Hz (every 20ms)
   // ═══════════════════════════════════════════════════════
   if (now - lastOutputTime >= OUTPUT_INTERVAL_MS) {
     lastOutputTime = now;
     messageCounter++;
-    
+
     // Calculate simple velocity
     int vx = 0, vy = 0;
     state.getVelocity(vx, vy);
-    
+
     // Format output
     char buffer[80];
     if (state.facePresent && state.confidence >= MIN_OUTPUT_CONFIDENCE) {
       snprintf(buffer, sizeof(buffer), "FACE:%d,%d,%d,%d,%d,%d,%d,%lu",
                state.x, state.y, vx, vy,
-               state.w, state.h, 
+               state.w, state.h,
                state.confidence, messageCounter);
     } else {
       snprintf(buffer, sizeof(buffer), "NO_FACE,%lu", messageCounter);
     }
-    
-    Serial.println(buffer);
+
+    TeensySerial.println(buffer);  // Face data to Teensy via UART
+    Serial.println(buffer);        // Debug copy to USB
 
     // Periodic health stats with memory monitoring
     static unsigned long lastHealthLog = 0;

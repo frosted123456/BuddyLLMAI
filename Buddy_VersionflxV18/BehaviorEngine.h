@@ -60,6 +60,9 @@ struct PersonRecord {
 #include "GoalFormation.h"   // NEW
 #include "OutcomeCalculator.h"  // PACKAGE 4: Standardized outcome measurement
 #include "ReflexiveControl.h"   // PHASE 3: Reflexive tracking layer
+#include "ConsciousnessLayer.h"
+#include "ConsciousnessManifest.h"
+#include "AmbientLife.h"
 
 // ============================================
 // DEBUG CONFIGURATION
@@ -84,6 +87,9 @@ private:
   EpisodicMemory episodicMemory;  // NEW
   GoalFormation goalSystem;       // NEW
   OutcomeCalculator outcomeCalc;  // PACKAGE 4: Standardized outcome measurement
+  ConsciousnessLayer consciousness;
+  ConsciousnessManifest consciousnessManifest;
+  AmbientLife ambientLife;
 
   AnimationController* animator;
   ServoController* servoController;
@@ -881,6 +887,41 @@ public:
       }
 
       performFaceTracking();  // Note: This already has internal reflex check
+
+      // === CONSCIOUSNESS MANIFESTATION ===
+      if (servoController != nullptr) {
+        // Wondering state (very rare, existential)
+        if (consciousness.isWondering()) {
+          consciousnessManifest.manifestWondering(
+              consciousness.getWonderingType(),
+              consciousness.getWonderingIntensity(),
+              *servoController, emotion, personality, needs);
+        }
+        // Conflict visible as false starts
+        else if (consciousness.shouldShowFalseStart()) {
+          consciousnessManifest.manifestConflict(
+              consciousness.getConflict(),
+              *servoController, bodySchema, emotion, personality, needs);
+        }
+        // Counterfactual thinking (subtle replays)
+        else if (consciousness.isCounterfactualThinking() && currentBehavior == IDLE) {
+          consciousnessManifest.manifestCounterfactual(
+              consciousness.getCounterfactual(),
+              *servoController, currentDirection);
+        }
+        // Meta-awareness catch
+        if (consciousness.didCatchMyself()) {
+          consciousnessManifest.manifestMetaCatch(
+              *servoController, emotion, personality, needs);
+        }
+      }
+    }
+
+    // Ambient life (need-driven, not timer-driven)
+    if (!reflexIsActive && !isTrackingFace &&
+        (animator == nullptr || !animator->isCurrentlyAnimating()) &&
+        servoController != nullptr) {
+      ambientLife.update(needs, emotion, personality, *servoController, now);
     }
 
     checkFaceTrackingTimeout();
@@ -905,6 +946,10 @@ public:
     BehaviorScore scores[8];
     int numBehaviors = behaviorSelector.scoreAllBehaviors(needs, personality, emotion,
                                                            spatialMemory, currentDirection, scores);
+
+    // Update consciousness with behavior scores
+    consciousness.update(scores, numBehaviors, needs, emotion, personality,
+                          spatialMemory, dt);
 
     Behavior selected = behaviorSelector.selectBehavior(scores, numBehaviors);
 
@@ -962,6 +1007,21 @@ public:
     if (goalSystem.shouldFormGoal(currentBehavior, emotion, personality,
                                    spatialMemory.getTotalNovelty(), needs.getSocial())) {
       formAppropriateGoal();
+    }
+
+    // Chance of counterfactual thinking after behavior outcome
+    if (behaviorUncertainty > 0.4 && random(100) < 15) {
+      float outcome = calculateBehaviorOutcome();
+      consciousness.triggerCounterfactual(currentBehavior,
+                                           consciousness.getSuppressedDrive(),
+                                           outcome);
+    }
+
+    // Record significant actions in narrative
+    if (currentBehavior != IDLE && currentBehavior != REST &&
+        currentBehavior != previousBehavior) {
+      float outcome = calculateBehaviorOutcome();
+      consciousness.recordSignificantAction(currentBehavior, outcome);
     }
   }
   
@@ -1673,8 +1733,13 @@ public:
       animator->getCurrentPose().print();
     }
 
+    consciousness.printDiagnostics();
+
     Serial.println("\n═══════════════════════════════════════\n");
   }
+
+  // Getter for consciousness layer (used by AIBridge)
+  ConsciousnessLayer& getConsciousness() { return consciousness; }
 
   const char* behaviorToString(Behavior b) {
     switch(b) {

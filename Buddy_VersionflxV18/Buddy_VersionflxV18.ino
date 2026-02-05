@@ -141,8 +141,8 @@ unsigned long lastFaceDataTime = 0;
 // FACE DETECTION HANDLER (PACKAGE 5: With Face Tracking)
 // ============================================
 void handleFaceDetection() {
-  // Only process if confidence is reasonable
-  if (currentFace.confidence < 60) {
+  // Only process if confidence is reasonable (lowered to accept histogram tracking)
+  if (currentFace.confidence < 30) {
     return;  // Too uncertain
   }
 
@@ -221,120 +221,89 @@ void handleFaceDetection() {
 }
 
 // ============================================
-// VISION DATA PARSER (PACKAGE 3) - Optimized with error handling
+// VISION DATA PARSER (PACKAGE 3) - Buffer-draining version
+// Reads ALL buffered messages and only processes the latest
 // ============================================
 void parseVisionData() {
   if (!ESP32_SERIAL.available()) return;
 
-  // Use char buffer instead of String to reduce heap fragmentation
   static char buffer[128];
-  int len = ESP32_SERIAL.readBytesUntil('\n', buffer, sizeof(buffer) - 1);
+  static char latestFace[128];
+  bool gotFace = false;
+  bool gotNoFace = false;
 
-  if (len == 0) return;
+  // Drain buffer — read all available, keep latest
+  while (ESP32_SERIAL.available()) {
+    int len = ESP32_SERIAL.readBytesUntil('\n', buffer, sizeof(buffer) - 1);
+    if (len == 0) continue;
+    buffer[len] = '\0';
 
-  buffer[len] = '\0';  // Null terminate
+    esp32LastMessage = millis();
+    esp32MessageCount++;
 
-  // Update health tracking
-  esp32LastMessage = millis();
-  esp32MessageCount++;
-
-  // Parse different message types from ESP32-S3
-  if (strncmp(buffer, "FACE:", 5) == 0) {
-    // ESP32 v7.2.1 FORMAT: FACE:x,y,vx,vy,w,h,conf,seq
-    // Example: FACE:120,100,5,-3,45,50,85,42
-    // Fields: x, y, velocity_x, velocity_y, width, height, confidence, sequence
-
-    int x, y, vx, vy, w, h, conf;
-    unsigned long sequence = 0;
-
-    int parsed = sscanf(buffer + 5, "%d,%d,%d,%d,%d,%d,%d,%lu",
-                        &x, &y, &vx, &vy, &w, &h, &conf, &sequence);
-
-    // Expect 8 fields (x, y, vx, vy, w, h, conf, seq)
-    if (parsed == 8) {
-      // Validate ranges
-      if (x >= 0 && x <= 240 && y >= 0 && y <= 240 &&
-          w >= 0 && w <= 240 && h >= 0 && h <= 240 &&
-          conf >= 0 && conf <= 100) {
-
-        // Map ESP32 v7.2.1 data to Teensy structure
-        currentFace.x = x;
-        currentFace.y = y;
-        currentFace.size = w;  // Use width as face size
-        currentFace.confidence = conf;
-        currentFace.personID = -1;  // Unknown person (no recognition yet)
-
-        // Estimate distance from face width (same formula as handleFaceDetection)
-        if (w > 80) {
-          currentFace.distance = 30;  // Very close
-        } else if (w > 60) {
-          currentFace.distance = 50;  // Close
-        } else if (w > 40) {
-          currentFace.distance = 80;  // Medium
-        } else {
-          currentFace.distance = 120;  // Far
-        }
-
-        currentFace.timestamp = millis();  // Use Teensy timestamp
-        currentFace.sequence = sequence;
-        currentFace.detected = true;
-        currentFace.lastSeen = millis();
-
-        // Note: vx, vy from ESP32 are ignored - ReflexiveControl calculates its own velocity
-
-        // Update reflexive layer with face data
-        reflexController.updateFaceData(x, y, w, currentFace.distance);
-        reflexController.updateConfidence(conf);  // v6.0: Pass confidence for adaptive control
-
-        // ═══════════════════════════════════════════════════════════════
-        // CRITICAL: Mark that we received FRESH face data
-        // This prevents reflex from moving on stale data
-        // ═══════════════════════════════════════════════════════════════
-        freshFaceDataReceived = true;
-        lastFaceDataTime = millis();
-
-        // Trigger social behaviors
-        handleFaceDetection();
-      } else {
-        esp32ParseErrors++;
-      }
-    } else {
-      esp32ParseErrors++;
+    if (strncmp(buffer, "FACE:", 5) == 0) {
+      memcpy(latestFace, buffer, len + 1);
+      gotFace = true;
+      gotNoFace = false;  // FACE after NO_FACE overrides
+    }
+    else if (strncmp(buffer, "NO_FACE", 7) == 0) {
+      gotNoFace = true;
+      gotFace = false;  // NO_FACE after FACE overrides
+    }
+    else if (strncmp(buffer, "ESP32_READY", 11) == 0 || strncmp(buffer, "READY", 5) == 0) {
+      Serial.println("[VISION] ESP32-S3 connected");
     }
   }
-  else if (strncmp(buffer, "REFLEX:", 7) == 0) {
-    // Format: REFLEX:BASE,NOD - not used (handled in main loop)
-    // Kept for backward compatibility
-  }
-  else if (strncmp(buffer, "FACE_LOST", 9) == 0) {
-    // Face completely lost (triggers reflex disable)
+
+  // Process final state
+  if (gotNoFace) {
     if (currentFace.detected) {
       currentFace.detected = false;
       reflexController.faceLost();
       behaviorEngine.stopFaceTracking();
       behaviorEngine.endPersonInteraction();
     }
+    return;
   }
-  else if (strncmp(buffer, "NO_FACE", 7) == 0) {
-    // Lost face tracking
-    if (currentFace.detected) {
-      currentFace.detected = false;
-      behaviorEngine.stopFaceTracking();
-      behaviorEngine.endPersonInteraction();
-    }
-  }
-  else if (strncmp(buffer, "SEARCHING", 9) == 0) {
-    // ESP32 searching for face (optional handling - no logging to reduce spam)
-  }
-  else if (strncmp(buffer, "MOTION:", 7) == 0) {
-    // Motion detection from histogram changes - could trigger investigation
-  }
-  else if (strncmp(buffer, "ESP32_READY", 11) == 0) {
-    Serial.println("[VISION] ESP32-S3 connected");
-  }
-  else if (strncmp(buffer, "READY", 5) == 0) {
-    Serial.println("[VISION] ESP32-S3 connected");
-  }
+
+  if (!gotFace) return;
+
+  // Parse latest FACE message
+  int x, y, vx, vy, w, h, conf;
+  unsigned long sequence = 0;
+  int parsed = sscanf(latestFace + 5, "%d,%d,%d,%d,%d,%d,%d,%lu",
+                      &x, &y, &vx, &vy, &w, &h, &conf, &sequence);
+
+  if (parsed != 8) { esp32ParseErrors++; return; }
+
+  if (x < 0 || x > 240 || y < 0 || y > 240 ||
+      w < 0 || w > 240 || h < 0 || h > 240 ||
+      conf < 0 || conf > 100) { esp32ParseErrors++; return; }
+
+  // Update face data
+  currentFace.x = x;
+  currentFace.y = y;
+  currentFace.size = w;
+  currentFace.confidence = conf;
+  currentFace.personID = -1;
+
+  if (w > 80) currentFace.distance = 30;
+  else if (w > 60) currentFace.distance = 50;
+  else if (w > 40) currentFace.distance = 80;
+  else currentFace.distance = 120;
+
+  currentFace.timestamp = millis();
+  currentFace.sequence = sequence;
+  currentFace.detected = true;
+  currentFace.lastSeen = millis();
+
+  reflexController.updateFaceData(x, y, w, currentFace.distance);
+  reflexController.updateConfidence(conf);
+
+  freshFaceDataReceived = true;
+  lastFaceDataTime = millis();
+
+  handleFaceDetection();
 }
 
 // ============================================

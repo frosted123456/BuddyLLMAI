@@ -148,9 +148,15 @@ teensy_state = {
     "emotion": "NEUTRAL", "behavior": "IDLE",
     "stimulation": 0.5, "social": 0.5, "energy": 0.7,
     "safety": 0.8, "novelty": 0.3, "tracking": False,
-    "servoBase": 90, "servoNod": 115, "servoTilt": 85
+    "servoBase": 90, "servoNod": 115, "servoTilt": 85,
+    "epistemic": "confident", "tension": 0.0,
+    "wondering": False, "selfAwareness": 0.5
 }
 teensy_state_lock = threading.Lock()
+
+# Adaptive noise floor for wake word
+noise_floor = 500
+NOISE_FLOOR_ALPHA = 0.01
 
 # =============================================================================
 # HTML TEMPLATE
@@ -627,7 +633,7 @@ def init_wake_word():
         return False
 
 def wake_word_loop():
-    global wake_word_running, recorder, porcupine
+    global wake_word_running, recorder, porcupine, noise_floor
     if not init_wake_word(): return
     socketio.emit('wake_word_status', {'enabled': True, 'word': CONFIG["wake_word"]})
     try:
@@ -639,6 +645,9 @@ def wake_word_loop():
                 pcm = recorder.read()
                 if pcm:
                     level = max(abs(min(pcm)), abs(max(pcm)))
+                    # Adapt noise floor during non-speech
+                    if level < noise_floor * 2:
+                        noise_floor = noise_floor * (1 - NOISE_FLOOR_ALPHA) + level * NOISE_FLOOR_ALPHA
                     socketio.emit('audio_level', {'level': level})
                 if porcupine.process(pcm) >= 0:
                     socketio.emit('wake_word_detected')
@@ -653,20 +662,22 @@ def wake_word_loop():
         if recorder: recorder.stop()
 
 def record_and_process():
-    global recorder
+    global recorder, noise_floor
     frames, silent_frames, speech_started, pre_speech_count = [], 0, False, 0
     sr = 16000
     fps = sr / 512
     silence_needed = int(CONFIG["silence_duration"] * fps)
     max_frames = int(CONFIG["max_recording_time"] * fps)
     pre_speech_max = int(CONFIG["pre_speech_timeout"] * fps)
+    # Adaptive silence threshold based on noise floor
+    adaptive_threshold = max(noise_floor * 3, 300)
     try:
         while True:
             frame = recorder.read()
             frames.extend(frame)
             amp = max(abs(min(frame)), abs(max(frame)))
             socketio.emit('audio_level', {'level': amp})
-            if amp > CONFIG["silence_threshold"]: speech_started = True; silent_frames = 0
+            if amp > adaptive_threshold: speech_started = True; silent_frames = 0
             else:
                 if speech_started: silent_frames += 1
                 else: pre_speech_count += 1
@@ -685,8 +696,11 @@ def record_and_process():
             lang = CONFIG["whisper_language"]
             r = whisper_model.transcribe(wp, fp16=False) if lang == "auto" else whisper_model.transcribe(wp, fp16=False, language=lang)
             text = r["text"].strip()
-            if text and len(text) > 2: process_input(text, True)
-            else: socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
+            if text and len(text) > 2:
+                # Hand off to thread so wake word loop resumes immediately
+                threading.Thread(target=lambda: process_input(text, True), daemon=True).start()
+            else:
+                socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
         finally: os.unlink(wp)
     except Exception as e:
         socketio.emit('log', {'message': f'Record error: {e}', 'level': 'error'})
@@ -731,10 +745,54 @@ def transcribe_audio(data):
 def get_buddy_state_prompt():
     with teensy_state_lock: s = teensy_state.copy()
     if not teensy_connected: return "Note: Unable to read emotional state."
-    ad = "calm" if s['arousal'] < 0.5 else "alert" if s['arousal'] < 0.7 else "energetic"
-    vd = "negative" if s['valence'] < 0 else "neutral" if s['valence'] < 0.3 else "positive"
-    ed = "tired" if s['energy'] < 0.5 else "normal" if s['energy'] < 0.7 else "energetic"
-    return f"State: {s['emotion']} ({ad}, {vd}), energy {ed}, {'tracking face' if s['tracking'] else s['behavior'].lower()}"
+
+    # Arousal description
+    if s['arousal'] < 0.3: ad = "very calm, almost sleepy"
+    elif s['arousal'] < 0.5: ad = "calm and relaxed"
+    elif s['arousal'] < 0.7: ad = "alert and attentive"
+    else: ad = "energetic and excited"
+
+    # Valence description
+    if s['valence'] < -0.3: vd = "feeling quite negative"
+    elif s['valence'] < 0: vd = "slightly uneasy"
+    elif s['valence'] < 0.3: vd = "feeling neutral"
+    elif s['valence'] < 0.6: vd = "feeling positive"
+    else: vd = "feeling very happy"
+
+    # Energy
+    if s['energy'] < 0.3: ed = "tired and low energy"
+    elif s['energy'] < 0.6: ed = "moderate energy"
+    else: ed = "full of energy"
+
+    # Consciousness states
+    epistemic = s.get('epistemic', 'confident')
+    tension = s.get('tension', 0.0)
+    is_wondering = s.get('wondering', False)
+    self_awareness = s.get('selfAwareness', 0.5)
+
+    parts = [
+        f"Emotional state: {s['emotion']} — {ad}, {vd}",
+        f"Energy: {ed}",
+        f"Currently: {'tracking a face' if s['tracking'] else s['behavior'].lower()}",
+    ]
+
+    if is_wondering:
+        parts.append("You are in a contemplative, wondering state — feeling philosophical")
+    if tension > 0.4:
+        parts.append(f"You feel conflicted inside (tension: {tension:.0%}) — torn between impulses")
+    if epistemic == 'confused':
+        parts.append("You're confused about what's happening around you")
+    elif epistemic == 'learning':
+        parts.append("You're actively trying to figure something out")
+    if self_awareness > 0.7:
+        parts.append("You're very self-aware right now, noticing your own thoughts")
+
+    if s['social'] > 0.7:
+        parts.append("You've been lonely and really want to talk")
+    if s['stimulation'] < 0.3:
+        parts.append("You've been bored and craving something interesting")
+
+    return "\n".join(parts)
 
 def query_ollama(text, img=None):
     state_info = get_buddy_state_prompt()
@@ -811,6 +869,11 @@ def process_input(text, include_vision):
         # Schedule cleanup after speech likely finishes
         def finish_speaking():
             time.sleep(speech_duration)
+            # Drain mic buffer to prevent echo self-trigger
+            if recorder:
+                for _ in range(5):
+                    try: recorder.read()
+                    except: break
             teensy_send_command("STOP_SPEAKING")
             teensy_send_command("IDLE")
             # Occasionally celebrate if mood is good

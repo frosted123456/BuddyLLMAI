@@ -267,6 +267,26 @@ private:
     Serial.print(nod);
     Serial.print(",\"servoTilt\":");
     Serial.print(tilt);
+
+    // Consciousness state
+    ConsciousnessLayer& consciousness = engine->getConsciousness();
+    Serial.print(",\"epistemic\":\"");
+    switch(consciousness.getEpistemicState()) {
+        case EPIST_CONFIDENT: Serial.print("confident"); break;
+        case EPIST_UNCERTAIN: Serial.print("uncertain"); break;
+        case EPIST_CONFUSED: Serial.print("confused"); break;
+        case EPIST_LEARNING: Serial.print("learning"); break;
+        case EPIST_CONFLICTED: Serial.print("conflicted"); break;
+        case EPIST_WONDERING: Serial.print("wondering"); break;
+    }
+    Serial.print("\"");
+    Serial.print(",\"tension\":");
+    Serial.print(consciousness.getTension(), 2);
+    Serial.print(",\"wondering\":");
+    Serial.print(consciousness.isWondering() ? "true" : "false");
+    Serial.print(",\"selfAwareness\":");
+    Serial.print(consciousness.getSelfAwareness(), 2);
+
     Serial.println("}");
   }
 
