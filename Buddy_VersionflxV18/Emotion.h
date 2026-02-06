@@ -132,6 +132,21 @@ public:
                      arousalVelocity * arousalVelocity);
     intensity += abs(valence) * 0.3 + abs(arousal - 0.5) * 0.3;
     
+    // Emotional momentum — strong emotions resist change
+    float emotionalMagnitude = sqrt(arousal * arousal + valence * valence);
+    if (emotionalMagnitude > 0.7) {
+      arousalVelocity *= 0.6;
+      valenceVelocity *= 0.6;
+    }
+
+    // Emotional settling — after big change, small oscillation
+    static float prevArousalVal = 0.5;
+    float arousalDelta = abs(arousal - prevArousalVal);
+    if (arousalDelta > 0.15) {
+      arousalVelocity += (arousal - prevArousalVal) * 0.05;
+    }
+    prevArousalVal = arousal;
+
     // Clamp values
     arousal = constrain(arousal, 0.0, 1.0);
     valence = constrain(valence, -1.0, 1.0);
