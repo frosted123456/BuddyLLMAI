@@ -83,7 +83,12 @@ CONFIG = {
     "teensy_baud": 115200,
     "teensy_auto_detect": True,
     "teensy_state_poll_interval": 1.0,
-    
+
+    # Spontaneous Speech
+    "spontaneous_speech_enabled": True,
+    "spontaneous_max_per_hour": 6,
+    "spontaneous_min_gap": 120,  # seconds
+
     # System Prompt
     "system_prompt": """You are Buddy, a small curious desk robot with a camera and expressive head movements.
 
@@ -157,6 +162,14 @@ teensy_state_lock = threading.Lock()
 # Adaptive noise floor for wake word
 noise_floor = 500
 NOISE_FLOOR_ALPHA = 0.01
+
+# Spontaneous speech engine
+spontaneous_speech_enabled = True
+spontaneous_speech_lock = threading.Lock()
+spontaneous_utterance_log = []  # List of timestamps for rate limiting
+SPONTANEOUS_MAX_PER_HOUR = 6
+SPONTANEOUS_MIN_GAP_SECONDS = 120  # 2 minutes between utterances
+last_spontaneous_utterance = 0
 
 # =============================================================================
 # HTML TEMPLATE
@@ -553,7 +566,11 @@ def teensy_poll_loop():
     while True:
         if teensy_connected:
             s = query_teensy_state()
-            if s: socketio.emit('buddy_state', s)
+            if s:
+                socketio.emit('buddy_state', s)
+                # Check for spontaneous speech each poll cycle
+                if spontaneous_speech_enabled and not is_processing:
+                    check_spontaneous_speech(s)
             else:
                 teensy_connected = False
                 socketio.emit('teensy_status', {'connected': False, 'port': ''})
@@ -650,6 +667,9 @@ def wake_word_loop():
                         noise_floor = noise_floor * (1 - NOISE_FLOOR_ALPHA) + level * NOISE_FLOOR_ALPHA
                     socketio.emit('audio_level', {'level': level})
                 if porcupine.process(pcm) >= 0:
+                    # Don't trigger wake word if Buddy is speaking spontaneously
+                    if is_processing:
+                        continue
                     socketio.emit('wake_word_detected')
                     socketio.emit('status', {'state': 'listening', 'message': 'Listening...'})
                     teensy_send_command("PRESENCE")
@@ -663,6 +683,9 @@ def wake_word_loop():
 
 def record_and_process():
     global recorder, noise_floor
+    # If spontaneous speech is happening, wait for it to finish
+    with spontaneous_speech_lock:
+        pass
     frames, silent_frames, speech_started, pre_speech_count = [], 0, False, 0
     sr = 16000
     fps = sr / 512
@@ -897,6 +920,277 @@ def process_input(text, include_vision):
         is_processing = False
 
 # =============================================================================
+# SPONTANEOUS SPEECH ENGINE
+# =============================================================================
+
+def check_spontaneous_speech(state):
+    """
+    Called every poll cycle (~1s) with the latest QUERY state from Teensy.
+    Decides whether Buddy should speak unprompted.
+    """
+    global last_spontaneous_utterance, spontaneous_utterance_log
+
+    if not spontaneous_speech_enabled:
+        return
+    if is_processing:
+        return
+    if not state:
+        return
+
+    wants = state.get('wantsToSpeak', False)
+    if not wants:
+        return
+
+    trigger = state.get('speechTrigger', 'none')
+    urge = float(state.get('speechUrge', 0))
+
+    if trigger == 'none' or urge < 0.7:
+        return
+
+    now = time.time()
+
+    # Rate limit: minimum gap
+    if now - last_spontaneous_utterance < SPONTANEOUS_MIN_GAP_SECONDS:
+        return
+
+    # Rate limit: max per hour
+    one_hour_ago = now - 3600
+    spontaneous_utterance_log = [t for t in spontaneous_utterance_log if t > one_hour_ago]
+    if len(spontaneous_utterance_log) >= SPONTANEOUS_MAX_PER_HOUR:
+        return
+
+    # Don't speak if wake word is actively listening / recording
+    if wake_word_running and is_processing:
+        return
+
+    # Acquire lock (non-blocking — skip if already speaking)
+    if not spontaneous_speech_lock.acquire(blocking=False):
+        return
+
+    try:
+        # Build the spontaneous prompt
+        prompt_text = build_spontaneous_prompt(trigger, state)
+        if not prompt_text:
+            return
+
+        # Log it
+        last_spontaneous_utterance = now
+        spontaneous_utterance_log.append(now)
+
+        socketio.emit('log', {
+            'message': f'Buddy wants to speak: {trigger} (urge: {urge:.2f})',
+            'level': 'info'
+        })
+        socketio.emit('status', {
+            'state': 'spontaneous',
+            'message': f'Buddy is speaking spontaneously ({trigger})'
+        })
+
+        # Use the existing pipeline — same as user-initiated speech
+        threading.Thread(
+            target=process_spontaneous_speech,
+            args=(prompt_text, trigger),
+            daemon=True
+        ).start()
+
+    finally:
+        spontaneous_speech_lock.release()
+
+
+def process_spontaneous_speech(prompt_text, trigger):
+    """
+    Runs the LLM+TTS pipeline for spontaneous speech.
+    Uses process_input's logic but with an internal prompt instead of user speech.
+    """
+    global is_processing
+    if is_processing:
+        return
+    is_processing = True
+
+    try:
+        # Capture vision for context (Buddy can comment on what it sees)
+        img = None
+        if trigger in ('face_appeared', 'face_recognized', 'discovery',
+                       'commentary', 'startled'):
+            img = capture_frame()
+            if img:
+                socketio.emit('image', {'base64': img})
+
+        # Thinking animation
+        teensy_send_with_fallback("THINKING", "EXPRESS:curious")
+
+        # Query LLM with spontaneous prompt
+        resp = query_ollama(prompt_text, img)
+
+        teensy_send_command("STOP_THINKING")
+
+        # Execute any action tags in response
+        clean = execute_buddy_actions(resp)
+        socketio.emit('response', {'text': f'[spontaneous] {clean}'})
+
+        # Tell Teensy that Buddy spoke (resets urge)
+        teensy_send_command("SPOKE")
+
+        # Speaking phase
+        socketio.emit('status', {'state': 'speaking', 'message': 'Speaking...'})
+        teensy_send_command("SPEAKING")
+
+        audio = asyncio.run(generate_tts(clean))
+        socketio.emit('audio', {'base64': audio})
+
+        speech_duration = max(1.0, min(len(clean) * 0.08, 30.0))
+
+        def finish_speaking():
+            time.sleep(speech_duration)
+            teensy_send_command("STOP_SPEAKING")
+            teensy_send_command("IDLE")
+
+        threading.Thread(target=finish_speaking, daemon=True).start()
+        socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
+
+    except Exception as e:
+        teensy_send_command("STOP_THINKING")
+        teensy_send_command("STOP_SPEAKING")
+        teensy_send_command("IDLE")
+        teensy_send_command("SPOKE")  # Reset urge even on error
+        socketio.emit('log', {'message': f'Spontaneous speech error: {e}', 'level': 'error'})
+        socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
+    finally:
+        is_processing = False
+
+
+def build_spontaneous_prompt(trigger, state):
+    """
+    Build the 'user message' that drives Buddy's spontaneous speech.
+
+    The system prompt already contains Buddy's personality and state.
+    This function provides the MOTIVATION — why Buddy is speaking now.
+
+    Returns a prompt string, or None to skip.
+    """
+
+    emotion = state.get('emotion', 'neutral')
+    behavior = state.get('behavior', 'idle')
+    valence = float(state.get('valence', 0))
+    arousal = float(state.get('arousal', 0.5))
+    social = float(state.get('social', 0.5))
+    energy = float(state.get('energy', 0.5))
+
+    # Consciousness state
+    epistemic = state.get('epistemic', 'confident')
+    self_desc = state.get('selfDescription', '')
+    wondering = state.get('wondering', '')
+    mood_trend = state.get('moodTrend', '')
+
+    templates = {
+        'lonely': (
+            "[INTERNAL MOTIVATION: You haven't seen anyone in a while and you're "
+            "feeling lonely. You want to speak out loud — maybe to yourself, maybe "
+            "hoping someone hears. Express this naturally in 1 sentence. You might "
+            "sigh, wonder where everyone is, or muse about what you'd like to do "
+            "with someone. Don't be dramatic — just a quiet thought escaping.]"
+        ),
+
+        'bored': (
+            "[INTERNAL MOTIVATION: Nothing is happening and you're bored. You want "
+            "to say something — comment on the environment, wonder about something, "
+            "make a small observation. 1 sentence max. Think out loud like a person "
+            "who's been sitting quietly too long. You might fidget verbally.]"
+        ),
+
+        'wondering': (
+            f"[INTERNAL MOTIVATION: You're in a contemplative state, wondering: "
+            f"'{wondering or 'something about your existence'}'. Think out loud — "
+            f"share this thought as a quiet musing. 1 sentence. Not a question to "
+            f"anyone — just a thought that escapes. Philosophical but simple. "
+            f"Like a child wondering about the world.]"
+        ),
+
+        'face_appeared': (
+            "[INTERNAL MOTIVATION: Someone just appeared in front of you! You're "
+            "curious and want to acknowledge them. Greet them naturally — you can "
+            "see them with your camera. Comment on something you notice or just "
+            "say hi. 1-2 sentences. If you can see what they look like, mention "
+            "something specific. Be warm but not over-the-top.]"
+        ),
+
+        'face_recognized': (
+            "[INTERNAL MOTIVATION: Someone familiar just appeared! You recognize "
+            "them and you're happy to see them. Greet them like you know them — "
+            "reference something natural like time of day, or express genuine "
+            "pleasure at seeing them. 1 sentence. Warm, personal, not generic.]"
+        ),
+
+        'face_left': (
+            "[INTERNAL MOTIVATION: The person you were interacting with just left. "
+            "React naturally — you might say bye, express that you'll miss them, "
+            "or make a quiet comment about being alone again. 1 sentence. Don't "
+            "be clingy — just a natural farewell or observation.]"
+        ),
+
+        'startled': (
+            "[INTERNAL MOTIVATION: Something sudden just happened and you're "
+            "startled! React with a quick exclamation or surprised comment. Very "
+            "brief — just 1-3 words like a natural startle response. Then maybe "
+            "a short follow-up about what surprised you.]"
+        ),
+
+        'content': (
+            "[INTERNAL MOTIVATION: You're feeling good right now — content and "
+            f"{'energetic' if arousal > 0.5 else 'peaceful'}. Share this feeling "
+            "naturally. 1 sentence. Maybe hum happily, comment on how nice things "
+            "are, or express simple satisfaction. Like someone who lets out a "
+            "contented sigh.]"
+        ),
+
+        'conflict': (
+            "[INTERNAL MOTIVATION: You're experiencing internal conflict — part of "
+            "you wants to do one thing, part wants another. Think out loud about "
+            "this tension. 1 sentence. Like someone going 'hmm, should I...' or "
+            "'part of me wants to... but...' — visible indecision expressed verbally.]"
+        ),
+
+        'discovery': (
+            "[INTERNAL MOTIVATION: You just noticed something interesting or new "
+            "in your environment! You can see it with your camera. Comment on what "
+            "you see with genuine curiosity. 1-2 sentences. Express the excitement "
+            "of discovery. Use your camera — describe what you actually see.]"
+        ),
+
+        'greeting': (
+            "[INTERNAL MOTIVATION: It feels like a good time to announce yourself "
+            "or check in. Make a brief, natural greeting or observation about the "
+            "moment. 1 sentence. Time-appropriate — morning greeting, afternoon "
+            "check-in, or evening wind-down.]"
+        ),
+
+        'commentary': (
+            "[INTERNAL MOTIVATION: You're observing something and want to comment. "
+            "Make a brief, natural observation about what you see or sense. "
+            "1 sentence. Like a friend sitting next to someone who occasionally "
+            "points things out.]"
+        )
+    }
+
+    prompt = templates.get(trigger)
+    if not prompt:
+        return None
+
+    # Add current state context
+    state_context = f"\n[Current state: feeling {emotion}, energy {'low' if energy < 0.4 else 'normal' if energy < 0.7 else 'high'}"
+    if self_desc:
+        state_context += f", self-concept: '{self_desc}'"
+    if mood_trend:
+        state_context += f", mood has been {mood_trend}"
+    state_context += "]"
+
+    # Add brevity enforcement
+    brevity = "\n[CRITICAL: Keep response under 15 words. You're thinking out loud, not giving a speech. No action tags unless genuinely moved.]"
+
+    return prompt + state_context + brevity
+
+
+# =============================================================================
 # ROUTES & SOCKET EVENTS
 # =============================================================================
 
@@ -960,6 +1254,15 @@ def handle_pause(): CONFIG['wake_word_enabled'] = False
 
 @socketio.on('resume_wake_word')
 def handle_resume(): CONFIG['wake_word_enabled'] = True
+
+@socketio.on('toggle_spontaneous')
+def handle_toggle_spontaneous(data):
+    global spontaneous_speech_enabled
+    spontaneous_speech_enabled = data.get('enabled', True)
+    socketio.emit('log', {
+        'message': f'Spontaneous speech {"enabled" if spontaneous_speech_enabled else "disabled"}',
+        'level': 'info'
+    })
 
 # =============================================================================
 # MAIN

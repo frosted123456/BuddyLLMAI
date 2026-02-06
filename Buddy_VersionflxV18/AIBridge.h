@@ -21,6 +21,7 @@
 //   !ACKNOWLEDGE         → Quick subtle nod
 //   !CELEBRATE           → Happy bounce animation
 //   !IDLE                → Clear AI state, return to behavior system
+//   !SPOKE               → Acknowledge spontaneous speech (resets urge)
 
 #ifndef AI_BRIDGE_H
 #define AI_BRIDGE_H
@@ -117,6 +118,9 @@ public:
     }
     else if (strncmp(cmdLine, "QUERY", 5) == 0) {
       cmdQuery();
+    }
+    else if (strncmp(cmdLine, "SPOKE", 5) == 0) {
+      cmdSpoke();
     }
     else if (strncmp(cmdLine, "LOOK:", 5) == 0) {
       cmdLook(cmdLine + 5);
@@ -286,6 +290,14 @@ private:
     Serial.print(consciousness.isWondering() ? "true" : "false");
     Serial.print(",\"selfAwareness\":");
     Serial.print(consciousness.getSelfAwareness(), 2);
+
+    // Speech urge fields
+    Serial.print(",\"speechUrge\":");
+    Serial.print(engine->getSpeechUrge().getUrge(), 2);
+    Serial.print(",\"speechTrigger\":\"");
+    Serial.print(engine->getSpeechUrge().triggerToString());
+    Serial.print("\",\"wantsToSpeak\":");
+    Serial.print(engine->getSpeechUrge().wantsToSpeak() ? "true" : "false");
 
     Serial.println("}");
   }
@@ -708,6 +720,21 @@ private:
     }
 
     Serial.println("{\"ok\":true}");
+  }
+
+  // ============================================
+  // !SPOKE - Acknowledge that spontaneous speech happened (resets urge)
+  // ============================================
+
+  void cmdSpoke() {
+    if (engine == nullptr) {
+      Serial.println("{\"ok\":false,\"reason\":\"not_initialized\"}");
+      return;
+    }
+    engine->getSpeechUrge().utteranceCompleted();
+    // Satisfy some stimulation need since Buddy "expressed itself"
+    engine->getNeeds().satisfyStimulation(0.1f);
+    Serial.println("{\"ok\":true,\"action\":\"spoke_acknowledged\"}");
   }
 
   // ============================================

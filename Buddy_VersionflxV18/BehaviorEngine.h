@@ -63,6 +63,7 @@ struct PersonRecord {
 #include "ConsciousnessLayer.h"
 #include "ConsciousnessManifest.h"
 #include "AmbientLife.h"
+#include "SpeechUrge.h"
 
 // ============================================
 // DEBUG CONFIGURATION
@@ -90,6 +91,7 @@ private:
   ConsciousnessLayer consciousness;
   ConsciousnessManifest consciousnessManifest;
   AmbientLife ambientLife;
+  SpeechUrgeSystem speechUrge;
 
   AnimationController* animator;
   ServoController* servoController;
@@ -951,6 +953,18 @@ public:
     consciousness.update(scores, numBehaviors, needs, emotion, personality,
                           spatialMemory, dt);
 
+    // Update speech urge from internal states
+    speechUrge.update(
+        needs, emotion, personality,
+        consciousness.isWondering(),
+        consciousness.isInConflict(),
+        consciousness.getTension(),
+        isTrackingFace,
+        isRecognizedPerson,
+        spatialMemory.getTotalNovelty(),
+        millis()
+    );
+
     Behavior selected = behaviorSelector.selectBehavior(scores, numBehaviors);
 
     // GOAL SYSTEM INFLUENCES BEHAVIOR
@@ -1740,6 +1754,9 @@ public:
 
   // Getter for consciousness layer (used by AIBridge)
   ConsciousnessLayer& getConsciousness() { return consciousness; }
+
+  // Getter for speech urge system (used by AIBridge)
+  SpeechUrgeSystem& getSpeechUrge() { return speechUrge; }
 
   const char* behaviorToString(Behavior b) {
     switch(b) {
