@@ -1,0 +1,11 @@
+# Buddy Vision Pipeline dependencies
+# Install: pip install -r requirements_vision.txt
+
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+numpy>=1.24.0
+flask>=3.0.0
+requests>=2.31.0
+
+# Optional: GPU-accelerated OpenCV (install INSTEAD of opencv-python)
+# pip install opencv-contrib-python
