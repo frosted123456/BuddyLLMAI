@@ -174,6 +174,7 @@ bool setupWiFi() {
         Serial.print(".");
     }
     Serial.printf("\n[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    WiFi.setSleep(false);  // Disable WiFi power save for low latency (WARN-2)
     return true;
 }
 
@@ -183,8 +184,10 @@ bool setupWiFi() {
 // ════════════════════════════════════════════════════════════════
 
 void captureTask(void* param) {
+    esp_task_wdt_add(NULL);  // Register this task with watchdog (WARN-4)
     unsigned long frameInterval = 1000 / TARGET_FPS;
     while (true) {
+        esp_task_wdt_reset();  // Feed watchdog (WARN-4)
         camera_fb_t* fb = esp_camera_fb_get();
         if (fb) {
             if (xSemaphoreTake(frameMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -217,21 +220,28 @@ void handleHealth() {
 void handleCapture() {
     esp_task_wdt_reset();
 
-    camera_fb_t* fb = nullptr;
+    // WARN-1 fix: Copy frame data before releasing mutex, then send from copy.
+    // This prevents holding frameMutex during slow network I/O.
     if (xSemaphoreTake(frameMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        // Return a copy of the latest frame
-        fb = latestFrame;
-        if (fb) {
-            httpServer.sendHeader("Content-Type", "image/jpeg");
-            httpServer.sendHeader("Access-Control-Allow-Origin", "*");
-            httpServer.sendHeader("Cache-Control", "no-cache");
-            httpServer.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+        if (latestFrame != nullptr && latestFrame->len > 0) {
+            // Copy frame data while holding mutex (fast memcpy)
+            size_t len = latestFrame->len;
+            uint8_t* copy = (uint8_t*)malloc(len);
+            if (copy) {
+                memcpy(copy, latestFrame->buf, len);
+                xSemaphoreGive(frameMutex);  // Release mutex BEFORE network IO
+
+                // Send from copy (slow network IO, mutex released)
+                httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+                httpServer.sendHeader("Cache-Control", "no-cache");
+                httpServer.send_P(200, "image/jpeg", (const char*)copy, len);
+                free(copy);
+                return;
+            }
         }
         xSemaphoreGive(frameMutex);
     }
-    if (!fb) {
-        httpServer.send(503, "text/plain", "No frame available");
-    }
+    httpServer.send(503, "text/plain", "No frame available");
 }
 
 void handleStream() {
@@ -276,7 +286,9 @@ void handleNotFound() {
 
 // Phase 1F: HTTP server task runs on core 0 (never blocks core 1)
 void httpServerTask(void* param) {
+    esp_task_wdt_add(NULL);  // Register this task with watchdog (WARN-4)
     while (true) {
+        esp_task_wdt_reset();  // Feed watchdog (WARN-4)
         httpServer.handleClient();
         delay(1);
     }
@@ -309,18 +321,21 @@ void wsEvent(uint8_t clientNum, WStype_t type, uint8_t* payload, size_t length) 
                 TeensySerial.println(cmd);
                 TeensySerial.flush();
 
-                // Wait for response from Teensy
+                // Wait for response from Teensy (REC-4: fixed-size buffer)
                 unsigned long waitStart = millis();
-                String response = "";
+                char response[1024];
+                int responseLen = 0;
                 bool gotResponse = false;
 
                 while (millis() - waitStart < TEENSY_RESPONSE_TIMEOUT_MS) {
                     while (TeensySerial.available()) {
                         char c = TeensySerial.read();
-                        response += c;
                         if (c == '\n') {
                             gotResponse = true;
                             break;
+                        }
+                        if (responseLen < (int)sizeof(response) - 1) {
+                            response[responseLen++] = c;
                         }
                     }
                     if (gotResponse) break;
@@ -329,9 +344,20 @@ void wsEvent(uint8_t clientNum, WStype_t type, uint8_t* payload, size_t length) 
 
                 xSemaphoreGive(uartMutex);
 
+                // Drain any stale face data that accumulated during mutex hold (REC-6)
+                // This data arrived while we were waiting for the QUERY response
+                // and is now old. Discard it so handleUDP processes fresh data next.
+                while (TeensySerial.available()) {
+                    TeensySerial.read();
+                }
+
                 if (gotResponse) {
-                    response.trim();
-                    wsServer.sendTXT(clientNum, response.c_str());
+                    // Trim trailing \r if present
+                    while (responseLen > 0 && (response[responseLen - 1] == '\r' || response[responseLen - 1] == ' ')) {
+                        responseLen--;
+                    }
+                    response[responseLen] = '\0';
+                    wsServer.sendTXT(clientNum, response);
                 } else {
                     wsServer.sendTXT(clientNum, "{\"ok\":false,\"reason\":\"timeout\"}");
                 }
@@ -436,6 +462,10 @@ void setup() {
     Serial.println("╚════════════════════════════════════════╝\n");
 
     // Initialize Teensy UART
+    // Increase UART1 RX buffer from default 256 to 1024 bytes.
+    // During 200-300ms WebSocket mutex hold, Teensy STATE broadcasts
+    // can overflow the default buffer. (CRITICAL-3 from hardware audit)
+    TeensySerial.setRxBufferSize(1024);
     TeensySerial.begin(TEENSY_BAUD, SERIAL_8N1, TEENSY_RX_PIN, TEENSY_TX_PIN);
     delay(100);
     TeensySerial.println("ESP32_READY");
@@ -447,11 +477,19 @@ void setup() {
     // Phase 1F: Create frame mutex
     frameMutex = xSemaphoreCreateMutex();
 
-    // Initialize camera
-    if (!initCamera()) {
-        Serial.println("[FATAL] Camera init failed!");
-        while (1) delay(5000);
+    // Camera init with retry and auto-reboot (CRITICAL-4 from hardware audit)
+    int cameraRetries = 0;
+    while (!initCamera()) {
+        cameraRetries++;
+        if (cameraRetries >= 5) {
+            Serial.println("[FATAL] Camera init failed 5 times, rebooting...");
+            delay(1000);
+            ESP.restart();
+        }
+        Serial.printf("[CAM] Init failed, retry %d/5...\n", cameraRetries);
+        delay(2000);
     }
+    Serial.println("[CAM] Camera initialized successfully");
 
     // Initialize WiFi
     wifiConnected = setupWiFi();
@@ -481,7 +519,7 @@ void setup() {
     esp_task_wdt_add(NULL);
 
     // Phase 1F: Start capture task on core 0
-    xTaskCreatePinnedToCore(captureTask, "capture", 4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(captureTask, "capture", 8192, NULL, 1, NULL, 0);  // CRITICAL-1: 8192 for camera ops
 
     // Phase 1F: Start HTTP server on core 0 (handles blocking /stream)
     xTaskCreatePinnedToCore(httpServerTask, "httpd", 8192, NULL, 1, NULL, 0);

@@ -369,6 +369,12 @@ void setup() {
   
   // NEW: Initialize ESP32-S3 communication
   Serial.println("[ESP32] Initializing vision communication...");
+  // Increase Serial1 RX buffer from default 64 bytes to 512.
+  // At 921600 baud, 64 bytes fills in <0.7ms. During the 30ms
+  // ultrasonic pulseIn() block, incoming face data would overflow.
+  // (CRITICAL-2 from hardware audit)
+  static uint8_t serial1RxBuf[512];
+  ESP32_SERIAL.addMemoryForRead(serial1RxBuf, sizeof(serial1RxBuf));
   ESP32_SERIAL.begin(ESP32_BAUD);
   delay(100);
 
