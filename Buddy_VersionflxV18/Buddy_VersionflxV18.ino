@@ -227,7 +227,7 @@ void handleFaceDetection() {
 void parseVisionData() {
   if (!ESP32_SERIAL.available()) return;
 
-  static char buffer[128];
+  static char buffer[256];  // Increased from 128 for VISION payloads (Phase 2)
   static char latestFace[128];
   bool gotFace = false;
   bool gotNoFace = false;
@@ -249,6 +249,16 @@ void parseVisionData() {
     else if (strncmp(buffer, "NO_FACE", 7) == 0) {
       gotNoFace = true;
       gotFace = false;  // NO_FACE after FACE overrides
+    }
+    // ── Phase 2: Vision feedback from PC (fire-and-forget, no response) ──
+    else if (strncmp(buffer, "!VISION:", 8) == 0) {
+      aiBridge.cmdVision(buffer + 8);
+    }
+    // ── Phase 1A: AI Bridge commands arriving via ESP32 WiFi↔UART bridge ──
+    else if (buffer[0] == '!') {
+      // Commands from PC via WiFi→ESP32→UART arrive with ! prefix
+      // Route responses back to ESP32_SERIAL so they reach the PC
+      aiBridge.handleCommand(buffer + 1, &ESP32_SERIAL);
     }
     else if (strncmp(buffer, "ESP32_READY", 11) == 0 || strncmp(buffer, "READY", 5) == 0) {
       Serial.println("[VISION] ESP32-S3 connected");

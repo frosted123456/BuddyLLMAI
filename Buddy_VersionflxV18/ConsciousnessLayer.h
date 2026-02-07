@@ -89,7 +89,8 @@ enum WonderingType {
     WONDER_PLACE,         // What is this place?
     WONDER_PURPOSE,       // Why do I do this?
     WONDER_FUTURE,        // What happens next?
-    WONDER_PAST           // What was that about?
+    WONDER_PAST,          // What was that about?
+    WONDER_EXTERNAL       // Phase 2: Something changed in the visual scene
 };
 
 struct WonderingState {
@@ -124,6 +125,9 @@ private:
     CounterfactualThought counterfactual;
     WonderingState wondering;
     MetaAwareness meta;
+
+    // Phase 2: Environmental stimulation from vision feedback
+    float environmentalStimulation;
 
 public:
     ConsciousnessLayer() {
@@ -161,6 +165,8 @@ public:
         meta.awarenessOfUncertainty = 0.0;
         meta.caughtMyself = false;
         meta.lastCatch = 0;
+
+        environmentalStimulation = 0.0;
     }
 
     // ========================================================================
@@ -445,6 +451,28 @@ public:
     }
 
     // ========================================================================
+    // Phase 2: ENVIRONMENT CHANGE — Triggered by PC vision novelty
+    // ========================================================================
+
+    void onEnvironmentChange(float noveltyLevel) {
+        // Something changed in the visual scene.
+        // High novelty can trigger wondering: "what was that?"
+        if (noveltyLevel > 0.7 && !wondering.isWondering) {
+            unsigned long timeSinceLast = millis() - wondering.lastWondering;
+            if (timeSinceLast > 60000) {  // 1 min minimum for external triggers
+                wondering.isWondering = true;
+                wondering.startTime = millis();
+                wondering.lastWondering = millis();
+                wondering.intensity = 0.5;
+                wondering.type = WONDER_EXTERNAL;
+            }
+        }
+
+        // Update environmental awareness (decays naturally in update)
+        environmentalStimulation = max(environmentalStimulation, noveltyLevel);
+    }
+
+    // ========================================================================
     // BEHAVIOR MODULATION — How consciousness affects decisions
     // ========================================================================
 
@@ -525,6 +553,7 @@ public:
                 case WONDER_PURPOSE: Serial.println("Why do I do this?"); break;
                 case WONDER_FUTURE: Serial.println("What happens next?"); break;
                 case WONDER_PAST: Serial.println("What was that about?"); break;
+                case WONDER_EXTERNAL: Serial.println("What just changed?"); break;
             }
         }
 
