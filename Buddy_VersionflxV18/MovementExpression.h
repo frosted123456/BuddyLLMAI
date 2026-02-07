@@ -582,6 +582,144 @@ public:
   }
   
   // ============================================
+  // BUDDY SIGNATURE MOVES
+  // Movement patterns that match the verbal personality
+  // ============================================
+
+  // Curious inspection: pause → tilt → orient → hold
+  // Buddy's characteristic "thinking about it" sequence
+  void curiousInspection(ServoController& servos, int targetBase, int targetNod,
+                         Emotion& emotion, Personality& personality, Needs& needs) {
+
+    MovementStyleParams style = styleGen.generate(emotion, personality, needs);
+
+    int currentBase, currentNod, currentTilt;
+    servos.getPosition(currentBase, currentNod, currentTilt);
+
+    Serial.println("[EXPRESSION] Curious inspection → pause-tilt-orient-hold");
+
+    // Step 1: Pause briefly (moderate caution — considers before acting)
+    // No movement command, just a short delay to read as hesitation
+    delay(150 + (int)(personality.getCaution() * 200));
+
+    // Step 2: Tilt head (the "considering" gesture)
+    int tiltDir = random(0, 2) == 0 ? -1 : 1;
+    Pose consider(currentBase, currentNod + 5, currentTilt + 18 * tiltDir);
+    style.speed *= 0.6;
+    servos.smoothMoveTo(consider.base, consider.nod, consider.tilt, style);
+    delay(200);
+
+    // Step 3: Orient toward the stimulus (high curiosity drives approach)
+    style.speed *= 1.5;
+    Pose orient(targetBase, targetNod, currentTilt + 8 * tiltDir);
+    servos.smoothMoveTo(orient.base, orient.nod, orient.tilt, style);
+    delay(300);
+
+    // Step 4: Hold the look (high persistence keeps focus)
+    // Just stay — the hold duration scales with persistence
+    delay(400 + (int)(personality.getPersistence() * 600));
+
+    recordExpression(EXPRESS_CURIOSITY);
+  }
+
+  // Social greeting: quick orient → slight nod → hold → small tilt
+  // Understated acknowledgment, not bouncy enthusiasm
+  void socialGreeting(ServoController& servos, int faceBase, int faceNod,
+                      Emotion& emotion, Personality& personality, Needs& needs) {
+
+    MovementStyleParams style = styleGen.generate(emotion, personality, needs);
+
+    int currentBase, currentNod, currentTilt;
+    servos.getPosition(currentBase, currentNod, currentTilt);
+
+    Serial.println("[EXPRESSION] Social greeting → orient-nod-hold-tilt");
+
+    // Step 1: Quick orient toward the face (noticed immediately)
+    style.speed *= 1.3;
+    Pose orient(faceBase, faceNod, currentTilt);
+    servos.smoothMoveTo(orient.base, orient.nod, orient.tilt, style);
+    delay(150);
+
+    // Step 2: Slight nod (acknowledgment, not excitement)
+    Pose nod(faceBase, faceNod + 8, currentTilt);
+    servos.smoothMoveTo(nod.base, nod.nod, nod.tilt, style);
+    delay(120);
+    Pose nodBack(faceBase, faceNod, currentTilt);
+    servos.smoothMoveTo(nodBack.base, nodBack.nod, nodBack.tilt, style);
+
+    // Step 3: Hold eye contact (attentive, not overeager)
+    delay(300 + (int)(personality.getPersistence() * 400));
+
+    // Step 4: Maybe a small tilt (curious "let me look at you" angle)
+    if (random(100) < 60) {
+      int tiltDir = random(0, 2) == 0 ? -1 : 1;
+      Pose tilt(faceBase, faceNod, currentTilt + 12 * tiltDir);
+      style.speed *= 0.7;
+      servos.smoothMoveTo(tilt.base, tilt.nod, tilt.tilt, style);
+    }
+
+    recordExpression(EXPRESS_AFFECTION);
+  }
+
+  // Alone behavior: slow scan → tilt at nothing → long stare → sudden small move
+  // Creates the impression of someone who's THINKING, not just idle
+  void aloneThinking(ServoController& servos, Emotion& emotion,
+                     Personality& personality, Needs& needs) {
+
+    MovementStyleParams style = styleGen.generate(emotion, personality, needs);
+    style.speed *= 0.5;  // Slow, observational
+
+    int currentBase, currentNod, currentTilt;
+    servos.getPosition(currentBase, currentNod, currentTilt);
+
+    int choice = random(0, 4);
+    Serial.print("[EXPRESSION] Alone thinking → ");
+
+    switch(choice) {
+      case 0: {
+        // Slow scanning (not restless — observational)
+        Serial.println("slow scan");
+        int scanDir = random(0, 2) == 0 ? -1 : 1;
+        Pose scan(currentBase + 25 * scanDir, currentNod, currentTilt);
+        servos.smoothMoveTo(scan.base, scan.nod, scan.tilt, style);
+        break;
+      }
+      case 1: {
+        // Occasional head tilt at nothing (having a thought)
+        Serial.println("tilt at nothing");
+        int tiltDir = random(0, 2) == 0 ? -1 : 1;
+        Pose tilt(currentBase, currentNod + 3, currentTilt + 15 * tiltDir);
+        servos.smoothMoveTo(tilt.base, tilt.nod, tilt.tilt, style);
+        break;
+      }
+      case 2: {
+        // Long pause in one direction (staring at something, judging it)
+        Serial.println("long stare");
+        int stareDir = random(-30, 31);
+        Pose stare(currentBase + stareDir, currentNod + random(-5, 6), currentTilt);
+        servos.smoothMoveTo(stare.base, stare.nod, stare.tilt, style);
+        // Hold — the persistence trait determines how long
+        delay(500 + (int)(personality.getPersistence() * 800));
+        break;
+      }
+      case 3: {
+        // Sudden small movement (thought interrupted itself)
+        Serial.println("thought interrupt");
+        // First, be still for a moment
+        delay(300);
+        // Then a quick small movement as if a thought struck
+        style.speed *= 3.0;
+        Pose jolt(currentBase + random(-8, 9), currentNod + random(-4, 5),
+                  currentTilt + random(-6, 7));
+        servos.smoothMoveTo(jolt.base, jolt.nod, jolt.tilt, style);
+        break;
+      }
+    }
+
+    recordExpression(EXPRESS_CONTEMPLATION);
+  }
+
+  // ============================================
   // UTILITY
   // ============================================
   
