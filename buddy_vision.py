@@ -261,6 +261,7 @@ def stream_receiver_thread(config):
         try:
             print(f"[STREAM] Connecting to {url}...")
             cap = cv2.VideoCapture(url)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Phase 1D: BUG-5 fix — minimize internal buffering
 
             if not cap.isOpened():
                 print("[STREAM] Failed to open stream, retrying in 3s...")
@@ -508,6 +509,7 @@ def rich_vision_thread(config):
     - Scene change detection (novelty)
     - Person count
     - Object detection (future: YOLO)
+    - Phase 2: Sends VISION updates to Teensy for autonomous observation loop
     """
     # MediaPipe face mesh for landmarks/expressions
     mp_face_mesh = mp.solutions.face_mesh
@@ -518,10 +520,15 @@ def rich_vision_thread(config):
         min_tracking_confidence=0.5
     )
 
+    # Phase 2: UDP socket for sending VISION updates to ESP32 → Teensy
+    vision_udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    esp32_addr = (config["esp32_ip"], config["udp_port"])
+
     frame_interval = 1.0 / config["target_rich_fps"]
     prev_frame_gray = None
 
     print(f"[RICH] Started — target {config['target_rich_fps']} FPS")
+    print(f"[RICH] Phase 2: Sending VISION updates to {esp32_addr}")
 
     while True:
         try:
@@ -562,6 +569,23 @@ def rich_vision_thread(config):
                 state.scene_novelty = state.scene_novelty * 0.7 + novelty * 0.3
 
             prev_frame_gray = gray_small
+
+            # ── Phase 2: Send VISION update to Teensy via UDP ──
+            # This closes the observation loop: PC sees → Teensy feels
+            vision_cmd = json.dumps({
+                "f": 1 if state.face_detected else 0,
+                "fc": state.person_count,
+                "ex": state.face_expression or "neutral",
+                "nv": round(state.scene_novelty, 2),
+                "ob": len(state.objects),
+                "mv": round(state.scene_novelty, 2),  # Use scene diff as movement proxy
+            }, separators=(',', ':'))
+
+            try:
+                vision_msg = f"!VISION:{vision_cmd}"
+                vision_udp_sock.sendto(vision_msg.encode(), esp32_addr)
+            except Exception:
+                pass  # Non-critical, next update comes in ~300ms
 
         except Exception as e:
             if config["debug"]:

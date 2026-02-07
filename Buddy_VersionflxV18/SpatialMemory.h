@@ -131,6 +131,20 @@ public:
   }
   
   // ============================================
+  // EXTERNAL NOVELTY INJECTION (Phase 2: Vision Feedback)
+  // ============================================
+
+  void injectExternalNovelty(int direction, float novelty) {
+    // Blend PC-detected scene novelty with ultrasonic-based novelty.
+    // The camera's richer observation supplements crude ultrasonic distance changes.
+    if (direction < 0 || direction >= 8) return;
+
+    float blended = bins[direction].noveltyScore * 0.3 + novelty * 0.7;
+    bins[direction].noveltyScore = constrain(blended, 0.0f, 1.0f);
+    bins[direction].lastUpdate = millis();
+  }
+
+  // ============================================
   // ANALYSIS
   // ============================================
   

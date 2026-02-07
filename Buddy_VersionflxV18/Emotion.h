@@ -155,6 +155,17 @@ public:
   }
   
   // ============================================
+  // EXTERNAL NUDGE (Phase 2: Vision Feedback)
+  // ============================================
+
+  void nudge(float valenceShift, float arousalShift) {
+    // External influence on emotional state (e.g., from observed facial expressions).
+    // Small shifts — these are environmental influences, not events.
+    valence = constrain(valence + valenceShift, -1.0f, 1.0f);
+    arousal = constrain(arousal + arousalShift, 0.0f, 1.0f);
+  }
+
+  // ============================================
   // EMOTION LABELING
   // ============================================
   

@@ -68,7 +68,7 @@ CONFIG = {
     "image_rotation": 90,
 
     # Wake Word - Jarvis (English built-in)
-    "picovoice_access_key": "wUO0BjvmEl2gQDwJaRh18jodPKKkGWGU+YBBC1+F+6CVdIvG0HFwPQ==",
+    "picovoice_access_key": os.environ.get("PICOVOICE_ACCESS_KEY", ""),  # Phase 1H: ISSUE-5 — use env var
     "wake_word": "jarvis",
     "wake_word_path": "",
     "wake_word_model_path": "",
@@ -157,7 +157,7 @@ porcupine = None
 recorder = None
 wake_word_thread = None
 wake_word_running = False
-is_processing = False
+processing_lock = threading.Lock()  # Phase 1C: BUG-4 fix — replaces bare bool is_processing
 current_image_base64 = None
 
 # Teensy state
@@ -614,7 +614,8 @@ def connect_teensy_serial():
         if not port: port = CONFIG.get("teensy_port", "COM12")
         teensy_serial = serial.Serial(port=port, baudrate=CONFIG.get("teensy_baud", 115200), timeout=0.1)
         teensy_connected = True
-        CONFIG["teensy_comm_mode"] = "serial"  # Record that we fell back
+        # Phase 1H: ISSUE-4 fix — don't permanently change comm mode here.
+        # If WebSocket reconnects later, we want to try it again.
         socketio.emit('teensy_status', {'connected': True, 'port': port})
         socketio.emit('log', {'message': f'Teensy connected via USB: {port}', 'level': 'success'})
         return True
@@ -722,7 +723,7 @@ def teensy_poll_loop():
                 ws_reconnect_count = 0  # Reset on success
 
                 # Spontaneous speech check
-                if CONFIG.get("spontaneous_speech_enabled", False) and not is_processing:
+                if CONFIG.get("spontaneous_speech_enabled", False) and not processing_lock.locked():
                     check_spontaneous_speech(s)
             else:
                 teensy_connected = False
@@ -843,7 +844,7 @@ def wake_word_loop():
                     socketio.emit('audio_level', {'level': level})
                 if porcupine.process(pcm) >= 0:
                     # Don't trigger wake word if Buddy is speaking spontaneously
-                    if is_processing:
+                    if processing_lock.locked():
                         continue
                     socketio.emit('wake_word_detected')
                     socketio.emit('status', {'state': 'listening', 'message': 'Listening...'})
@@ -1047,13 +1048,38 @@ def get_buddy_state_prompt():
 
     return "\n".join(parts)
 
-def query_ollama(text, img=None):
+def query_ollama(text, img=None, timeout=60):
+    """Query Ollama with timeout to prevent system lockup (Phase 1B: BUG-3 fix)."""
     state_info = get_buddy_state_prompt()
     prompt = CONFIG["system_prompt"].replace("{buddy_state}", state_info)
     msgs = [{"role": "system", "content": prompt}]
-    if img: msgs.append({"role": "user", "content": text, "images": [img]})
-    else: msgs.append({"role": "user", "content": text})
-    return ollama.chat(model=CONFIG["ollama_model"], messages=msgs)["message"]["content"]
+    if img:
+        msgs.append({"role": "user", "content": text, "images": [img]})
+    else:
+        msgs.append({"role": "user", "content": text})
+
+    result = [None]
+    error = [None]
+
+    def _query():
+        try:
+            result[0] = ollama.chat(
+                model=CONFIG["ollama_model"],
+                messages=msgs
+            )["message"]["content"]
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=_query, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        socketio.emit('log', {'message': f'Ollama timeout after {timeout}s', 'level': 'error'})
+        raise TimeoutError(f"Ollama did not respond within {timeout}s")
+    if error[0]:
+        raise error[0]
+    return result[0]
 
 async def generate_tts(text):
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f: tp = f.name
@@ -1063,9 +1089,9 @@ async def generate_tts(text):
     finally: os.unlink(tp)
 
 def process_input(text, include_vision):
-    global is_processing
-    if is_processing: return
-    is_processing = True
+    if not processing_lock.acquire(blocking=False):
+        socketio.emit('log', {'message': 'Already processing, skipping', 'level': 'warning'})
+        return
     try:
         socketio.emit('transcript', {'text': text})
         
@@ -1146,8 +1172,8 @@ def process_input(text, include_vision):
         teensy_send_command("IDLE")
         socketio.emit('error', {'message': str(e)})
         socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
-    finally: 
-        is_processing = False
+    finally:
+        processing_lock.release()
 
 # =============================================================================
 # SPONTANEOUS SPEECH ENGINE
@@ -1162,7 +1188,7 @@ def check_spontaneous_speech(state):
 
     if not spontaneous_speech_enabled:
         return
-    if is_processing:
+    if processing_lock.locked():
         return
     if not state:
         return
@@ -1190,7 +1216,7 @@ def check_spontaneous_speech(state):
         return
 
     # Don't speak if wake word is actively listening / recording
-    if wake_word_running and is_processing:
+    if wake_word_running and processing_lock.locked():
         return
 
     # Acquire lock (non-blocking — skip if already speaking)
@@ -1232,10 +1258,8 @@ def process_spontaneous_speech(prompt_text, trigger):
     Runs the LLM+TTS pipeline for spontaneous speech.
     Uses process_input's logic but with an internal prompt instead of user speech.
     """
-    global is_processing
-    if is_processing:
+    if not processing_lock.acquire(blocking=False):
         return
-    is_processing = True
 
     try:
         # Capture vision for context (Buddy can comment on what it sees)
@@ -1286,7 +1310,7 @@ def process_spontaneous_speech(prompt_text, trigger):
         socketio.emit('log', {'message': f'Spontaneous speech error: {e}', 'level': 'error'})
         socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
     finally:
-        is_processing = False
+        processing_lock.release()
 
 
 def build_spontaneous_prompt(trigger, state):
@@ -1547,6 +1571,18 @@ if __name__ == '__main__':
     print()
 
     init_whisper()
+
+    # Phase 1H: OPT-3 — Validate Ollama model availability
+    try:
+        models = ollama.list()
+        names = [m.get('name', '') for m in models.get('models', [])]
+        if not any(CONFIG['ollama_model'] in n for n in names):
+            print(f"  WARNING: Model '{CONFIG['ollama_model']}' not found!")
+            print(f"  Available: {', '.join(names[:5])}")
+        else:
+            print(f"  Ollama model: {CONFIG['ollama_model']} OK")
+    except Exception as e:
+        print(f"  WARNING: Cannot reach Ollama: {e}")
 
     print("Connecting to Teensy...")
     connect_teensy()
