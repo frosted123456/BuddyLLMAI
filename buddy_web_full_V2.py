@@ -3,18 +3,22 @@ Buddy Voice Assistant - Web UI (Full Featured + Teensy Integration)
 ====================================================================
 Web-based interface with wake word, push-to-talk, Teensy state monitoring.
 
+Package 3: Full Server Migration — Wireless architecture.
+Teensy communication via ESP32 WebSocket bridge (with USB serial fallback).
+Vision data from buddy_vision.py pipeline (with direct ESP32 capture fallback).
+
 Requirements:
-    pip install flask flask-socketio ollama openai-whisper edge-tts requests pillow numpy pvporcupine pvrecorder pyserial
+    pip install flask flask-socketio ollama openai-whisper edge-tts requests pillow numpy pvporcupine pvrecorder pyserial websocket-client
 
 Hardware:
-    - Microphone (ReSpeaker or USB mic)
-    - ESP32-S3 CAM at http://192.168.2.65/capture
+    - Microphone (ReSpeaker or USB mic — optional on server, push-to-talk always works)
+    - ESP32-S3 (WiFi↔UART bridge on port 81, camera stream)
     - Teensy 4.0 running Buddy firmware with AIBridge
-    - Speakers (browser audio)
+    - Speakers (browser audio on Office PC)
 
 Usage:
-    python buddy_web_full.py
-    Open http://localhost:5000 in browser
+    python buddy_web_full_V2.py
+    Open http://<SERVER_IP>:5000 from any browser on the network
 """
 
 import io
@@ -42,16 +46,27 @@ import pvporcupine
 from pvrecorder import PvRecorder
 import serial
 import serial.tools.list_ports
+import websocket  # pip install websocket-client
 
 # =============================================================================
 # DEFAULT CONFIGURATION
 # =============================================================================
 
 CONFIG = {
-    # Camera
+    # ─── Package 3: Architecture Migration ───
+
+    # ESP32 Bridge
+    "esp32_ip": "192.168.1.100",
+    "esp32_ws_port": 81,
+    "teensy_comm_mode": "websocket",   # "websocket" or "serial"
+
+    # Vision Pipeline (Package 2)
+    "vision_api_url": "http://localhost:5555",
+
+    # Camera (legacy — used as fallback if vision pipeline is offline)
     "esp32_cam_url": "http://192.168.2.65/capture",
     "image_rotation": 90,
-    
+
     # Wake Word - Jarvis (English built-in)
     "picovoice_access_key": "wUO0BjvmEl2gQDwJaRh18jodPKKkGWGU+YBBC1+F+6CVdIvG0HFwPQ==",
     "wake_word": "jarvis",
@@ -148,6 +163,10 @@ current_image_base64 = None
 # Teensy state
 teensy_serial = None
 teensy_connected = False
+
+# WebSocket connection to ESP32 bridge
+ws_connection = None
+ws_lock = threading.Lock()
 teensy_state = {
     "arousal": 0.5, "valence": 0.0, "dominance": 0.5,
     "emotion": "NEUTRAL", "behavior": "IDLE",
@@ -307,6 +326,10 @@ HTML_TEMPLATE = """
                             <div class="teensy-dot" id="teensyDot"></div>
                             <span id="teensyStatus">Teensy: connecting...</span>
                         </div>
+                        <div class="teensy-status">
+                            <div class="teensy-dot" id="visionDot"></div>
+                            <span id="visionStatus">Vision: checking...</span>
+                        </div>
                         <div class="buddy-state">
                             <div class="state-item"><div class="state-label">Emotion</div><span class="emotion-badge NEUTRAL" id="emotionBadge">NEUTRAL</span></div>
                             <div class="state-item"><div class="state-label">Behavior</div><span class="behavior-badge" id="behaviorBadge">IDLE</span></div>
@@ -339,10 +362,16 @@ HTML_TEMPLATE = """
             </div>
             <div class="settings-panel" id="settingsPanel">
                 <div class="settings-section">
-                    <h3>🔌 Teensy Connection</h3>
-                    <div class="setting-row-inline"><input type="checkbox" id="settingTeensyAutoDetect" checked><label for="settingTeensyAutoDetect">Auto-detect Teensy port</label></div>
-                    <div class="setting-row"><label>Manual Port</label><input type="text" id="settingTeensyPort" value="COM12"></div>
+                    <h3>🔌 Connection</h3>
+                    <div class="setting-row"><label>ESP32 Bridge IP</label><input type="text" id="settingEsp32Ip" value="192.168.1.100"></div>
+                    <div class="setting-row"><label>Comm Mode</label><select id="settingCommMode"><option value="websocket" selected>WebSocket (WiFi)</option><option value="serial">USB Serial</option></select></div>
+                    <div class="setting-row-inline"><input type="checkbox" id="settingTeensyAutoDetect" checked><label for="settingTeensyAutoDetect">Auto-detect Teensy port (serial mode)</label></div>
+                    <div class="setting-row"><label>Manual Port (serial mode)</label><input type="text" id="settingTeensyPort" value="COM12"></div>
                     <button class="btn-export" id="btnReconnectTeensy">🔄 Reconnect Teensy</button>
+                </div>
+                <div class="settings-section">
+                    <h3>🧠 Behavior</h3>
+                    <div class="setting-row-inline"><input type="checkbox" id="settingSpontaneous"><label for="settingSpontaneous">Spontaneous Speech</label></div>
                 </div>
                 <div class="settings-section">
                     <h3>🎤 Wake Word</h3>
@@ -427,8 +456,11 @@ HTML_TEMPLATE = """
             document.getElementById('trackingStatus').textContent = d.tracking ? 'Face tracking active' : 'Not tracking';
         });
         socket.on('config_loaded', (d) => {
+            document.getElementById('settingEsp32Ip').value = d.esp32_ip || '192.168.1.100';
+            document.getElementById('settingCommMode').value = d.teensy_comm_mode || 'websocket';
             document.getElementById('settingTeensyAutoDetect').checked = d.teensy_auto_detect !== false;
             document.getElementById('settingTeensyPort').value = d.teensy_port || 'COM12';
+            document.getElementById('settingSpontaneous').checked = d.spontaneous_speech_enabled || false;
             document.getElementById('settingWakeWordEnabled').checked = d.wake_word_enabled;
             document.getElementById('settingWakeWord').value = d.wake_word || 'jarvis';
             document.getElementById('settingWakeWordPath').value = d.wake_word_path || '';
@@ -467,6 +499,7 @@ HTML_TEMPLATE = """
         document.getElementById('btnReconnectTeensy').addEventListener('click', () => { socket.emit('reconnect_teensy', {auto_detect: document.getElementById('settingTeensyAutoDetect').checked, port: document.getElementById('settingTeensyPort').value}); });
         document.getElementById('btnApplySettings').addEventListener('click', () => {
             socket.emit('update_config', {
+                esp32_ip: document.getElementById('settingEsp32Ip').value, teensy_comm_mode: document.getElementById('settingCommMode').value,
                 teensy_auto_detect: document.getElementById('settingTeensyAutoDetect').checked, teensy_port: document.getElementById('settingTeensyPort').value,
                 wake_word_enabled: document.getElementById('settingWakeWordEnabled').checked, wake_word: document.getElementById('settingWakeWord').value,
                 wake_word_path: document.getElementById('settingWakeWordPath').value.trim(), wake_word_model_path: document.getElementById('settingWakeWordModelPath').value.trim(),
@@ -481,6 +514,33 @@ HTML_TEMPLATE = """
         });
         document.getElementById('btnExportConfig').addEventListener('click', () => { navigator.clipboard.writeText(JSON.stringify({wake_word: document.getElementById('settingWakeWord').value, wake_word_sensitivity: parseFloat(document.getElementById('settingWakeWordSensitivity').value)}, null, 2)); log('Config copied', 'success'); });
         
+        // Vision pipeline health check
+        setInterval(async () => {
+            try {
+                const r = await fetch('/api/vision_health');
+                const d = await r.json();
+                const dot = document.getElementById('visionDot');
+                const txt = document.getElementById('visionStatus');
+                if (d.ok) {
+                    dot.classList.add('connected');
+                    dot.classList.remove('disconnected');
+                    txt.textContent = 'Vision: ' + (d.tracking_fps || 0).toFixed(0) + 'fps, ' + (d.latency_ms || 0).toFixed(0) + 'ms';
+                } else {
+                    dot.classList.add('disconnected');
+                    dot.classList.remove('connected');
+                    txt.textContent = 'Vision: offline';
+                }
+            } catch(e) {
+                document.getElementById('visionDot').classList.add('disconnected');
+                document.getElementById('visionStatus').textContent = 'Vision: offline';
+            }
+        }, 5000);
+
+        // Spontaneous speech toggle
+        document.getElementById('settingSpontaneous').addEventListener('change', (e) => {
+            socket.emit('toggle_spontaneous', { enabled: e.target.checked });
+        });
+
         initAudio(); updateRanges(); socket.emit('get_config');
     </script>
 </body>
@@ -499,6 +559,54 @@ def find_teensy_port():
     return None
 
 def connect_teensy():
+    """Connect to Teensy via ESP32 WebSocket bridge, with USB serial fallback."""
+    global teensy_serial, teensy_connected, ws_connection
+
+    mode = CONFIG.get("teensy_comm_mode", "websocket")
+
+    if mode == "websocket":
+        return connect_teensy_ws()
+    else:
+        return connect_teensy_serial()
+
+def connect_teensy_ws():
+    """Connect via ESP32 WiFi-UART bridge (WebSocket)."""
+    global ws_connection, teensy_connected
+    try:
+        if ws_connection:
+            try: ws_connection.close()
+            except: pass
+
+        ip = CONFIG["esp32_ip"]
+        port = CONFIG["esp32_ws_port"]
+        url = f"ws://{ip}:{port}"
+
+        ws_connection = websocket.create_connection(url, timeout=5)
+
+        # Read welcome message from ESP32
+        hello = ws_connection.recv()
+        socketio.emit('log', {'message': f'ESP32 bridge connected: {hello}', 'level': 'success'})
+
+        # Test with QUERY
+        ws_connection.send("!QUERY")
+        resp = ws_connection.recv()
+
+        if resp and '{' in resp:
+            teensy_connected = True
+            socketio.emit('teensy_status', {'connected': True, 'port': f'WS:{ip}:{port}'})
+            socketio.emit('log', {'message': 'Teensy responding via WebSocket bridge', 'level': 'success'})
+            return True
+        else:
+            raise Exception(f"Unexpected QUERY response: {resp}")
+
+    except Exception as e:
+        socketio.emit('log', {'message': f'WebSocket bridge error: {e}', 'level': 'error'})
+        socketio.emit('log', {'message': 'Trying USB serial fallback...', 'level': 'warning'})
+        # Fallback to USB serial
+        return connect_teensy_serial()
+
+def connect_teensy_serial():
+    """Original USB serial connection (fallback)."""
     global teensy_serial, teensy_connected
     try:
         if teensy_serial: teensy_serial.close()
@@ -506,17 +614,60 @@ def connect_teensy():
         if not port: port = CONFIG.get("teensy_port", "COM12")
         teensy_serial = serial.Serial(port=port, baudrate=CONFIG.get("teensy_baud", 115200), timeout=0.1)
         teensy_connected = True
+        CONFIG["teensy_comm_mode"] = "serial"  # Record that we fell back
         socketio.emit('teensy_status', {'connected': True, 'port': port})
-        socketio.emit('log', {'message': f'Teensy connected on {port}', 'level': 'success'})
+        socketio.emit('log', {'message': f'Teensy connected via USB: {port}', 'level': 'success'})
         return True
     except Exception as e:
         teensy_connected = False
         socketio.emit('teensy_status', {'connected': False, 'port': ''})
-        socketio.emit('log', {'message': f'Teensy error: {e}', 'level': 'error'})
+        socketio.emit('log', {'message': f'Teensy USB error: {e}', 'level': 'error'})
         return False
 
 def teensy_send_command(cmd, fallback=None):
-    """Send command to Teensy with optional fallback for unimplemented commands."""
+    """Send command to Teensy via WebSocket bridge or USB serial."""
+    global teensy_connected, ws_connection
+
+    mode = CONFIG.get("teensy_comm_mode", "websocket")
+
+    if mode == "websocket":
+        return teensy_send_ws(cmd, fallback)
+    else:
+        return teensy_send_serial(cmd, fallback)
+
+def teensy_send_ws(cmd, fallback=None):
+    """Send command via ESP32 WebSocket bridge."""
+    global ws_connection, teensy_connected
+    if not teensy_connected or not ws_connection: return None
+
+    with ws_lock:
+        try:
+            ws_connection.send(f"!{cmd}")
+            ws_connection.settimeout(0.5)  # 500ms timeout
+            resp = ws_connection.recv()
+
+            if resp:
+                resp = resp.strip()
+                if resp.startswith('{'):
+                    try:
+                        result = json.loads(resp)
+                        if not result.get('ok') and result.get('reason') == 'unknown_command' and fallback:
+                            socketio.emit('log', {'message': f'Command {cmd} not implemented, trying fallback', 'level': 'warning'})
+                            return teensy_send_ws(fallback)
+                        return result
+                    except json.JSONDecodeError:
+                        pass
+            return None
+
+        except websocket.WebSocketTimeoutException:
+            return None
+        except Exception as e:
+            teensy_connected = False
+            socketio.emit('log', {'message': f'WebSocket error: {e}', 'level': 'error'})
+            return None
+
+def teensy_send_serial(cmd, fallback=None):
+    """Send command via USB serial (original implementation)."""
     global teensy_serial, teensy_connected
     if not teensy_connected or not teensy_serial: return None
     try:
@@ -529,12 +680,10 @@ def teensy_send_command(cmd, fallback=None):
         for line in resp.split('\n'):
             line = line.strip()
             if line.startswith('{'):
-                try: 
+                try:
                     result = json.loads(line)
-                    # If command not recognized and we have a fallback, try it
                     if not result.get('ok') and result.get('error') == 'unknown_command' and fallback:
-                        socketio.emit('log', {'message': f'Command {cmd} not implemented, trying fallback', 'level': 'warning'})
-                        return teensy_send_command(fallback)
+                        return teensy_send_serial(fallback)
                     return result
                 except: pass
         return None
@@ -563,19 +712,34 @@ def query_teensy_state():
 
 def teensy_poll_loop():
     global teensy_connected
+    ws_reconnect_count = 0
+
     while True:
         if teensy_connected:
             s = query_teensy_state()
             if s:
                 socketio.emit('buddy_state', s)
-                # Check for spontaneous speech each poll cycle
-                if spontaneous_speech_enabled and not is_processing:
+                ws_reconnect_count = 0  # Reset on success
+
+                # Spontaneous speech check
+                if CONFIG.get("spontaneous_speech_enabled", False) and not is_processing:
                     check_spontaneous_speech(s)
             else:
                 teensy_connected = False
+                ws_reconnect_count += 1
                 socketio.emit('teensy_status', {'connected': False, 'port': ''})
-                time.sleep(2); connect_teensy()
-        else: connect_teensy()
+
+                # Exponential backoff on reconnection
+                wait = min(3 * ws_reconnect_count, 30)
+                socketio.emit('log', {
+                    'message': f'Connection lost, retrying in {wait}s...',
+                    'level': 'warning'
+                })
+                time.sleep(wait)
+                connect_teensy()
+        else:
+            connect_teensy()
+
         time.sleep(CONFIG.get("teensy_state_poll_interval", 1.0))
 
 def execute_buddy_actions(text):
@@ -633,6 +797,16 @@ def execute_buddy_actions(text):
 def init_wake_word():
     global porcupine, recorder
     try:
+        # Check if a recording device is available on this machine
+        try:
+            test_recorder = PvRecorder(device_index=-1, frame_length=512)
+            test_recorder.delete()
+        except Exception as e:
+            socketio.emit('log', {'message': f'No microphone on server — wake word disabled. Use push-to-talk.', 'level': 'warning'})
+            socketio.emit('wake_word_status', {'enabled': False, 'word': 'disabled (no mic)'})
+            return False
+
+        # Original init logic continues...
         if porcupine: porcupine.delete()
         wp = CONFIG.get("wake_word_path", "")
         mp = CONFIG.get("wake_word_model_path", "")
@@ -646,7 +820,8 @@ def init_wake_word():
         if recorder is None: recorder = PvRecorder(device_index=-1, frame_length=porcupine.frame_length)
         return True
     except Exception as e:
-        socketio.emit('log', {'message': f'Wake word error: {e}', 'level': 'error'})
+        socketio.emit('log', {'message': f'Wake word init failed: {e}. Push-to-talk still works.', 'level': 'warning'})
+        socketio.emit('wake_word_status', {'enabled': False, 'word': 'disabled'})
         return False
 
 def wake_word_loop():
@@ -740,21 +915,47 @@ def init_whisper():
     print("Whisper loaded.")
 
 def capture_frame(retries=3):
-    """Capture frame with retry logic for flaky ESP32-CAM."""
+    """
+    Capture frame from vision pipeline (Package 2) or ESP32 fallback.
+    Returns base64-encoded JPEG string.
+    """
     global current_image_base64
+
+    vision_url = CONFIG.get("vision_api_url", "http://localhost:5555")
+
+    # Try vision pipeline first (already rotated and processed)
     for attempt in range(retries):
         try:
-            r = requests.get(CONFIG["esp32_cam_url"], timeout=5)
+            r = requests.get(f"{vision_url}/snapshot", timeout=3)
             if r.status_code == 200:
-                img = Image.open(io.BytesIO(r.content)).rotate(CONFIG["image_rotation"], expand=True)
-                buf = io.BytesIO(); img.save(buf, format="JPEG", quality=85); buf.seek(0)
+                # Vision pipeline returns raw JPEG bytes
+                img_bytes = r.content
+                current_image_base64 = base64.b64encode(img_bytes).decode("utf-8")
+                return current_image_base64
+        except Exception as e:
+            if attempt == 0:
+                socketio.emit('log', {'message': f'Vision API unavailable, trying ESP32 direct', 'level': 'warning'})
+
+    # Fallback: direct ESP32 capture (old method)
+    for attempt in range(retries):
+        try:
+            cam_url = f"http://{CONFIG['esp32_ip']}/capture"
+            r = requests.get(cam_url, timeout=5)
+            if r.status_code == 200:
+                img = Image.open(io.BytesIO(r.content))
+                rotation = CONFIG.get("image_rotation", 0)
+                if rotation:
+                    img = img.rotate(rotation, expand=True)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=85)
+                buf.seek(0)
                 current_image_base64 = base64.b64encode(buf.read()).decode("utf-8")
                 return current_image_base64
         except Exception as e:
-            socketio.emit('log', {'message': f'Cam attempt {attempt+1}/{retries}: {e}', 'level': 'warning'})
             if attempt < retries - 1:
-                time.sleep(0.5)  # Brief pause before retry
-    socketio.emit('log', {'message': 'Camera capture failed after retries', 'level': 'error'})
+                time.sleep(0.5)
+
+    socketio.emit('log', {'message': 'Camera capture failed (both sources)', 'level': 'error'})
     return None
 
 def transcribe_audio(data):
@@ -765,9 +966,23 @@ def transcribe_audio(data):
         return r["text"].strip()
     finally: os.unlink(tp)
 
+def get_vision_state():
+    """Fetch current vision state from buddy_vision.py API."""
+    try:
+        vision_url = CONFIG.get("vision_api_url", "http://localhost:5555")
+        r = requests.get(f"{vision_url}/state", timeout=1)
+        if r.status_code == 200:
+            return r.json()
+    except:
+        pass
+    return None
+
 def get_buddy_state_prompt():
+    """Build state description for LLM, including vision data from Package 2."""
     with teensy_state_lock: s = teensy_state.copy()
-    if not teensy_connected: return "Note: Unable to read emotional state."
+
+    if not teensy_connected:
+        return "Note: Unable to read emotional state."
 
     # Arousal description
     if s['arousal'] < 0.3: ad = "very calm, almost sleepy"
@@ -814,6 +1029,21 @@ def get_buddy_state_prompt():
         parts.append("You've been lonely and really want to talk")
     if s['stimulation'] < 0.3:
         parts.append("You've been bored and craving something interesting")
+
+    # ─── Enrich with vision data (from buddy_vision.py) ───
+    vision = get_vision_state()
+    if vision:
+        if vision.get("face_detected"):
+            expr = vision.get("face_expression")
+            if expr and expr != "neutral":
+                parts.append(f"Person's expression: {expr}")
+            count = vision.get("person_count", 0)
+            if count > 1:
+                parts.append(f"{count} people visible")
+
+        novelty = vision.get("scene_novelty", 0)
+        if novelty > 0.3:
+            parts.append("Something changed in the environment")
 
     return "\n".join(parts)
 
@@ -1187,7 +1417,20 @@ def build_spontaneous_prompt(trigger, state):
     # Add brevity enforcement
     brevity = "\n[CRITICAL: Keep response under 15 words. You're thinking out loud, not giving a speech. No action tags unless genuinely moved.]"
 
-    return prompt + state_context + brevity
+    # ─── Enrich with vision data ───
+    vision_context = ""
+    vision = get_vision_state()
+    if vision and trigger in ('face_appeared', 'face_recognized', 'discovery',
+                              'startled', 'commentary'):
+        expr = vision.get("face_expression")
+        if expr and expr != "neutral":
+            vision_context += f"\n[You can see the person's expression: they look {expr}.]"
+
+        novelty = vision.get("scene_novelty", 0)
+        if novelty > 0.3 and trigger == 'discovery':
+            vision_context += "\n[Something visually changed in your environment — comment on what you see.]"
+
+    return prompt + state_context + vision_context + brevity
 
 
 # =============================================================================
@@ -1196,6 +1439,15 @@ def build_spontaneous_prompt(trigger, state):
 
 @app.route('/')
 def index(): return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/vision_health')
+def api_vision_health():
+    """Proxy to vision pipeline health endpoint."""
+    try:
+        r = requests.get(f"{CONFIG['vision_api_url']}/health", timeout=2)
+        return r.json()
+    except:
+        return jsonify({"ok": False})
 
 @socketio.on('connect')
 def handle_connect():
@@ -1259,6 +1511,7 @@ def handle_resume(): CONFIG['wake_word_enabled'] = True
 def handle_toggle_spontaneous(data):
     global spontaneous_speech_enabled
     spontaneous_speech_enabled = data.get('enabled', True)
+    CONFIG["spontaneous_speech_enabled"] = spontaneous_speech_enabled
     socketio.emit('log', {
         'message': f'Spontaneous speech {"enabled" if spontaneous_speech_enabled else "disabled"}',
         'level': 'info'
@@ -1268,14 +1521,48 @@ def handle_toggle_spontaneous(data):
 # MAIN
 # =============================================================================
 
+def check_vision_pipeline():
+    """Check if buddy_vision.py is running."""
+    vision = get_vision_state()
+    if vision:
+        socketio.emit('log', {
+            'message': f'Vision pipeline online: {vision.get("tracking_fps", 0):.0f} fps',
+            'level': 'success'
+        })
+        return True
+    else:
+        socketio.emit('log', {
+            'message': 'Vision pipeline offline — face tracking disabled, push-to-talk still works',
+            'level': 'warning'
+        })
+        return False
+
 if __name__ == '__main__':
     print("=" * 50)
-    print("BUDDY VOICE ASSISTANT")
+    print("BUDDY VOICE ASSISTANT — Server Mode")
     print("=" * 50)
+    print(f"  Comm mode:  {CONFIG['teensy_comm_mode']}")
+    print(f"  ESP32 IP:   {CONFIG['esp32_ip']}")
+    print(f"  Vision API: {CONFIG['vision_api_url']}")
+    print()
+
     init_whisper()
+
     print("Connecting to Teensy...")
     connect_teensy()
+
+    # Check vision pipeline
+    vision = get_vision_state()
+    if vision:
+        print(f"  Vision pipeline: ONLINE ({vision.get('tracking_fps', 0):.0f} fps)")
+    else:
+        print("  Vision pipeline: OFFLINE (start buddy_vision.py for face tracking)")
+
     threading.Thread(target=teensy_poll_loop, daemon=True).start()
     threading.Thread(target=wake_word_loop, daemon=True).start()
-    print("Open http://localhost:5000")
+
+    print()
+    print(f"Open http://0.0.0.0:5000 from any browser on the network")
+    print("=" * 50)
+
     socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
