@@ -480,6 +480,15 @@ public:
           Serial.print("[TRACKING] LOCKED ON for ");
           Serial.print(lockDuration / 1000);
           Serial.println(" seconds");
+
+          // Buddy signature: understated social greeting on lock
+          if (servoController != nullptr &&
+              (animator == nullptr || !animator->isCurrentlyAnimating())) {
+            int faceBaseAngle = constrain((int)(targetFaceX * 170.0 / 240.0), 10, 170);
+            int faceNodAngle = constrain((int)(targetFaceY * 70.0 / 240.0) + 80, 80, 150);
+            expressiveness.socialGreeting(*servoController, faceBaseAngle, faceNodAngle,
+                                          emotion, personality, needs);
+          }
         }
         // During engagement, track moderately (building interest but visible)
         trackingIntensity = 0.7;  // Increased from 0.4 for more visible tracking
@@ -917,6 +926,15 @@ public:
               *servoController, emotion, personality, needs);
         }
       }
+    }
+
+    // Buddy signature: alone thinking when nobody is around
+    if (!reflexIsActive && !isTrackingFace &&
+        (animator == nullptr || !animator->isCurrentlyAnimating()) &&
+        servoController != nullptr &&
+        currentBehavior == IDLE && !spatialMemory.likelyHumanPresent() &&
+        random(100) < 8) {
+      expressiveness.aloneThinking(*servoController, emotion, personality, needs);
     }
 
     // Ambient life (need-driven, not timer-driven)
@@ -1370,7 +1388,11 @@ public:
       // REMOVED: delay(400) - non-blocking design
 
       if (expressiveness.canExpress() && random(100) < 50) {
-        if (personality.getCuriosity() > 0.5) {
+        if (personality.getCuriosity() > 0.5 && random(100) < 40) {
+          // Buddy signature: full curious inspection sequence
+          expressiveness.curiousInspection(*servoController, angles.base, angles.nod,
+                                            emotion, personality, needs);
+        } else if (personality.getCuriosity() > 0.5) {
           expressiveness.expressCuriosity(*servoController, emotion, personality, needs);
         } else {
           expressiveness.expressContemplation(*servoController, emotion, personality, needs);

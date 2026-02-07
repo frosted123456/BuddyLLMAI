@@ -23,14 +23,14 @@ private:
   
 public:
   Personality() {
-    // Start with balanced personality
-    curiosity = 0.5;
-    caution = 0.5;
-    sociability = 0.5;
-    playfulness = 0.5;
-    excitability = 0.5;
-    persistence = 0.5;
-    expressiveness = 0.5;
+    // Buddy's canonical personality
+    curiosity = 0.75;
+    caution = 0.50;
+    sociability = 0.55;
+    playfulness = 0.60;
+    excitability = 0.50;
+    persistence = 0.70;
+    expressiveness = 0.65;
   }
   
   // ============================================
@@ -194,7 +194,18 @@ public:
         expressiveness = 0.8;
         Serial.println("[PERSONALITY] Set to Playful Friend");
         break;
-        
+
+      case 4:  // Buddy (canonical personality)
+        curiosity = 0.75;
+        caution = 0.50;
+        sociability = 0.55;
+        playfulness = 0.60;
+        excitability = 0.50;
+        persistence = 0.70;
+        expressiveness = 0.65;
+        Serial.println("[PERSONALITY] Set to Buddy");
+        break;
+
       default:  // Balanced (default)
         curiosity = 0.5;
         caution = 0.5;
