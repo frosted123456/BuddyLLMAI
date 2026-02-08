@@ -67,7 +67,7 @@ const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 #define TEENSY_TX_PIN 43
 #define TEENSY_RX_PIN 44
 #define TEENSY_BAUD   921600
-HardwareSerial TeensySerial(1);
+HardwareSerial TeensySerial(0);  // Use UART0 — GPIO 43/44 are UART0's native pins
 
 // Network
 #define HTTP_PORT     80
