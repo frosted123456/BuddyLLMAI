@@ -36,6 +36,8 @@
 #include <WiFiUdp.h>
 #include <WebSocketsServer.h>
 #include "esp_task_wdt.h"
+#include "esp_system.h"          // For esp_reset_reason()
+#include "esp32-hal-psram.h"     // For ps_malloc()
 
 // ════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -164,22 +166,30 @@ bool initCamera() {
 
 bool setupWiFi() {
     Serial.printf("[WIFI] Connecting to %s...\n", WIFI_SSID);
+
+    // Clean slate — kill any residual WiFi state
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(200);
+
     WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    WiFi.persistent(true);
+    WiFi.persistent(false);          // Don't read/write NVS — avoids flash corruption issues
+    WiFi.setAutoReconnect(false);    // We handle reconnection manually in checkWiFi()
+    WiFi.setSleep(false);            // Disable power save BEFORE connecting (not after)
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED) {
         if (millis() - start > 20000) {
             Serial.println("[WIFI] Connection timeout");
+            Serial.printf("[WIFI] Status code: %d\n", WiFi.status());
             return false;
         }
         delay(500);
         Serial.print(".");
     }
     Serial.printf("\n[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-    WiFi.setSleep(false);  // Disable WiFi power save for low latency (WARN-2)
+    Serial.printf("[WIFI] RSSI: %d dBm\n", WiFi.RSSI());
     return true;
 }
 
@@ -473,8 +483,15 @@ void checkWiFi() {
         cameraPaused = true;
         delay(200);  // Let current frame capture complete
 
-        WiFi.disconnect(true);  // Force radio off
-        delay(1000);            // Let voltage rails stabilize
+        // Full radio reset — disconnect alone sometimes isn't enough on ESP32-S3
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        delay(500);
+        WiFi.mode(WIFI_STA);
+        WiFi.persistent(false);
+        WiFi.setAutoReconnect(false);
+        WiFi.setSleep(false);
+        delay(500);
         WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
         unsigned long start = millis();
@@ -488,8 +505,12 @@ void checkWiFi() {
 
         if (WiFi.status() == WL_CONNECTED) {
             Serial.printf("[WIFI] Reconnected: %s\n", WiFi.localIP().toString().c_str());
+            Serial.printf("[WIFI] RSSI: %d dBm\n", WiFi.RSSI());
             WiFi.setSleep(false);
             reconnectAttempts = 0;
+
+            // Start network services if they were deferred during setup
+            startNetworkServices();
         } else if (reconnectAttempts >= 10) {
             Serial.println("[WIFI] Too many failures, rebooting...");
             delay(1000);
@@ -498,6 +519,29 @@ void checkWiFi() {
     } else {
         reconnectAttempts = 0;
     }
+}
+
+// ════════════════════════════════════════════════════════════════
+// Network Service Startup — called once when WiFi first connects
+// ════════════════════════════════════════════════════════════════
+
+bool networkServicesStarted = false;
+
+void startNetworkServices() {
+    if (networkServicesStarted) return;  // Idempotent — safe to call multiple times
+
+    httpServer.begin();
+    Serial.printf("[HTTP] Server on port %d\n", HTTP_PORT);
+
+    wsServer.begin();
+    wsServer.onEvent(wsEvent);
+    Serial.printf("[WS] Server on port %d\n", WS_PORT);
+
+    udp.begin(UDP_PORT);
+    Serial.printf("[UDP] Listening on port %d\n", UDP_PORT);
+
+    networkServicesStarted = true;
+    Serial.println("[NET] All network services active");
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -570,26 +614,24 @@ void setup() {
     uartMutex = xSemaphoreCreateMutex();
     frameMutex = xSemaphoreCreateMutex();
 
-    // ═══ 5. Start network services (only if WiFi connected) ═══
+    // ═══ 5. Register HTTP handlers (just function pointers, no network needed) ═══
     httpServer.on("/health", HTTP_GET, handleHealth);
     httpServer.on("/capture", HTTP_GET, handleCapture);
     httpServer.on("/stream", HTTP_GET, handleStream);
     httpServer.onNotFound(handleNotFound);
-    httpServer.begin();
-    Serial.printf("[HTTP] Server on port %d\n", HTTP_PORT);
 
-    wsServer.begin();
-    wsServer.onEvent(wsEvent);
-    Serial.printf("[WS] Server on port %d\n", WS_PORT);
+    // ═══ 6. Start network services ONLY if WiFi is connected ═══
+    if (wifiConnected) {
+        startNetworkServices();
+    } else {
+        Serial.println("[NET] Services deferred — will start when WiFi connects");
+    }
 
-    udp.begin(UDP_PORT);
-    Serial.printf("[UDP] Listening on port %d\n", UDP_PORT);
-
-    // ═══ 6. Initialize watchdog ═══
+    // ═══ 7. Initialize watchdog ═══
     esp_task_wdt_init(WDT_TIMEOUT_S, true);
     esp_task_wdt_add(NULL);
 
-    // ═══ 7. Start background tasks ═══
+    // ═══ 8. Start background tasks ═══
     // Capture task on core 0 (shares with HTTP/stream)
     xTaskCreatePinnedToCore(captureTask, "capture", 8192, NULL, 1, NULL, 0);
     // HTTP server task on core 0 (handles blocking /stream)
