@@ -32,7 +32,7 @@
 #include "AnimationController.h"
 #include "ReflexiveControl.h"
 
-extern bool esp32Ready;  // Handshake flag from main .ino — gates Serial1 writes
+extern volatile bool esp32Linked;  // Handshake flag from main .ino — gates Serial1 writes
 
 // AI animation modes for non-blocking looping animations
 enum AIAnimMode {
@@ -421,7 +421,7 @@ private:
     );
 
     if (len > 0 && len < (int)sizeof(buf)) {
-      if (esp32Ready || responseStream == &Serial) {
+      if (esp32Linked || responseStream == &Serial) {
         responseStream->println(buf);
       }
     } else {
