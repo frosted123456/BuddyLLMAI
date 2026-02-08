@@ -78,7 +78,7 @@ HardwareSerial TeensySerial(1);
 #define TARGET_FPS         15
 #define WDT_TIMEOUT_S      15
 #define TEENSY_RESPONSE_TIMEOUT_MS 200
-#define WIFI_RECONNECT_INTERVAL_MS 30000
+#define WIFI_RECONNECT_INTERVAL_MS 10000
 
 // MJPEG boundary
 #define MJPEG_BOUNDARY "buddyframe"
@@ -162,11 +162,13 @@ bool initCamera() {
 bool setupWiFi() {
     Serial.printf("[WIFI] Connecting to %s...\n", WIFI_SSID);
     WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(true);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED) {
-        if (millis() - start > 10000) {
+        if (millis() - start > 20000) {
             Serial.println("[WIFI] Connection timeout");
             return false;
         }
@@ -429,22 +431,31 @@ void checkTeensyUnsolicited() {
 
 void checkWiFi() {
     static unsigned long lastCheck = 0;
+    static int reconnectAttempts = 0;
     if (millis() - lastCheck < WIFI_RECONNECT_INTERVAL_MS) return;
     lastCheck = millis();
 
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[WIFI] Disconnected, reconnecting...");
+        reconnectAttempts++;
+        Serial.printf("[WIFI] Disconnected, reconnecting (attempt %d)...\n", reconnectAttempts);
         WiFi.disconnect();
-        delay(100);
+        delay(500);
         WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
         unsigned long start = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - start < 5000) {
+        while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
             esp_task_wdt_reset();
             delay(250);
         }
         if (WiFi.status() == WL_CONNECTED) {
             Serial.printf("[WIFI] Reconnected: %s\n", WiFi.localIP().toString().c_str());
+            reconnectAttempts = 0;
+        } else if (reconnectAttempts >= 10) {
+            Serial.println("[WIFI] Too many failures, rebooting...");
+            delay(1000);
+            ESP.restart();
         }
+    } else {
+        reconnectAttempts = 0;
     }
 }
 
