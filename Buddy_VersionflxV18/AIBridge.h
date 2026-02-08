@@ -216,6 +216,115 @@ public:
   // Used by main loop to skip behavior engine servo commands
   bool isAIAnimating() { return aiAnimMode != AI_ANIM_NONE; }
 
+  // Public: called directly from parseVisionData() in .ino for zero-overhead updates
+  // ============================================
+  // !VISION:json — Phase 2: Autonomous Observation Loop
+  // Updates behavior engine with PC vision observations.
+  // This is a ONE-WAY feed (no response) to avoid UART contention.
+  // Called directly from parseVisionData() at 2-3 Hz.
+  // ============================================
+
+  void cmdVision(const char* jsonStr) {
+    if (engine == nullptr) return;
+
+    // Parse compact vision update from PC
+    // Format: {"f":1,"fc":2,"ex":"happy","nv":0.45,"ob":3,"mv":0.2}
+    int faceDetected = 0;
+    int faceCount = 0;
+    char expression[16] = "neutral";
+    float sceneNovelty = 0.0;
+    int objectCount = 0;
+    float movement = 0.0;
+
+    const char* p;
+
+    p = strstr(jsonStr, "\"f\":");
+    if (p) faceDetected = atoi(p + 4);
+
+    p = strstr(jsonStr, "\"fc\":");
+    if (p) faceCount = atoi(p + 5);
+
+    p = strstr(jsonStr, "\"ex\":\"");
+    if (p) {
+        p += 6;
+        int i = 0;
+        while (*p && *p != '"' && i < 15) {
+            expression[i++] = *p++;
+        }
+        expression[i] = '\0';
+    }
+
+    p = strstr(jsonStr, "\"nv\":");
+    if (p) sceneNovelty = atof(p + 5);
+
+    p = strstr(jsonStr, "\"ob\":");
+    if (p) objectCount = atoi(p + 5);
+
+    p = strstr(jsonStr, "\"mv\":");
+    if (p) movement = atof(p + 5);
+
+    // ── Feed into behavior engine ──
+
+    SpatialMemory& spatialMemory = engine->getSpatialMemory();
+    Emotion& emotion = engine->getEmotion();
+    Needs& needs = engine->getNeeds();
+    ConsciousnessLayer& consciousness = engine->getConsciousness();
+
+    // 1. Scene novelty → spatial memory (enriches ultrasonic-only data)
+    if (sceneNovelty > 0.0) {
+        // Compute approximate direction from base servo angle
+        int base = 90;
+        if (servos != nullptr) {
+            int b, n, t;
+            servos->getPosition(b, n, t);
+            base = b;
+        }
+        // Map servo angle to 8-bin direction: 90=front(0), >130=left(6), <50=right(2)
+        int dir;
+        if (base > 130)      dir = 6;  // Left
+        else if (base > 110) dir = 7;  // Front-left
+        else if (base > 70)  dir = 0;  // Front
+        else if (base > 50)  dir = 1;  // Front-right
+        else                 dir = 2;  // Right
+
+        spatialMemory.injectExternalNovelty(dir, sceneNovelty);
+    }
+
+    // 2. Expression → emotional resonance
+    if (faceDetected && strcmp(expression, "neutral") != 0) {
+        float valenceShift = 0.0;
+        float arousalShift = 0.0;
+
+        if (strcmp(expression, "happy") == 0)          { valenceShift = 0.05;  arousalShift = 0.02; }
+        else if (strcmp(expression, "surprised") == 0)  { arousalShift = 0.08; }
+        else if (strcmp(expression, "frowning") == 0)   { valenceShift = -0.03; arousalShift = 0.02; }
+        else if (strcmp(expression, "angry") == 0)      { valenceShift = -0.05; arousalShift = 0.05; }
+        else if (strcmp(expression, "sad") == 0)        { valenceShift = -0.04; arousalShift = -0.02; }
+        else if (strcmp(expression, "raised_brows") == 0) { arousalShift = 0.03; }
+
+        emotion.nudge(valenceShift, arousalShift);
+    }
+
+    // 3. Face count → social context
+    if (faceCount > 1) {
+        needs.satisfySocial(0.02 * faceCount);
+    }
+
+    // 4. Object count + movement → stimulation
+    if (objectCount > 0 || movement > 0.3) {
+        float stimAmount = min(0.05f, movement * 0.03f + objectCount * 0.01f);
+        needs.satisfyStimulation(stimAmount);
+    }
+
+    // 5. High novelty → consciousness event (can trigger wondering)
+    if (sceneNovelty > 0.5) {
+        consciousness.onEnvironmentChange(sceneNovelty);
+    }
+
+    // No response — this is a continuous feed, not a request/response command.
+    // Saves UART bandwidth and avoids contention.
+  }
+
 private:
 
   // ============================================
@@ -268,65 +377,53 @@ private:
     bool animating = (animator != nullptr && animator->isCurrentlyAnimating())
                      || (aiAnimMode != AI_ANIM_NONE);
 
-    responseStream->print("{\"arousal\":");
-    responseStream->print(emo.getArousal(), 2);
-    responseStream->print(",\"valence\":");
-    responseStream->print(emo.getValence(), 2);
-    responseStream->print(",\"dominance\":");
-    responseStream->print(emo.getDominance(), 2);
-    responseStream->print(",\"emotion\":\"");
-    responseStream->print(emo.getLabelString());
-    responseStream->print("\",\"behavior\":\"");
-    responseStream->print(behaviorName(beh));
-    responseStream->print("\",\"stimulation\":");
-    responseStream->print(needs.getStimulation(), 2);
-    responseStream->print(",\"social\":");
-    responseStream->print(needs.getSocial(), 2);
-    responseStream->print(",\"energy\":");
-    responseStream->print(needs.getEnergy(), 2);
-    responseStream->print(",\"safety\":");
-    responseStream->print(needs.getSafety(), 2);
-    responseStream->print(",\"novelty\":");
-    responseStream->print(needs.getNovelty(), 2);
-    responseStream->print(",\"tracking\":");
-    responseStream->print(tracking ? "true" : "false");
-    responseStream->print(",\"animating\":");
-    responseStream->print(animating ? "true" : "false");
-    responseStream->print(",\"servoBase\":");
-    responseStream->print(base);
-    responseStream->print(",\"servoNod\":");
-    responseStream->print(nod);
-    responseStream->print(",\"servoTilt\":");
-    responseStream->print(tilt);
-
     // Consciousness state
     ConsciousnessLayer& consciousness = engine->getConsciousness();
-    responseStream->print(",\"epistemic\":\"");
+
+    const char* epistemicStr = "confident";
     switch(consciousness.getEpistemicState()) {
-        case EPIST_CONFIDENT: responseStream->print("confident"); break;
-        case EPIST_UNCERTAIN: responseStream->print("uncertain"); break;
-        case EPIST_CONFUSED: responseStream->print("confused"); break;
-        case EPIST_LEARNING: responseStream->print("learning"); break;
-        case EPIST_CONFLICTED: responseStream->print("conflicted"); break;
-        case EPIST_WONDERING: responseStream->print("wondering"); break;
+        case EPIST_CONFIDENT:  epistemicStr = "confident"; break;
+        case EPIST_UNCERTAIN:  epistemicStr = "uncertain"; break;
+        case EPIST_CONFUSED:   epistemicStr = "confused"; break;
+        case EPIST_LEARNING:   epistemicStr = "learning"; break;
+        case EPIST_CONFLICTED: epistemicStr = "conflicted"; break;
+        case EPIST_WONDERING:  epistemicStr = "wondering"; break;
     }
-    responseStream->print("\"");
-    responseStream->print(",\"tension\":");
-    responseStream->print(consciousness.getTension(), 2);
-    responseStream->print(",\"wondering\":");
-    responseStream->print(consciousness.isWondering() ? "true" : "false");
-    responseStream->print(",\"selfAwareness\":");
-    responseStream->print(consciousness.getSelfAwareness(), 2);
 
-    // Speech urge fields
-    responseStream->print(",\"speechUrge\":");
-    responseStream->print(engine->getSpeechUrge().getUrge(), 2);
-    responseStream->print(",\"speechTrigger\":\"");
-    responseStream->print(engine->getSpeechUrge().triggerToString());
-    responseStream->print("\",\"wantsToSpeak\":");
-    responseStream->print(engine->getSpeechUrge().wantsToSpeak() ? "true" : "false");
+    // Build entire JSON in buffer, then send as single write
+    char buf[512];
+    int len = snprintf(buf, sizeof(buf),
+      "{\"arousal\":%.2f,\"valence\":%.2f,\"dominance\":%.2f,"
+      "\"emotion\":\"%s\",\"behavior\":\"%s\","
+      "\"stimulation\":%.2f,\"social\":%.2f,\"energy\":%.2f,"
+      "\"safety\":%.2f,\"novelty\":%.2f,"
+      "\"tracking\":%s,\"animating\":%s,"
+      "\"servoBase\":%d,\"servoNod\":%d,\"servoTilt\":%d,"
+      "\"epistemic\":\"%s\",\"tension\":%.2f,"
+      "\"wondering\":%s,\"selfAwareness\":%.2f,"
+      "\"speechUrge\":%.2f,\"speechTrigger\":\"%s\","
+      "\"wantsToSpeak\":%s}",
+      emo.getArousal(), emo.getValence(), emo.getDominance(),
+      emo.getLabelString(), behaviorName(beh),
+      needs.getStimulation(), needs.getSocial(), needs.getEnergy(),
+      needs.getSafety(), needs.getNovelty(),
+      tracking ? "true" : "false",
+      animating ? "true" : "false",
+      base, nod, tilt,
+      epistemicStr, consciousness.getTension(),
+      consciousness.isWondering() ? "true" : "false",
+      consciousness.getSelfAwareness(),
+      engine->getSpeechUrge().getUrge(),
+      engine->getSpeechUrge().triggerToString(),
+      engine->getSpeechUrge().wantsToSpeak() ? "true" : "false"
+    );
 
-    responseStream->println("}");
+    if (len > 0 && len < (int)sizeof(buf)) {
+      responseStream->println(buf);
+    } else {
+      // Buffer overflow fallback — should never happen with 512 bytes
+      responseStream->println("{\"ok\":false,\"reason\":\"buffer_overflow\"}");
+    }
   }
 
   // ============================================
@@ -762,115 +859,6 @@ private:
     // Satisfy some stimulation need since Buddy "expressed itself"
     engine->getNeeds().satisfyStimulation(0.1f);
     responseStream->println("{\"ok\":true,\"action\":\"spoke_acknowledged\"}");
-  }
-
-  // ============================================
-  // !VISION:json — Phase 2: Autonomous Observation Loop
-  // Updates behavior engine with PC vision observations.
-  // This is a ONE-WAY feed (no response) to avoid UART contention.
-  // Called directly from parseVisionData() at 2-3 Hz.
-  // ============================================
-
-  public:
-  void cmdVision(const char* jsonStr) {
-    if (engine == nullptr) return;
-
-    // Parse compact vision update from PC
-    // Format: {"f":1,"fc":2,"ex":"happy","nv":0.45,"ob":3,"mv":0.2}
-    int faceDetected = 0;
-    int faceCount = 0;
-    char expression[16] = "neutral";
-    float sceneNovelty = 0.0;
-    int objectCount = 0;
-    float movement = 0.0;
-
-    const char* p;
-
-    p = strstr(jsonStr, "\"f\":");
-    if (p) faceDetected = atoi(p + 4);
-
-    p = strstr(jsonStr, "\"fc\":");
-    if (p) faceCount = atoi(p + 5);
-
-    p = strstr(jsonStr, "\"ex\":\"");
-    if (p) {
-        p += 6;
-        int i = 0;
-        while (*p && *p != '"' && i < 15) {
-            expression[i++] = *p++;
-        }
-        expression[i] = '\0';
-    }
-
-    p = strstr(jsonStr, "\"nv\":");
-    if (p) sceneNovelty = atof(p + 5);
-
-    p = strstr(jsonStr, "\"ob\":");
-    if (p) objectCount = atoi(p + 5);
-
-    p = strstr(jsonStr, "\"mv\":");
-    if (p) movement = atof(p + 5);
-
-    // ── Feed into behavior engine ──
-
-    SpatialMemory& spatialMemory = engine->getSpatialMemory();
-    Emotion& emotion = engine->getEmotion();
-    Needs& needs = engine->getNeeds();
-    ConsciousnessLayer& consciousness = engine->getConsciousness();
-
-    // 1. Scene novelty → spatial memory (enriches ultrasonic-only data)
-    if (sceneNovelty > 0.0) {
-        // Compute approximate direction from base servo angle
-        int base = 90;
-        if (servos != nullptr) {
-            int b, n, t;
-            servos->getPosition(b, n, t);
-            base = b;
-        }
-        // Map servo angle to 8-bin direction: 90=front(0), >130=left(6), <50=right(2)
-        int dir;
-        if (base > 130)      dir = 6;  // Left
-        else if (base > 110) dir = 7;  // Front-left
-        else if (base > 70)  dir = 0;  // Front
-        else if (base > 50)  dir = 1;  // Front-right
-        else                 dir = 2;  // Right
-
-        spatialMemory.injectExternalNovelty(dir, sceneNovelty);
-    }
-
-    // 2. Expression → emotional resonance
-    if (faceDetected && strcmp(expression, "neutral") != 0) {
-        float valenceShift = 0.0;
-        float arousalShift = 0.0;
-
-        if (strcmp(expression, "happy") == 0)          { valenceShift = 0.05;  arousalShift = 0.02; }
-        else if (strcmp(expression, "surprised") == 0)  { arousalShift = 0.08; }
-        else if (strcmp(expression, "frowning") == 0)   { valenceShift = -0.03; arousalShift = 0.02; }
-        else if (strcmp(expression, "angry") == 0)      { valenceShift = -0.05; arousalShift = 0.05; }
-        else if (strcmp(expression, "sad") == 0)        { valenceShift = -0.04; arousalShift = -0.02; }
-        else if (strcmp(expression, "raised_brows") == 0) { arousalShift = 0.03; }
-
-        emotion.nudge(valenceShift, arousalShift);
-    }
-
-    // 3. Face count → social context
-    if (faceCount > 1) {
-        needs.satisfySocial(0.02 * faceCount);
-    }
-
-    // 4. Object count + movement → stimulation
-    if (objectCount > 0 || movement > 0.3) {
-        float stimAmount = min(0.05f, movement * 0.03f + objectCount * 0.01f);
-        needs.satisfyStimulation(stimAmount);
-    }
-
-    // 5. High novelty → consciousness event (can trigger wondering)
-    if (sceneNovelty > 0.5) {
-        consciousness.onEnvironmentChange(sceneNovelty);
-    }
-
-    // No response — this is a continuous feed, not a request/response command.
-    // Saves UART bandwidth and avoids contention.
   }
 
   private:

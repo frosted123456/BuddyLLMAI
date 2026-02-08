@@ -224,22 +224,39 @@ def calculate_confidence(detection_score, face_w_240):
     Map MediaPipe detection score to Teensy confidence range.
 
     Teensy thresholds:
-        < 25:  REJECTED (not sent to reflex controller)
+        < 25:  REJECTED
         25-69: Low confidence (was histogram tracker range)
         70-95: High confidence (was AI detection range)
 
-    MediaPipe scores are 0.0-1.0 and generally much higher than
-    the old ESP32 detector, so we map them into the 70-98 range
-    for AI-quality detections.
+    MediaPipe typically returns 0.5-0.99.
+    We map to a wider range to give Teensy meaningful variation:
+        0.50 → 55   (low — barely detected)
+        0.65 → 65   (low-medium)
+        0.75 → 75   (medium-high)
+        0.85 → 82   (high)
+        0.95 → 90   (very high)
+        1.00 → 95   (maximum)
     """
-    # MediaPipe confidence -> Teensy confidence
-    # 0.5 -> 70, 0.7 -> 80, 0.9 -> 90, 1.0 -> 95
-    base_conf = int(50 + detection_score * 48)
-    base_conf = max(25, min(base_conf, 98))
+    # Piecewise linear mapping for better spread
+    if detection_score < 0.5:
+        base_conf = 25  # Minimum accepted
+    elif detection_score < 0.7:
+        # 0.5-0.7 → 55-70 (low confidence band)
+        base_conf = int(55 + (detection_score - 0.5) * 75)
+    elif detection_score < 0.85:
+        # 0.7-0.85 → 70-85 (high confidence band)
+        base_conf = int(70 + (detection_score - 0.7) * 100)
+    else:
+        # 0.85-1.0 → 85-95 (very high confidence band)
+        base_conf = int(85 + (detection_score - 0.85) * 67)
 
-    # Slight boost for larger faces (more reliable at close range)
-    if face_w_240 > 60:
+    base_conf = max(25, min(base_conf, 95))
+
+    # Small boost for larger faces (closer = more reliable)
+    if face_w_240 > 80:
         base_conf = min(base_conf + 3, 98)
+    elif face_w_240 > 60:
+        base_conf = min(base_conf + 2, 98)
 
     return base_conf
 
@@ -453,7 +470,10 @@ def face_tracking_thread(config):
 
                 # Reset velocity tracking after sustained face loss
                 if consecutive_no_face > 10:
-                    state.prev_face_time = 0
+                    with state.lock:
+                        state.prev_face_time = 0
+                        state.prev_face_x = 120
+                        state.prev_face_y = 120
 
                 if config["debug"] and consecutive_no_face == 1:
                     print(f"[TRACKING] Face lost ({detect_ms:.1f}ms)")
