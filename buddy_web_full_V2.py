@@ -56,7 +56,7 @@ CONFIG = {
     # ─── Package 3: Architecture Migration ───
 
     # ESP32 Bridge
-    "esp32_ip": "192.168.1.100",
+    "esp32_ip": os.environ.get("BUDDY_ESP32_IP", "192.168.1.100"),
     "esp32_ws_port": 81,
     "teensy_comm_mode": "websocket",   # "websocket" or "serial"
 
@@ -203,6 +203,20 @@ spontaneous_utterance_log = []  # List of timestamps for rate limiting
 SPONTANEOUS_MAX_PER_HOUR = 6
 SPONTANEOUS_MIN_GAP_SECONDS = 120  # 2 minutes between utterances
 last_spontaneous_utterance = 0
+
+# Dedicated async event loop for TTS (thread-safe)
+_tts_loop = asyncio.new_event_loop()
+_tts_thread = threading.Thread(
+    target=lambda: _tts_loop.run_forever(),
+    daemon=True,
+    name="tts-loop"
+)
+_tts_thread.start()
+
+def run_tts_sync(text):
+    """Run TTS generation on the dedicated event loop (thread-safe)."""
+    future = asyncio.run_coroutine_threadsafe(generate_tts(text), _tts_loop)
+    return future.result(timeout=30)
 
 # =============================================================================
 # HTML TEMPLATE
@@ -615,9 +629,15 @@ def connect_teensy_ws():
 
     except Exception as e:
         socketio.emit('log', {'message': f'WebSocket bridge error: {e}', 'level': 'error'})
-        socketio.emit('log', {'message': 'Trying USB serial fallback...', 'level': 'warning'})
-        # Fallback to USB serial
-        return connect_teensy_serial()
+        # Only fallback to USB serial if explicitly configured
+        if CONFIG.get("teensy_comm_mode") == "serial":
+            socketio.emit('log', {'message': 'Falling back to USB serial...', 'level': 'warning'})
+            return connect_teensy_serial()
+        else:
+            socketio.emit('log', {'message': 'WebSocket failed. Check ESP32 WiFi. USB serial fallback disabled in websocket mode.', 'level': 'error'})
+            teensy_connected = False
+            socketio.emit('teensy_status', {'connected': False, 'port': ''})
+            return False
 
 def connect_teensy_serial():
     """Original USB serial connection (fallback)."""
@@ -1153,8 +1173,12 @@ def process_input(text, include_vision):
         teensy_send_command("SPEAKING")  # Subtle movements while talking (OK if not implemented)
         
         # Generate and send audio
-        audio = asyncio.run(generate_tts(clean))
-        socketio.emit('audio', {'base64': audio})
+        try:
+            audio = run_tts_sync(clean)
+            socketio.emit('audio', {'base64': audio})
+        except Exception as tts_err:
+            socketio.emit('log', {'message': f'TTS failed: {tts_err}', 'level': 'error'})
+            # Response text was already sent — user sees it, just no audio
         
         # Estimate speech duration (~80ms per character, clamped 1-30s)
         speech_duration = max(1.0, min(len(clean) * 0.08, 30.0))
@@ -1243,10 +1267,6 @@ def check_spontaneous_speech(state):
         if not prompt_text:
             return
 
-        # Log it
-        last_spontaneous_utterance = now
-        spontaneous_utterance_log.append(now)
-
         socketio.emit('log', {
             'message': f'Buddy wants to speak: {trigger} (urge: {urge:.2f})',
             'level': 'info'
@@ -1272,10 +1292,17 @@ def process_spontaneous_speech(prompt_text, trigger):
     Runs the LLM+TTS pipeline for spontaneous speech.
     Uses process_input's logic but with an internal prompt instead of user speech.
     """
+    global last_spontaneous_utterance, spontaneous_utterance_log
+
     if not processing_lock.acquire(blocking=False):
         return
 
     try:
+        # Log rate-limit AFTER acquiring lock (not before)
+        now = time.time()
+        last_spontaneous_utterance = now
+        spontaneous_utterance_log.append(now)
+
         # Capture vision for context (Buddy can comment on what it sees)
         img = None
         if trigger in ('face_appeared', 'face_recognized', 'discovery',
@@ -1303,8 +1330,12 @@ def process_spontaneous_speech(prompt_text, trigger):
         socketio.emit('status', {'state': 'speaking', 'message': 'Speaking...'})
         teensy_send_command("SPEAKING")
 
-        audio = asyncio.run(generate_tts(clean))
-        socketio.emit('audio', {'base64': audio})
+        try:
+            audio = run_tts_sync(clean)
+            socketio.emit('audio', {'base64': audio})
+        except Exception as tts_err:
+            socketio.emit('log', {'message': f'TTS failed: {tts_err}', 'level': 'error'})
+            # Response text was already sent — user sees it, just no audio
 
         speech_duration = max(1.0, min(len(clean) * 0.08, 30.0))
 

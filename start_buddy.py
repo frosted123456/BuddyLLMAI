@@ -12,6 +12,7 @@ Usage:
     python start_buddy.py --esp32-ip 192.168.1.100 --no-vision
 """
 
+import os
 import subprocess
 import sys
 import signal
@@ -60,10 +61,12 @@ def main():
         processes.append(p_vision)
         time.sleep(3)  # Let vision pipeline connect to stream
 
-    # Start main server
+    # Start main server with ESP32 IP passed via environment
     print("[LAUNCHER] Starting main server...")
+    server_env = os.environ.copy()
+    server_env["BUDDY_ESP32_IP"] = args.esp32_ip
     server_cmd = [sys.executable, "buddy_web_full_V2.py"]
-    p_server = subprocess.Popen(server_cmd)
+    p_server = subprocess.Popen(server_cmd, env=server_env)
     processes.append(p_server)
 
     print()

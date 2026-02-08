@@ -137,6 +137,9 @@ const unsigned long DIAGNOSTICS_INTERVAL = 300000; // 5 minutes
 bool freshFaceDataReceived = false;
 unsigned long lastFaceDataTime = 0;
 
+// Debug output control — disable for wireless-only operation
+bool debugPrintEnabled = true;  // Set false for production, true for development
+
 // ============================================
 // FACE DETECTION HANDLER (PACKAGE 5: With Face Tracking)
 // ============================================
@@ -715,7 +718,7 @@ void loop() {
     sumLoopTime += loopTime;
     loopCount++;
 
-    if (now - lastTimingPrint > 2000) {
+    if (debugPrintEnabled && now - lastTimingPrint > 2000) {
       unsigned long avgLoopTime = (loopCount > 0) ? (sumLoopTime / loopCount) : 0;
 
       Serial.println("\n╔════════════════════════════════════════════════════╗");
@@ -818,7 +821,7 @@ void loop() {
     bool currentReflexState = reflexController.isActive();
 
     // Log state changes
-    if (currentReflexState != lastReflexState) {
+    if (debugPrintEnabled && currentReflexState != lastReflexState) {
       Serial.println("\n╔═══════════════════════════════════════╗");
       if (currentReflexState) {
         Serial.println("║  REFLEX MODE: ON (TRACKING)           ║");
@@ -830,8 +833,8 @@ void loop() {
         Serial.println("║  → Full consciousness running         ║");
       }
       Serial.println("╚═══════════════════════════════════════╝\n");
-      lastReflexState = currentReflexState;
     }
+    lastReflexState = currentReflexState;
 
     // NOTE: lastUpdate already set at START of timing block (line 520)
     // This matches Teensy architecture and prevents drift
@@ -1049,6 +1052,13 @@ void serialEvent() {
         }
         break;
 
+      case 'g':
+      case 'G':
+        debugPrintEnabled = !debugPrintEnabled;
+        Serial.print("Debug output: ");
+        Serial.println(debugPrintEnabled ? "ON" : "OFF");
+        break;
+
       case 'h':
       case 'H':
         printHelp();
@@ -1056,13 +1066,26 @@ void serialEvent() {
 
       case '!':
         {
-          // AI Bridge command - read rest of line with short timeout
-          unsigned long savedTimeout = Serial.getTimeout();
-          Serial.setTimeout(100);
-          String cmdLine = Serial.readStringUntil('\n');
-          Serial.setTimeout(savedTimeout);
-          cmdLine.trim();
-          aiBridge.handleCommand(cmdLine.c_str());
+          // AI Bridge command — non-blocking read
+          // If the full command hasn't arrived yet, buffer it for next call
+          static char aiCmdBuf[128];
+          static int aiCmdPos = 0;
+
+          while (Serial.available()) {
+            char c = Serial.read();
+            if (c == '\n' || c == '\r') {
+              if (aiCmdPos > 0) {
+                aiCmdBuf[aiCmdPos] = '\0';
+                aiBridge.handleCommand(aiCmdBuf);
+                aiCmdPos = 0;
+              }
+              break;
+            }
+            if (aiCmdPos < (int)sizeof(aiCmdBuf) - 1) {
+              aiCmdBuf[aiCmdPos++] = c;
+            }
+          }
+          // If no newline yet, command will continue building on next serialEvent
         }
         break;
 
@@ -1238,6 +1261,7 @@ void printHelp() {
   Serial.println("  e/E - Check ESP32 communication health");
   Serial.println("  r/R - Show tracking diagnostics");
   Serial.println("        (Face position, reflex state)");
+  Serial.println("  g/G - Toggle debug serial output");
   Serial.println("");
   Serial.println("STATE:");
   Serial.println("  s/S - Save state to EEPROM now");

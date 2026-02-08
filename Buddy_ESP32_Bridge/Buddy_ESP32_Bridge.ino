@@ -114,6 +114,9 @@ volatile unsigned long uartDropped = 0;
 
 bool wifiConnected = false;
 
+// Camera pause flag (for WiFi reconnection)
+volatile bool cameraPaused = false;
+
 // ════════════════════════════════════════════════════════════════
 // CAMERA INITIALIZATION
 // ════════════════════════════════════════════════════════════════
@@ -138,7 +141,7 @@ bool initCamera() {
     config.pin_sccb_scl = SIOC_GPIO;
     config.pin_pwdn     = PWDN_GPIO;
     config.pin_reset    = RESET_GPIO;
-    config.xclk_freq_hz = 20000000;
+    config.xclk_freq_hz = 10000000;  // 10MHz — reduces EMI near WiFi antenna
     config.pixel_format = PIXFORMAT_JPEG;
     config.frame_size   = FRAMESIZE_VGA;     // 640x480
     config.jpeg_quality = 12;
@@ -190,6 +193,13 @@ void captureTask(void* param) {
     unsigned long frameInterval = 1000 / TARGET_FPS;
     while (true) {
         esp_task_wdt_reset();  // Feed watchdog (WARN-4)
+
+        // Pause capture during WiFi reconnection to free DMA
+        if (cameraPaused) {
+            delay(100);
+            continue;
+        }
+
         camera_fb_t* fb = esp_camera_fb_get();
         if (fb) {
             if (xSemaphoreTake(frameMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -228,7 +238,7 @@ void handleCapture() {
         if (latestFrame != nullptr && latestFrame->len > 0) {
             // Copy frame data while holding mutex (fast memcpy)
             size_t len = latestFrame->len;
-            uint8_t* copy = (uint8_t*)malloc(len);
+            uint8_t* copy = (uint8_t*)ps_malloc(len);  // Allocate from PSRAM (8MB available)
             if (copy) {
                 memcpy(copy, latestFrame->buf, len);
                 xSemaphoreGive(frameMutex);  // Release mutex BEFORE network IO
@@ -255,20 +265,40 @@ void handleStream() {
     client.println("Cache-Control: no-cache");
     client.println();
 
+    unsigned long lastYield = millis();
+
     while (client.connected()) {
         esp_task_wdt_reset();
 
         if (xSemaphoreTake(frameMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            camera_fb_t* fb = latestFrame;
-            if (fb) {
-                client.printf("--%s\r\n", MJPEG_BOUNDARY);
-                client.println("Content-Type: image/jpeg");
-                client.printf("Content-Length: %d\r\n", fb->len);
-                client.println();
-                client.write(fb->buf, fb->len);
-                client.println();
+            if (latestFrame != nullptr && latestFrame->len > 0) {
+                // Copy frame data while holding mutex
+                size_t len = latestFrame->len;
+                uint8_t* copy = (uint8_t*)ps_malloc(len);
+                if (copy) {
+                    memcpy(copy, latestFrame->buf, len);
+                    xSemaphoreGive(frameMutex);
+
+                    // Send from copy (slow network IO, mutex released)
+                    client.printf("--%s\r\n", MJPEG_BOUNDARY);
+                    client.println("Content-Type: image/jpeg");
+                    client.printf("Content-Length: %d\r\n", len);
+                    client.println();
+                    client.write(copy, len);
+                    client.println();
+                    free(copy);
+                } else {
+                    xSemaphoreGive(frameMutex);
+                }
+            } else {
+                xSemaphoreGive(frameMutex);
             }
-            xSemaphoreGive(frameMutex);
+        }
+
+        // Yield to other HTTP handlers periodically
+        if (millis() - lastYield > 100) {
+            lastYield = millis();
+            delay(1);  // Allow httpServerTask to process other requests
         }
 
         delay(1000 / TARGET_FPS);
@@ -438,16 +468,27 @@ void checkWiFi() {
     if (WiFi.status() != WL_CONNECTED) {
         reconnectAttempts++;
         Serial.printf("[WIFI] Disconnected, reconnecting (attempt %d)...\n", reconnectAttempts);
-        WiFi.disconnect();
-        delay(500);
+
+        // Pause camera to free DMA for WiFi
+        cameraPaused = true;
+        delay(200);  // Let current frame capture complete
+
+        WiFi.disconnect(true);  // Force radio off
+        delay(1000);            // Let voltage rails stabilize
         WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
         unsigned long start = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+        while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
             esp_task_wdt_reset();
             delay(250);
         }
+
+        // Resume camera regardless of WiFi result
+        cameraPaused = false;
+
         if (WiFi.status() == WL_CONNECTED) {
             Serial.printf("[WIFI] Reconnected: %s\n", WiFi.localIP().toString().c_str());
+            WiFi.setSleep(false);
             reconnectAttempts = 0;
         } else if (reconnectAttempts >= 10) {
             Serial.println("[WIFI] Too many failures, rebooting...");
@@ -468,27 +509,41 @@ void setup() {
     delay(1000);
 
     Serial.println("\n╔════════════════════════════════════════╗");
-    Serial.println("║  BUDDY ESP32 WiFi BRIDGE v1.0          ║");
+    Serial.println("║  BUDDY ESP32 WiFi BRIDGE v1.1          ║");
     Serial.println("║  Package 1: WiFi ↔ UART Bridge         ║");
     Serial.println("╚════════════════════════════════════════╝\n");
 
-    // Initialize Teensy UART
-    // Increase UART1 RX buffer from default 256 to 1024 bytes.
-    // During 200-300ms WebSocket mutex hold, Teensy STATE broadcasts
-    // can overflow the default buffer. (CRITICAL-3 from hardware audit)
-    TeensySerial.setRxBufferSize(1024);
-    TeensySerial.begin(TEENSY_BAUD, SERIAL_8N1, TEENSY_RX_PIN, TEENSY_TX_PIN);
-    delay(100);
-    TeensySerial.println("ESP32_READY");
-    Serial.println("[UART] Teensy UART initialized");
+    // ═══ DIAGNOSTIC: Check if last boot was a brownout reset ═══
+    int resetReason = esp_reset_reason();
+    Serial.printf("[BOOT] Reset reason: %d ", resetReason);
+    switch (resetReason) {
+        case 1:  Serial.println("(power-on)"); break;
+        case 3:  Serial.println("(software)"); break;
+        case 9:  Serial.println("(BROWNOUT — check power supply!)"); break;
+        case 15: Serial.println("(watchdog)"); break;
+        default: Serial.printf("(code %d)\n", resetReason); break;
+    }
 
-    // Phase 1E: Create UART mutex
-    uartMutex = xSemaphoreCreateMutex();
+    // ═══ 1. WiFi FIRST — before anything uses DMA or PSRAM ═══
+    // Camera DMA and PSRAM OPI compete with WiFi's internal DMA.
+    // WiFi must establish connection before contention begins.
+    wifiConnected = false;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        Serial.printf("[WIFI] Connection attempt %d/3...\n", attempt);
+        if (setupWiFi()) {
+            wifiConnected = true;
+            break;
+        }
+        Serial.println("[WIFI] Failed, retrying after cooldown...");
+        WiFi.disconnect(true);   // Force radio off between attempts
+        delay(3000);             // Let voltage rails stabilize
+    }
 
-    // Phase 1F: Create frame mutex
-    frameMutex = xSemaphoreCreateMutex();
+    if (!wifiConnected) {
+        Serial.println("[WIFI] ⚠ All attempts failed — will retry in background");
+    }
 
-    // Camera init with retry and auto-reboot (CRITICAL-4 from hardware audit)
+    // ═══ 2. Camera SECOND — after WiFi is established ═══
     int cameraRetries = 0;
     while (!initCamera()) {
         cameraRetries++;
@@ -502,13 +557,20 @@ void setup() {
     }
     Serial.println("[CAM] Camera initialized successfully");
 
-    // Initialize WiFi
-    wifiConnected = setupWiFi();
-    if (!wifiConnected) {
-        Serial.println("[WARN] WiFi failed — retrying in background");
-    }
+    // ═══ 3. UART THIRD — after WiFi + camera are stable ═══
+    // 921600 baud lines near PCB antenna generate EMI.
+    // Starting UART last minimizes interference with WiFi association.
+    TeensySerial.setRxBufferSize(1024);
+    TeensySerial.begin(TEENSY_BAUD, SERIAL_8N1, TEENSY_RX_PIN, TEENSY_TX_PIN);
+    delay(100);
+    TeensySerial.println("ESP32_READY");
+    Serial.println("[UART] Teensy UART initialized");
 
-    // Setup HTTP server
+    // ═══ 4. Create synchronization primitives ═══
+    uartMutex = xSemaphoreCreateMutex();
+    frameMutex = xSemaphoreCreateMutex();
+
+    // ═══ 5. Start network services (only if WiFi connected) ═══
     httpServer.on("/health", HTTP_GET, handleHealth);
     httpServer.on("/capture", HTTP_GET, handleCapture);
     httpServer.on("/stream", HTTP_GET, handleStream);
@@ -516,23 +578,21 @@ void setup() {
     httpServer.begin();
     Serial.printf("[HTTP] Server on port %d\n", HTTP_PORT);
 
-    // Setup WebSocket server
     wsServer.begin();
     wsServer.onEvent(wsEvent);
     Serial.printf("[WS] Server on port %d\n", WS_PORT);
 
-    // Setup UDP listener
     udp.begin(UDP_PORT);
     Serial.printf("[UDP] Listening on port %d\n", UDP_PORT);
 
-    // Initialize watchdog
+    // ═══ 6. Initialize watchdog ═══
     esp_task_wdt_init(WDT_TIMEOUT_S, true);
     esp_task_wdt_add(NULL);
 
-    // Phase 1F: Start capture task on core 0
-    xTaskCreatePinnedToCore(captureTask, "capture", 8192, NULL, 1, NULL, 0);  // CRITICAL-1: 8192 for camera ops
-
-    // Phase 1F: Start HTTP server on core 0 (handles blocking /stream)
+    // ═══ 7. Start background tasks ═══
+    // Capture task on core 0 (shares with HTTP/stream)
+    xTaskCreatePinnedToCore(captureTask, "capture", 8192, NULL, 1, NULL, 0);
+    // HTTP server task on core 0 (handles blocking /stream)
     xTaskCreatePinnedToCore(httpServerTask, "httpd", 8192, NULL, 1, NULL, 0);
 
     Serial.println("\n[READY] Bridge active");
@@ -540,6 +600,8 @@ void setup() {
         Serial.printf("  Stream:  http://%s/stream\n", WiFi.localIP().toString().c_str());
         Serial.printf("  WS:      ws://%s:%d\n", WiFi.localIP().toString().c_str(), WS_PORT);
         Serial.printf("  UDP:     %s:%d\n", WiFi.localIP().toString().c_str(), UDP_PORT);
+    } else {
+        Serial.println("  ⚠ WiFi offline — will retry in background");
     }
     Serial.println();
 }
