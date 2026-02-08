@@ -38,6 +38,8 @@
 #include "esp_task_wdt.h"
 #include "esp_system.h"          // For esp_reset_reason()
 #include "esp32-hal-psram.h"     // For ps_malloc()
+#include "driver/uart.h"         // For uart_driver_delete()
+#include "driver/gpio.h"         // For gpio_reset_pin(), gpio_set_direction()
 
 // ════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -119,6 +121,8 @@ bool wifiConnected = false;
 // Camera pause flag (for WiFi reconnection)
 volatile bool cameraPaused = false;
 
+volatile bool teensyReady = false;  // True after Teensy acknowledges handshake
+
 // ════════════════════════════════════════════════════════════════
 // CAMERA INITIALIZATION
 // ════════════════════════════════════════════════════════════════
@@ -167,29 +171,27 @@ bool initCamera() {
 bool setupWiFi() {
     Serial.printf("[WIFI] Connecting to %s...\n", WIFI_SSID);
 
-    // Clean slate — kill any residual WiFi state
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
     delay(200);
 
     WiFi.mode(WIFI_STA);
-    WiFi.persistent(false);          // Don't read/write NVS — avoids flash corruption issues
-    WiFi.setAutoReconnect(false);    // We handle reconnection manually in checkWiFi()
-    WiFi.setSleep(false);            // Disable power save BEFORE connecting (not after)
+    WiFi.persistent(false);
+    WiFi.setAutoReconnect(false);
+    WiFi.setSleep(false);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED) {
         if (millis() - start > 20000) {
-            Serial.println("[WIFI] Connection timeout");
-            Serial.printf("[WIFI] Status code: %d\n", WiFi.status());
+            Serial.printf("\n[WIFI] Timeout (status: %d)\n", WiFi.status());
             return false;
         }
         delay(500);
         Serial.print(".");
     }
-    Serial.printf("\n[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-    Serial.printf("[WIFI] RSSI: %d dBm\n", WiFi.RSSI());
+    Serial.printf("\n[WIFI] Connected! IP: %s (RSSI: %d dBm)\n",
+        WiFi.localIP().toString().c_str(), WiFi.RSSI());
     return true;
 }
 
@@ -479,11 +481,9 @@ void checkWiFi() {
         reconnectAttempts++;
         Serial.printf("[WIFI] Disconnected, reconnecting (attempt %d)...\n", reconnectAttempts);
 
-        // Pause camera to free DMA for WiFi
         cameraPaused = true;
-        delay(200);  // Let current frame capture complete
+        delay(200);
 
-        // Full radio reset — disconnect alone sometimes isn't enough on ESP32-S3
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
         delay(500);
@@ -500,16 +500,12 @@ void checkWiFi() {
             delay(250);
         }
 
-        // Resume camera regardless of WiFi result
         cameraPaused = false;
 
         if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("[WIFI] Reconnected: %s\n", WiFi.localIP().toString().c_str());
-            Serial.printf("[WIFI] RSSI: %d dBm\n", WiFi.RSSI());
-            WiFi.setSleep(false);
+            Serial.printf("[WIFI] Reconnected: %s (RSSI: %d dBm)\n",
+                WiFi.localIP().toString().c_str(), WiFi.RSSI());
             reconnectAttempts = 0;
-
-            // Start network services if they were deferred during setup
             startNetworkServices();
         } else if (reconnectAttempts >= 10) {
             Serial.println("[WIFI] Too many failures, rebooting...");
@@ -553,11 +549,11 @@ void setup() {
     delay(1000);
 
     Serial.println("\n╔════════════════════════════════════════╗");
-    Serial.println("║  BUDDY ESP32 WiFi BRIDGE v1.1          ║");
-    Serial.println("║  Package 1: WiFi ↔ UART Bridge         ║");
+    Serial.println("║  BUDDY ESP32 WiFi BRIDGE v1.3          ║");
+    Serial.println("║  UART0 fix + boot handshake            ║");
     Serial.println("╚════════════════════════════════════════╝\n");
 
-    // ═══ DIAGNOSTIC: Check if last boot was a brownout reset ═══
+    // Diagnostic: check reset reason
     int resetReason = esp_reset_reason();
     Serial.printf("[BOOT] Reset reason: %d ", resetReason);
     switch (resetReason) {
@@ -568,9 +564,32 @@ void setup() {
         default: Serial.printf("(code %d)\n", resetReason); break;
     }
 
-    // ═══ 1. WiFi FIRST — before anything uses DMA or PSRAM ═══
-    // Camera DMA and PSRAM OPI compete with WiFi's internal DMA.
-    // WiFi must establish connection before contention begins.
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 1: IMMEDIATELY isolate GPIO 43/44 from UART0
+    // ═══════════════════════════════════════════════════════════════
+    // ROM bootloader maps UART0 to these pins. With Teensy connected,
+    // Teensy TX drives GPIO 44 → UART0 RX interrupts on core 0 →
+    // WiFi authentication delayed → connection timeout.
+    //
+    // Fix: Delete UART0 driver, reset pins to plain input with
+    // pulldown. Pulldown keeps RX low = UART idle state = no
+    // start bits detected = no interrupts generated.
+    // ═══════════════════════════════════════════════════════════════
+
+    uart_driver_delete(UART_NUM_0);  // May fail if not installed — that's fine
+
+    gpio_reset_pin((gpio_num_t)TEENSY_TX_PIN);  // GPIO 43
+    gpio_reset_pin((gpio_num_t)TEENSY_RX_PIN);  // GPIO 44
+    gpio_set_direction((gpio_num_t)TEENSY_TX_PIN, GPIO_MODE_INPUT);
+    gpio_set_direction((gpio_num_t)TEENSY_RX_PIN, GPIO_MODE_INPUT);
+    gpio_pulldown_en((gpio_num_t)TEENSY_RX_PIN);  // Hold low — suppresses Teensy TX
+
+    Serial.println("[GPIO] UART0 detached from GPIO 43/44, pins isolated");
+
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 2: Connect WiFi — pins are electrically silent
+    // ═══════════════════════════════════════════════════════════════
+
     wifiConnected = false;
     for (int attempt = 1; attempt <= 3; attempt++) {
         Serial.printf("[WIFI] Connection attempt %d/3...\n", attempt);
@@ -579,15 +598,20 @@ void setup() {
             break;
         }
         Serial.println("[WIFI] Failed, retrying after cooldown...");
-        WiFi.disconnect(true);   // Force radio off between attempts
-        delay(3000);             // Let voltage rails stabilize
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        delay(3000);
+        WiFi.mode(WIFI_STA);
     }
 
     if (!wifiConnected) {
         Serial.println("[WIFI] ⚠ All attempts failed — will retry in background");
     }
 
-    // ═══ 2. Camera SECOND — after WiFi is established ═══
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 3: Camera AFTER WiFi
+    // ═══════════════════════════════════════════════════════════════
+
     int cameraRetries = 0;
     while (!initCamera()) {
         cameraRetries++;
@@ -601,41 +625,96 @@ void setup() {
     }
     Serial.println("[CAM] Camera initialized successfully");
 
-    // ═══ 3. UART THIRD — after WiFi + camera are stable ═══
-    // 921600 baud lines near PCB antenna generate EMI.
-    // Starting UART last minimizes interference with WiFi association.
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 4: NOW init UART1 on GPIO 43/44 — WiFi is stable
+    // ═══════════════════════════════════════════════════════════════
+    // Only now do we take ownership of the pins for UART communication.
+    // WiFi authentication is complete, so UART1 interrupts won't
+    // interfere with the WPA2 handshake.
+    // ═══════════════════════════════════════════════════════════════
+
     TeensySerial.setRxBufferSize(1024);
     TeensySerial.begin(TEENSY_BAUD, SERIAL_8N1, TEENSY_RX_PIN, TEENSY_TX_PIN);
-    delay(100);
-    TeensySerial.println("ESP32_READY");
-    Serial.println("[UART] Teensy UART initialized");
+    Serial.println("[UART] UART1 configured on GPIO 43/44 (921600 baud)");
 
-    // ═══ 4. Create synchronization primitives ═══
+    // Drain anything Teensy sent while we were booting
+    delay(100);
+    int drained = 0;
+    while (TeensySerial.available()) {
+        TeensySerial.read();
+        drained++;
+    }
+    Serial.printf("[UART] Drained %d bytes from RX buffer\n", drained);
+
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 5: Boot handshake — tell Teensy we're ready
+    // ═══════════════════════════════════════════════════════════════
+    // Teensy has been holding TX silent, waiting for this signal.
+    // Send it 3 times with small delays to ensure delivery even if
+    // Teensy's UART buffer had noise from our pin reconfiguration.
+    // ═══════════════════════════════════════════════════════════════
+
+    for (int i = 0; i < 3; i++) {
+        TeensySerial.println("ESP32_READY");
+        delay(50);
+    }
+    Serial.println("[HANDSHAKE] Sent ESP32_READY to Teensy (x3)");
+
+    // Wait briefly for Teensy acknowledgment (non-blocking, don't stall boot)
+    unsigned long hsStart = millis();
+    while (millis() - hsStart < 2000) {
+        if (TeensySerial.available()) {
+            String line = TeensySerial.readStringUntil('\n');
+            line.trim();
+            if (line == "TEENSY_READY") {
+                teensyReady = true;
+                Serial.println("[HANDSHAKE] Teensy acknowledged — link established");
+                break;
+            }
+        }
+        delay(10);
+    }
+    if (!teensyReady) {
+        Serial.println("[HANDSHAKE] No Teensy acknowledgment (timeout) — continuing anyway");
+        // Not fatal — Teensy may be running older firmware without handshake
+        // Bridge will still work, just without confirmed sync
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 6: Create synchronization primitives
+    // ═══════════════════════════════════════════════════════════════
+
     uartMutex = xSemaphoreCreateMutex();
     frameMutex = xSemaphoreCreateMutex();
 
-    // ═══ 5. Register HTTP handlers (just function pointers, no network needed) ═══
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 7: Register HTTP handlers + start network services
+    // ═══════════════════════════════════════════════════════════════
+
     httpServer.on("/health", HTTP_GET, handleHealth);
     httpServer.on("/capture", HTTP_GET, handleCapture);
     httpServer.on("/stream", HTTP_GET, handleStream);
     httpServer.onNotFound(handleNotFound);
 
-    // ═══ 6. Start network services ONLY if WiFi is connected ═══
     if (wifiConnected) {
         startNetworkServices();
     } else {
         Serial.println("[NET] Services deferred — will start when WiFi connects");
     }
 
-    // ═══ 7. Initialize watchdog ═══
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 8: Watchdog + background tasks
+    // ═══════════════════════════════════════════════════════════════
+
     esp_task_wdt_init(WDT_TIMEOUT_S, true);
     esp_task_wdt_add(NULL);
 
-    // ═══ 8. Start background tasks ═══
-    // Capture task on core 0 (shares with HTTP/stream)
     xTaskCreatePinnedToCore(captureTask, "capture", 8192, NULL, 1, NULL, 0);
-    // HTTP server task on core 0 (handles blocking /stream)
     xTaskCreatePinnedToCore(httpServerTask, "httpd", 8192, NULL, 1, NULL, 0);
+
+    // ═══════════════════════════════════════════════════════════════
+    // BOOT COMPLETE
+    // ═══════════════════════════════════════════════════════════════
 
     Serial.println("\n[READY] Bridge active");
     if (wifiConnected) {
@@ -645,6 +724,7 @@ void setup() {
     } else {
         Serial.println("  ⚠ WiFi offline — will retry in background");
     }
+    Serial.printf("  Teensy:  %s\n", teensyReady ? "LINKED" : "no handshake (compatible mode)");
     Serial.println();
 }
 

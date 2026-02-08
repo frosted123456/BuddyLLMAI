@@ -32,6 +32,8 @@
 #include "AnimationController.h"
 #include "ReflexiveControl.h"
 
+extern bool esp32Ready;  // Handshake flag from main .ino — gates Serial1 writes
+
 // AI animation modes for non-blocking looping animations
 enum AIAnimMode {
   AI_ANIM_NONE = 0,
@@ -419,7 +421,9 @@ private:
     );
 
     if (len > 0 && len < (int)sizeof(buf)) {
-      responseStream->println(buf);
+      if (esp32Ready || responseStream == &Serial) {
+        responseStream->println(buf);
+      }
     } else {
       // Buffer overflow fallback — should never happen with 512 bytes
       responseStream->println("{\"ok\":false,\"reason\":\"buffer_overflow\"}");

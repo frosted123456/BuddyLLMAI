@@ -86,6 +86,38 @@ unsigned long esp32MessageCount = 0;
 unsigned long esp32ParseErrors = 0;
 const unsigned long ESP32_TIMEOUT = 5000;  // 5 seconds without messages = warning
 
+// ════════════════════════════════════════════════════════════════
+// ESP32 Boot Handshake
+// ════════════════════════════════════════════════════════════════
+// ESP32 needs silence on its RX pin during WiFi authentication.
+// Teensy holds all Serial1 TX until ESP32 sends "ESP32_READY".
+// ════════════════════════════════════════════════════════════════
+
+bool esp32Ready = false;                     // True after handshake received
+unsigned long esp32BootStart = 0;            // Timeout tracker
+const unsigned long ESP32_HANDSHAKE_TIMEOUT = 30000;  // 30s max wait
+
+// Safe write to ESP32 — suppresses TX until handshake complete
+void esp32Print(const char* msg) {
+    if (!esp32Ready) return;
+    Serial1.print(msg);
+}
+
+void esp32Println(const char* msg) {
+    if (!esp32Ready) return;
+    Serial1.println(msg);
+}
+
+void esp32Printf(const char* fmt, ...) {
+    if (!esp32Ready) return;
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    Serial1.print(buf);
+}
+
 // ============================================
 // GLOBAL OBJECTS
 // ============================================
@@ -263,7 +295,15 @@ void parseVisionData() {
       // Route responses back to ESP32_SERIAL so they reach the PC
       aiBridge.handleCommand(buffer + 1, &ESP32_SERIAL);
     }
-    else if (strncmp(buffer, "ESP32_READY", 11) == 0 || strncmp(buffer, "READY", 5) == 0) {
+    else if (strncmp(buffer, "ESP32_READY", 11) == 0) {
+      // Re-handshake: ESP32 rebooted while Teensy was running
+      Serial.println("[LINK] ESP32 rebooted — re-handshaking");
+      esp32Ready = true;
+      ESP32_SERIAL.println("TEENSY_READY");
+      delay(10);
+      ESP32_SERIAL.println("TEENSY_READY");
+    }
+    else if (strncmp(buffer, "READY", 5) == 0) {
       Serial.println("[VISION] ESP32-S3 connected");
     }
   }
@@ -381,8 +421,7 @@ void setup() {
   ESP32_SERIAL.begin(ESP32_BAUD);
   delay(100);
 
-  // Send ready signal to ESP32-S3
-  ESP32_SERIAL.println("TEENSY_READY");
+  // Note: TEENSY_READY is now sent via handshake at end of setup()
   Serial.println("  ✓ ESP32 v7.2.1 Serial initialized at 921600 baud");
   Serial.println("  ✓ Ready to receive face detection data");
   Serial.println("  ✓ Format: FACE:x,y,vx,vy,w,h,conf,seq");
@@ -467,6 +506,36 @@ void setup() {
   Serial.println("║    Vision system active!           ║");
   Serial.println("╚════════════════════════════════════╝\n");
   Serial.flush();
+
+  // ═══ Wait for ESP32 boot handshake ═══
+  // ESP32 needs WiFi + camera + UART init before we send anything.
+  // Hold TX silent until we receive "ESP32_READY" or timeout.
+  esp32BootStart = millis();
+  Serial.println("[BOOT] Waiting for ESP32 handshake...");
+
+  while (!esp32Ready && (millis() - esp32BootStart < ESP32_HANDSHAKE_TIMEOUT)) {
+      if (ESP32_SERIAL.available()) {
+          String line = ESP32_SERIAL.readStringUntil('\n');
+          line.trim();
+          if (line == "ESP32_READY") {
+              esp32Ready = true;
+              Serial.println("[BOOT] ESP32 ready — sending acknowledgment");
+              ESP32_SERIAL.println("TEENSY_READY");
+              delay(10);
+              ESP32_SERIAL.println("TEENSY_READY");  // Send twice for reliability
+          }
+      }
+      delay(10);
+  }
+
+  if (esp32Ready) {
+      Serial.println("[BOOT] Handshake complete — UART link active");
+  } else {
+      Serial.println("[BOOT] ESP32 handshake timeout — continuing without sync");
+      // Not fatal: ESP32 may be running older firmware without handshake.
+      // Set ready anyway so the system still works.
+      esp32Ready = true;
+  }
 }
 
 // ============================================
