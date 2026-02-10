@@ -101,7 +101,8 @@ CONFIG = {
     "whisper_language": "auto",
     
     # Ollama
-    "ollama_model": "llava",
+    "ollama_model": "llama3.1:8b",      # Text-only model for speech (fast)
+    "ollama_vision_model": "llava",       # Vision model for scene descriptions (slower)
     "ollama_host": "http://localhost:11434",
     
     # TTS
@@ -242,8 +243,21 @@ class SceneContext:
             try:
                 now = time.time()
                 if now - self.last_scene_capture >= self.scene_capture_interval:
-                    self._capture_and_describe()
-                    self.last_scene_capture = now
+                    # Yield to speech generation — don't compete for Ollama
+                    if _ollama_speech_priority:
+                        time.sleep(2)
+                        continue
+                    # Acquire the Ollama lock (non-blocking — skip if busy)
+                    if _ollama_lock.acquire(blocking=False):
+                        try:
+                            self._capture_and_describe()
+                            self.last_scene_capture = now
+                        finally:
+                            _ollama_lock.release()
+                    else:
+                        # Ollama is busy (probably with speech), skip this cycle
+                        time.sleep(2)
+                        continue
                 time.sleep(1)
             except Exception as e:
                 try:
@@ -519,10 +533,17 @@ class SceneContext:
             return "\n".join(parts)
 
 
+# ═══════════════════════════════════════════════════════
+# OLLAMA CONTENTION GATE — prevents scene descriptions from
+# blocking speech generation. Speech always gets priority.
+# ═══════════════════════════════════════════════════════
+_ollama_lock = threading.Lock()      # Only one Ollama call at a time
+_ollama_speech_priority = False       # When True, scene loop yields
+
 # Scene understanding (initialized later when camera URL is known)
 scene_context = SceneContext(
     ollama_url="http://localhost:11434",
-    vision_model="llava"
+    vision_model=CONFIG.get("ollama_vision_model", "llava")
 )
 
 # ═══════════════════════════════════════════════════════
@@ -2226,15 +2247,25 @@ def get_buddy_state_prompt():
     return buddy_state, narrative_context, intent_context
 
 def query_ollama(text, img=None, timeout=60):
-    """Query Ollama with timeout to prevent system lockup (Phase 1B: BUG-3 fix)."""
+    """
+    Query Ollama with timeout and priority gating.
+    Speech generation gets priority over scene descriptions.
+    Uses the text-only model unless an image is provided.
+    """
+    global _ollama_speech_priority
+
     state_info, narrative_ctx, intent_ctx = get_buddy_state_prompt()
     prompt = CONFIG["system_prompt"].replace("{buddy_state}", state_info)
     prompt = prompt.replace("{narrative_context}", narrative_ctx)
     prompt = prompt.replace("{intent_context}", intent_ctx)
     msgs = [{"role": "system", "content": prompt}]
+
+    # Use vision model only when an image is actually provided
     if img:
+        model = CONFIG.get("ollama_vision_model", CONFIG["ollama_model"])
         msgs.append({"role": "user", "content": text, "images": [img]})
     else:
+        model = CONFIG["ollama_model"]
         msgs.append({"role": "user", "content": text})
 
     result = [None]
@@ -2243,22 +2274,29 @@ def query_ollama(text, img=None, timeout=60):
     def _query():
         try:
             result[0] = ollama.chat(
-                model=CONFIG["ollama_model"],
+                model=model,
                 messages=msgs
             )["message"]["content"]
         except Exception as e:
             error[0] = e
 
-    t = threading.Thread(target=_query, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
+    # Signal scene loop to yield, then grab the Ollama lock
+    _ollama_speech_priority = True
+    _ollama_lock.acquire()
+    try:
+        t = threading.Thread(target=_query, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
 
-    if t.is_alive():
-        socketio.emit('log', {'message': f'Ollama timeout after {timeout}s', 'level': 'error'})
-        raise TimeoutError(f"Ollama did not respond within {timeout}s")
-    if error[0]:
-        raise error[0]
-    return result[0]
+        if t.is_alive():
+            socketio.emit('log', {'message': f'Ollama timeout after {timeout}s', 'level': 'error'})
+            raise TimeoutError(f"Ollama did not respond within {timeout}s")
+        if error[0]:
+            raise error[0]
+        return result[0]
+    finally:
+        _ollama_lock.release()
+        _ollama_speech_priority = False
 
 async def generate_tts(text):
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f: tp = f.name
