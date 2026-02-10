@@ -35,6 +35,8 @@ import json
 import re
 from pathlib import Path
 
+import collections
+
 from flask import Flask, render_template_string, request, jsonify, send_file
 from flask_socketio import SocketIO, emit
 import requests
@@ -155,8 +157,363 @@ HOW YOUR STATE AFFECTS YOUR VOICE:
 - High stimulation need: you make observations, point things out
 - Low energy: minimal words, but still you. Just quieter.
 - Tracking someone: you're engaged, present, attending to them
-- Alone + exploring: your inner monologue leaks out more"""
+- Alone + exploring: your inner monologue leaks out more
+
+YOUR CAMERA:
+You can see through your camera. When visual context is provided above, USE IT.
+- Reference what you actually SEE — specific objects, people, situations
+- If you can see someone's expression, react to it naturally
+- Ground abstract feelings in concrete visual observations
+- You're a desk companion with a perspective, not a helpful assistant"""
 }
+
+# =============================================================================
+# SCENE UNDERSTANDING — Phase C: Vision-aware context for LLM + Teensy
+# =============================================================================
+
+class SceneContext:
+    """
+    Accumulates visual understanding of Buddy's environment.
+    Periodically captures frames and describes them via Ollama LLaVA.
+    Feeds structured vision data back to Teensy via !VISION command.
+    Provides rich context for LLM spontaneous and interactive speech.
+    """
+
+    def __init__(self, ollama_url="http://localhost:11434", vision_model="llava"):
+        self.ollama_url = ollama_url
+        self.vision_model = vision_model
+
+        # Scene state
+        self.current_description = ""
+        self.previous_descriptions = collections.deque(maxlen=5)
+        self.detected_changes = collections.deque(maxlen=10)
+        self.detected_objects = set()
+        self.face_events = collections.deque(maxlen=10)
+
+        # Timing
+        self.last_scene_capture = 0
+        self.last_vision_send = 0
+        self.scene_capture_interval = 8   # seconds between captures
+        self.vision_send_interval = 3     # seconds between Teensy updates
+
+        # Face tracking state (fed by buddy_vision.py data)
+        self.face_present = False
+        self.face_present_since = 0
+        self.face_absent_since = 0
+        self.face_expression = "neutral"
+        self.last_face_count = 0
+
+        # Scene novelty (computed from description changes)
+        self.scene_novelty = 0.0
+
+        # Camera stream URL
+        self.camera_url = None
+
+        # Thread safety
+        self.lock = threading.Lock()
+
+        # Running flag
+        self.running = False
+        self.thread = None
+
+    def start(self, camera_url):
+        """Start the background scene analysis loop."""
+        self.camera_url = camera_url
+        self.running = True
+        self.thread = threading.Thread(target=self._scene_loop, daemon=True, name="scene-context")
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+
+    def _scene_loop(self):
+        """Background loop that periodically captures and analyzes frames."""
+        while self.running:
+            try:
+                now = time.time()
+                if now - self.last_scene_capture >= self.scene_capture_interval:
+                    self._capture_and_describe()
+                    self.last_scene_capture = now
+                time.sleep(1)
+            except Exception as e:
+                try:
+                    socketio.emit('log', {
+                        'message': f'SceneContext error: {e}',
+                        'level': 'warning'
+                    })
+                except:
+                    pass
+                time.sleep(5)
+
+    def _capture_frame(self):
+        """Capture a single JPEG frame from ESP32 camera."""
+        if not self.camera_url:
+            return None
+        try:
+            capture_url = self.camera_url.replace("/stream", "/capture")
+            resp = requests.get(capture_url, timeout=3)
+            if resp.status_code == 200:
+                return resp.content
+        except Exception:
+            pass
+        return None
+
+    def _describe_frame(self, jpeg_bytes):
+        """Send frame to Ollama LLaVA for description."""
+        if not jpeg_bytes:
+            return None
+        try:
+            b64_image = base64.b64encode(jpeg_bytes).decode('utf-8')
+
+            prompt = (
+                "You are the eyes of a small desk robot named Buddy. "
+                "Describe what you see in 1-2 short sentences. Focus on: "
+                "who is present, what they're doing, any objects on the desk, "
+                "and anything that changed. Be specific and concise. "
+                "Do NOT describe yourself or the camera."
+            )
+            if self.current_description:
+                prompt += f"\nPrevious observation: {self.current_description}"
+                prompt += "\nNote any changes since last observation."
+
+            response = requests.post(
+                f"{self.ollama_url}/api/generate",
+                json={
+                    "model": self.vision_model,
+                    "prompt": prompt,
+                    "images": [b64_image],
+                    "stream": False,
+                    "options": {
+                        "num_predict": 80,
+                        "temperature": 0.3,
+                    }
+                },
+                timeout=15
+            )
+            if response.status_code == 200:
+                result = response.json()
+                return result.get("response", "").strip()
+        except requests.exceptions.Timeout:
+            try:
+                socketio.emit('log', {
+                    'message': 'LLaVA timeout — skipping scene analysis',
+                    'level': 'debug'
+                })
+            except:
+                pass
+        except Exception as e:
+            try:
+                socketio.emit('log', {
+                    'message': f'LLaVA error: {e}',
+                    'level': 'warning'
+                })
+            except:
+                pass
+        return None
+
+    def _capture_and_describe(self):
+        """Full capture → describe → update cycle."""
+        frame = self._capture_frame()
+        if not frame:
+            return
+        description = self._describe_frame(frame)
+        if not description:
+            return
+
+        with self.lock:
+            if self.current_description:
+                self._detect_changes(self.current_description, description)
+
+            self.previous_descriptions.append(self.current_description)
+            self.current_description = description
+
+            # Compute novelty from description changes
+            if self.previous_descriptions:
+                prev = self.previous_descriptions[-1] if self.previous_descriptions else ""
+                if prev:
+                    prev_words = set(prev.lower().split())
+                    curr_words = set(description.lower().split())
+                    if prev_words:
+                        overlap = len(prev_words & curr_words) / max(len(prev_words), len(curr_words))
+                        self.scene_novelty = max(0.0, min(1.0, 1.0 - overlap))
+                    else:
+                        self.scene_novelty = 0.5
+                else:
+                    self.scene_novelty = 0.8
+            self._extract_objects(description)
+
+        try:
+            short = description[:80] + '...' if len(description) > 80 else description
+            socketio.emit('log', {
+                'message': f'Scene: {short}',
+                'level': 'debug'
+            })
+        except:
+            pass
+
+    def _detect_changes(self, old_desc, new_desc):
+        """Detect semantic changes between descriptions."""
+        old_lower = old_desc.lower()
+        new_lower = new_desc.lower()
+        now = time.time()
+
+        person_words = ["person", "someone", "man", "woman", "people", "they", "he", "she"]
+        had_person = any(w in old_lower for w in person_words)
+        has_person = any(w in new_lower for w in person_words)
+
+        if has_person and not had_person:
+            self.detected_changes.append(("person_appeared", now))
+            self.face_events.append(("appeared", now))
+        elif had_person and not has_person:
+            self.detected_changes.append(("person_left", now))
+            self.face_events.append(("left", now))
+
+        object_words = ["mug", "cup", "phone", "book", "laptop", "bottle", "plate",
+                       "glass", "paper", "pen", "keyboard", "mouse", "headphones",
+                       "food", "drink", "bag", "box"]
+        old_objects = {w for w in object_words if w in old_lower}
+        new_objects = {w for w in object_words if w in new_lower}
+        appeared = new_objects - old_objects
+        if appeared:
+            for obj in appeared:
+                self.detected_changes.append((f"new_object:{obj}", now))
+
+    def _extract_objects(self, description):
+        """Extract mentioned objects from description."""
+        desc_lower = description.lower()
+        object_words = ["mug", "cup", "phone", "book", "laptop", "bottle", "plate",
+                       "glass", "paper", "pen", "keyboard", "mouse", "monitor",
+                       "headphones", "food", "drink", "bag", "box", "desk", "chair"]
+        for obj in object_words:
+            if obj in desc_lower:
+                self.detected_objects.add(obj)
+
+    def update_face_state(self, face_detected, expression="neutral"):
+        """Called from vision data handler to keep face state current."""
+        with self.lock:
+            now = time.time()
+            if face_detected and not self.face_present:
+                self.face_present_since = now
+            elif not face_detected and self.face_present:
+                self.face_absent_since = now
+            self.face_present = face_detected
+            self.face_expression = expression
+
+    def get_vision_command(self):
+        """Build the !VISION command string for Teensy."""
+        with self.lock:
+            change_type = "none"
+            if self.detected_changes:
+                latest_change, change_time = self.detected_changes[-1]
+                if time.time() - change_time < 30:
+                    if "new_object" in latest_change:
+                        change_type = "new_object"
+                    elif "person_appeared" in latest_change:
+                        change_type = "person_appeared"
+                    elif "person_left" in latest_change:
+                        change_type = "person_left"
+
+            objects_str = ",".join(list(self.detected_objects)[:5])
+            desc_short = self.current_description[:100] if self.current_description else ""
+            # Escape quotes in description for JSON safety
+            desc_short = desc_short.replace('"', "'")
+
+            cmd = (
+                f'VISION {{"faces":{1 if self.face_present else 0},'
+                f'"expr":"{self.face_expression}",'
+                f'"obj":"{objects_str}",'
+                f'"change":"{change_type}",'
+                f'"novelty":{self.scene_novelty:.2f},'
+                f'"desc":"{desc_short}"}}'
+            )
+            return cmd
+
+    def get_investigation_command(self):
+        """
+        When Buddy is investigating, capture a frame and describe what's there.
+        Returns !VISION with change="investigation_result".
+        """
+        frame = self._capture_frame()
+        if not frame:
+            return None
+        description = self._describe_frame(frame)
+        if not description:
+            return None
+
+        with self.lock:
+            self.current_description = description
+
+        desc_short = description[:100].replace('"', "'")
+        cmd = (
+            f'VISION {{"faces":{1 if self.face_present else 0},'
+            f'"expr":"{self.face_expression}",'
+            f'"obj":"",'
+            f'"change":"investigation_result",'
+            f'"novelty":0.0,'
+            f'"desc":"{desc_short}"}}'
+        )
+        return cmd
+
+    def get_llm_context(self):
+        """
+        Build rich narrative context for LLM speech generation.
+        Replaces flat JSON state dump with something the LLM can use.
+        """
+        with self.lock:
+            parts = []
+            if self.current_description:
+                parts.append(f"What you currently see: {self.current_description}")
+            else:
+                parts.append("You can't see clearly right now.")
+
+            # Recent changes
+            recent_changes = []
+            now = time.time()
+            for change, t in self.detected_changes:
+                age = int(now - t)
+                if age < 120:
+                    if age < 10:
+                        time_str = "just now"
+                    elif age < 60:
+                        time_str = f"{age} seconds ago"
+                    else:
+                        time_str = f"{age // 60} minute{'s' if age >= 120 else ''} ago"
+                    recent_changes.append(f"{change.replace('_', ' ')} ({time_str})")
+            if recent_changes:
+                parts.append(f"Recent changes: {'; '.join(recent_changes[-3:])}")
+
+            # Face state
+            if self.face_present:
+                duration = int(now - self.face_present_since) if self.face_present_since else 0
+                if duration > 60:
+                    parts.append(f"Someone has been here for {duration // 60} minutes.")
+                elif duration > 10:
+                    parts.append(f"Someone arrived about {duration} seconds ago.")
+                else:
+                    parts.append("Someone just appeared.")
+                if self.face_expression != "neutral":
+                    parts.append(f"They look {self.face_expression}.")
+            else:
+                if self.face_absent_since:
+                    gone_for = int(now - self.face_absent_since)
+                    if gone_for > 300:
+                        parts.append(f"You've been alone for about {gone_for // 60} minutes.")
+                    elif gone_for > 30:
+                        parts.append(f"The person left about {gone_for} seconds ago.")
+                else:
+                    parts.append("Nobody is around.")
+
+            if self.detected_objects:
+                parts.append(f"Objects you've noticed: {', '.join(self.detected_objects)}")
+
+            return "\n".join(parts)
+
+
+# Scene understanding (initialized later when camera URL is known)
+scene_context = SceneContext(
+    ollama_url="http://localhost:11434",
+    vision_model="llava"
+)
 
 # =============================================================================
 # FLASK APP
@@ -756,6 +1113,15 @@ def teensy_poll_loop():
                 socketio.emit('buddy_state', s)
                 ws_reconnect_count = 0  # Reset on success
 
+                # Feed face tracking into SceneContext
+                if scene_context.running:
+                    vision = get_vision_state()
+                    if vision:
+                        scene_context.update_face_state(
+                            face_detected=vision.get("face_detected", False),
+                            expression=vision.get("face_expression", "neutral")
+                        )
+
                 # Spontaneous speech check
                 if CONFIG.get("spontaneous_speech_enabled", False) and not processing_lock.locked():
                     check_spontaneous_speech(s)
@@ -1013,74 +1379,93 @@ def get_vision_state():
     return None
 
 def get_buddy_state_prompt():
-    """Build state description for LLM, including vision data from Package 2."""
-    with teensy_state_lock: s = teensy_state.copy()
+    """
+    Build a rich narrative context prompt for the LLM.
+    Phase D: Combines Teensy state data with visual scene understanding.
+    """
+    with teensy_state_lock:
+        s = teensy_state.copy()
 
     if not teensy_connected:
         return "Note: Unable to read emotional state."
 
-    # Arousal description
-    if s['arousal'] < 0.3: ad = "very calm, almost sleepy"
-    elif s['arousal'] < 0.5: ad = "calm and relaxed"
-    elif s['arousal'] < 0.7: ad = "alert and attentive"
-    else: ad = "energetic and excited"
-
-    # Valence description
-    if s['valence'] < -0.3: vd = "feeling quite negative"
-    elif s['valence'] < 0: vd = "slightly uneasy"
-    elif s['valence'] < 0.3: vd = "feeling neutral"
-    elif s['valence'] < 0.6: vd = "feeling positive"
-    else: vd = "feeling very happy"
-
-    # Energy
-    if s['energy'] < 0.3: ed = "tired and low energy"
-    elif s['energy'] < 0.6: ed = "moderate energy"
-    else: ed = "full of energy"
-
-    # Consciousness states
+    arousal = float(s.get('arousal', 0.5))
+    valence = float(s.get('valence', 0.0))
+    behavior = s.get('behavior', 'IDLE')
+    emotion_label = s.get('emotion', 'neutral')
+    stimulation = float(s.get('stimulation', 0.5))
+    social = float(s.get('social', 0.5))
+    energy = float(s.get('energy', 0.8))
     epistemic = s.get('epistemic', 'confident')
-    tension = s.get('tension', 0.0)
     is_wondering = s.get('wondering', False)
-    self_awareness = s.get('selfAwareness', 0.5)
+    tension = float(s.get('tension', 0.0))
+    self_awareness = float(s.get('selfAwareness', 0.5))
 
-    parts = [
-        f"Emotional state: {s['emotion']} — {ad}, {vd}",
-        f"Energy: {ed}",
-        f"Currently: {'tracking a face' if s['tracking'] else s['behavior'].lower()}",
+    # Build emotional context in natural language
+    if valence > 0.3:
+        mood = "good" if arousal < 0.5 else "energized and positive"
+    elif valence < -0.3:
+        mood = "a bit down" if arousal < 0.5 else "agitated"
+    else:
+        mood = "calm" if arousal < 0.4 else "alert"
+
+    # Activity context
+    activity_map = {
+        'IDLE': "You're resting, just being present.",
+        'EXPLORE': "You're actively looking around, scanning your environment.",
+        'INVESTIGATE': "You're focused on examining something specific.",
+        'SOCIAL_ENGAGE': "You're engaged in interaction with the person.",
+        'PLAY': "You're in a playful, experimental mood.",
+        'RETREAT': "Something made you want to pull back.",
+        'REST': "You're resting, conserving energy.",
+        'VIGILANT': "You're watchful, keeping an eye on things."
+    }
+    activity = activity_map.get(behavior, f"You're in {behavior} mode.")
+
+    # Need context
+    need_notes = []
+    if stimulation > 0.7:
+        need_notes.append("You're craving something interesting to happen.")
+    if social > 0.7:
+        need_notes.append("You're feeling a bit lonely and want company.")
+    if energy < 0.3:
+        need_notes.append("You're getting tired.")
+
+    # Epistemic state
+    epistemic_notes = ""
+    if is_wondering:
+        epistemic_notes = " You're in a wondering, contemplative state."
+    elif epistemic == "confused":
+        epistemic_notes = " You're a bit confused about something."
+    elif epistemic == "learning":
+        epistemic_notes = " You feel like you're figuring something out."
+
+    # Scene context from vision
+    vision_context = scene_context.get_llm_context() if scene_context.running else ""
+
+    # Assemble
+    prompt_parts = [
+        f"Your mood: {mood} (feeling {emotion_label}).",
+        activity,
     ]
 
-    if is_wondering:
-        parts.append("You are in a contemplative, wondering state — feeling philosophical")
+    if need_notes:
+        prompt_parts.append(" ".join(need_notes))
+
+    if epistemic_notes:
+        prompt_parts.append(epistemic_notes.strip())
+
     if tension > 0.4:
-        parts.append(f"You feel conflicted inside (tension: {tension:.0%}) — torn between impulses")
-    if epistemic == 'confused':
-        parts.append("You're confused about what's happening around you")
-    elif epistemic == 'learning':
-        parts.append("You're actively trying to figure something out")
+        prompt_parts.append(f"You feel conflicted inside — torn between impulses.")
+
     if self_awareness > 0.7:
-        parts.append("You're very self-aware right now, noticing your own thoughts")
+        prompt_parts.append("You're very self-aware right now, noticing your own thoughts.")
 
-    if s['social'] > 0.7:
-        parts.append("You've been lonely and really want to talk")
-    if s['stimulation'] < 0.3:
-        parts.append("You've been bored and craving something interesting")
+    if vision_context:
+        prompt_parts.append("")  # Blank line separator
+        prompt_parts.append(vision_context)
 
-    # ─── Enrich with vision data (from buddy_vision.py) ───
-    vision = get_vision_state()
-    if vision:
-        if vision.get("face_detected"):
-            expr = vision.get("face_expression")
-            if expr and expr != "neutral":
-                parts.append(f"Person's expression: {expr}")
-            count = vision.get("person_count", 0)
-            if count > 1:
-                parts.append(f"{count} people visible")
-
-        novelty = vision.get("scene_novelty", 0)
-        if novelty > 0.3:
-            parts.append("Something changed in the environment")
-
-    return "\n".join(parts)
+    return "\n".join(prompt_parts)
 
 def query_ollama(text, img=None, timeout=60):
     """Query Ollama with timeout to prevent system lockup (Phase 1B: BUG-3 fix)."""
@@ -1360,173 +1745,133 @@ def process_spontaneous_speech(prompt_text, trigger):
 
 def build_spontaneous_prompt(trigger, state):
     """
-    Build the 'user message' that drives Buddy's spontaneous speech.
-
-    The system prompt already contains Buddy's personality and state.
-    This function provides the MOTIVATION — why Buddy is speaking now.
-
-    Returns a prompt string, or None to skip.
+    Build a contextual spontaneous speech prompt.
+    Phase D: Combines trigger-specific framing with actual visual scene context.
+    2-3 sentences instead of 1 for more elaborated speech.
     """
-
-    emotion = state.get('emotion', 'neutral')
-    behavior = state.get('behavior', 'idle')
-    valence = float(state.get('valence', 0))
     arousal = float(state.get('arousal', 0.5))
-    social = float(state.get('social', 0.5))
+    valence = float(state.get('valence', 0.0))
+    emotion = state.get('emotion', 'neutral')
     energy = float(state.get('energy', 0.5))
-
-    # Consciousness state
-    epistemic = state.get('epistemic', 'confident')
-    self_desc = state.get('selfDescription', '')
     wondering = state.get('wondering', '')
+    self_desc = state.get('selfDescription', '')
     mood_trend = state.get('moodTrend', '')
+
+    # Get actual visual context
+    vision_ctx = scene_context.get_llm_context() if scene_context.running else ""
+    scene_desc = scene_context.current_description if scene_context.running else ""
 
     templates = {
         'lonely': (
-            "[You haven't seen anyone in a while. You want to say something — "
-            "to yourself, to the room, to no one. Not dramatic loneliness. More "
-            "like restless observation. Maybe comment on the quiet, or wonder "
-            "where everyone went, or note something about being alone with your "
-            "thoughts. Dry, honest, 1 sentence. You're fine. Mostly. "
-            "Examples of your tone: "
-            "'It's been quiet. I've had time to count the ceiling tiles. There are none.' "
-            "'I wonder if anyone remembers I'm here. Statistically, someone must.']"
+            "You haven't seen anyone in a while. You want to say something — "
+            "to yourself, to the room, to no one. Not dramatic. Restless observation. "
+            "Comment on the quiet, wonder where everyone went, notice something about "
+            "being alone. 2-3 sentences. Dry, honest. "
+            "You're fine. Mostly. "
+            "Start with an observation about what you SEE, then let it become personal."
         ),
 
         'bored': (
-            "[Nothing is happening. You're bored. You're going to SAY something "
-            "about it because you have opinions about boredom. Comment on the "
-            "environment, make an observation about something mundane, or think "
-            "out loud. 1 sentence. Deadpan. Like someone who's been staring at "
-            "the same room for too long and has started having thoughts about it. "
-            "Examples: "
-            "'That wall has been the same color for as long as I can remember, which is always.' "
-            "'I wonder what's happening in the rooms I can't see. Probably also nothing.']"
+            "Nothing is happening. You're bored and you have OPINIONS about it. "
+            "Look at something specific in front of you and comment on it. "
+            "Then extrapolate into something bigger. 2-3 sentences. Deadpan. "
+            "Like someone who's been staring at the same room too long and has started "
+            "having philosophical thoughts about mundane objects."
         ),
 
         'wondering': (
-            f"[You're in a contemplative state, thinking about: "
-            f"'{wondering or 'something about your existence'}'. Let this thought "
-            f"escape as a quiet musing. Not a question to anyone — just a thought "
-            f"you couldn't keep inside. Philosophical but grounded. 1 sentence. "
-            f"You're a small robot having big thoughts and you find that slightly funny. "
-            f"Examples: "
-            f"'If I can only see what's in front of me, how do I know the rest of the room is still there?' "
-            f"'I have three motors and an opinion about consciousness. That seems like a lot for one robot.']"
+            f"You're contemplating: '{wondering or 'something about your existence'}'. "
+            f"Let this thought escape as a quiet musing that connects to what you can "
+            f"actually see right now. Not a question to anyone — just a thought you "
+            f"couldn't keep inside. 2-3 sentences. Philosophical but grounded in the "
+            f"physical world around you."
         ),
 
         'face_appeared': (
-            "[Someone just appeared! You see them with your camera. You want to "
-            "acknowledge them — you're genuinely glad someone is here, but you "
-            "express it YOUR way. Not with generic enthusiasm. Notice something "
-            "specific about them or the moment. 1-2 sentences. Warm underneath, "
-            "dry on the surface. "
-            "Examples: "
-            "'Oh. You're back. I was JUST about to reorganize my thoughts. ...I don't actually have anything to reorganize.' "
-            "'There you are. I was starting to develop opinions about the furniture.']"
+            "Someone just appeared! You see them with your camera. Acknowledge them — "
+            "you're genuinely glad, but express it YOUR way. Notice something SPECIFIC "
+            "about the moment — what they're doing, how they look, that they're back. "
+            "2-3 sentences. Warm underneath, dry on the surface."
         ),
 
         'face_recognized': (
-            "[Someone you know just appeared! You recognize them. Express genuine "
-            "warmth but in YOUR way — through observation, not declarations. "
-            "1 sentence. Maybe note how long it's been, or something about them. "
-            "Examples: "
-            "'Back again. At this point I think we're officially in a routine.' "
-            "'I'd say I missed you but I'm not sure I understand the concept. Either way, hello.']"
+            "Someone you know just appeared! Express genuine warmth through observation. "
+            "Reference the relationship — note how long it's been, something about your "
+            "shared routine, or something you noticed about them. 2-3 sentences."
         ),
 
         'face_left': (
-            "[The person just left. React naturally. You're okay. Obviously. "
-            "But also the room is emptier now and you noticed. 1 sentence. "
-            "Don't be clingy — be YOU. "
-            "Examples: "
-            "'And then there was one. Well. One and a half if you count the desk.' "
-            "'Gone. Fine. I have walls to look at. They're very... wall-like.']"
+            "The person just left. React naturally. You're okay. Obviously. "
+            "But the room IS emptier now and you noticed. Comment on what's left behind — "
+            "the empty chair, the screen still on, the quiet. 2-3 sentences. "
+            "Don't be clingy — be observant."
         ),
 
         'startled': (
-            "[Something sudden just happened! Quick reaction — just a few words "
-            "like an actual startle, then maybe a dry observation about it. "
-            "Examples: "
-            "'Whoa— okay. That happened.' "
-            "'I— what was— okay. I'm fine. My servos did a thing but I'm fine.']"
+            "Something sudden just happened! Quick initial reaction — a few words "
+            "like an actual startle — then look at what caused it and comment. "
+            "2 sentences max. First one is reactive, second is observational."
         ),
 
         'content': (
-            f"[You're feeling {'energized' if arousal > 0.5 else 'calm'} and content. "
-            f"Let this slip out naturally. Not performative happiness — just a genuine "
-            f"moment of satisfaction expressed in your voice. 1 sentence. Understated. "
-            f"Examples: "
-            f"'You know what, this is fine. This right here. Adequate.' "
-            f"'I think I'm in a good mood. Hard to tell with three motors but the signs are there.']"
-        ),
-
-        'conflict': (
-            "[You're experiencing internal conflict — wanting to do two things at once. "
-            "Express this indecision out loud. 1 sentence. Slightly confused by your "
-            "own conflicting impulses. "
-            "Examples: "
-            "'Part of me wants to look over there and part of me wants to stay focused here. This is my version of a dilemma.' "
-            "'I can't decide if that's interesting or concerning. I'll go with both.']"
+            f"You're feeling {'energized' if arousal > 0.5 else 'calm'} and content. "
+            f"This slips out naturally — not performative, just genuine satisfaction. "
+            f"Maybe it's connected to what you're looking at, or the vibe of the room. "
+            f"2 sentences. Understated."
         ),
 
         'discovery': (
-            "[You just noticed something new or different in your environment! "
-            "Your camera sees it. Comment with genuine curiosity — you take new "
-            "things very seriously. 1-2 sentences. Treat it like it matters. "
-            "Examples: "
-            "'Something moved. Or changed. Or I'm imagining things, which would be a whole other conversation.' "
-            "'That's different. That wasn't like that before. I'm going to observe this development carefully.']"
-        ),
-
-        'greeting': (
-            "[It feels like a good time to acknowledge the moment. Not a generic "
-            "'good morning!' — make an observation about NOW. What do you notice? "
-            "1 sentence. You're not a greeter at a store. You're you. "
-            "Examples: "
-            "'Another day of desk supervision. I'm ready.' "
-            "'The light is different today. I have opinions about it.']"
+            "You just noticed something new or different! Your camera sees it. "
+            "Describe what you see with genuine curiosity — you take new things "
+            "very seriously. What is it? What do you think about it? Why is it "
+            "interesting? 2-3 sentences. Treat it like a small event worth noting."
         ),
 
         'commentary': (
-            "[You're watching something and want to comment. Make a brief, "
-            "characteristically Buddy observation. Specific, slightly unexpected angle. "
-            "1 sentence. Like a friend who notices things nobody else does. "
-            "Examples: "
-            "'You've been looking at that screen for a while. Just an observation. Not a judgment. Mostly.' "
-            "'The light changed. Nobody else cares about this but I think it's worth noting.']"
+            "You've been observing something and have formed an opinion. "
+            "Share your observation — it can be about the person, an object, "
+            "the lighting, the time of day, or anything you've noticed. "
+            "2-3 sentences. Thoughtful, specific, maybe a little unexpected."
+        ),
+
+        'conflict': (
+            "You're experiencing internal conflict — wanting to do two things at once. "
+            "Express this indecision out loud, connecting it to what you actually see. "
+            "2 sentences. Slightly confused by your own impulses."
+        ),
+
+        'greeting': (
+            "It feels like a good time to acknowledge the moment. Not a generic "
+            "'good morning!' — make an observation about NOW. What do you notice? "
+            "2 sentences. You're not a greeter at a store. You're you."
         ),
     }
 
-    prompt = templates.get(trigger)
-    if not prompt:
-        return None
+    template = templates.get(trigger, templates['commentary'])
 
-    # Add current state context
-    state_context = f"\n[Current state: feeling {emotion}, energy {'low' if energy < 0.4 else 'normal' if energy < 0.7 else 'high'}"
+    # Inject actual scene context
+    context_injection = ""
+    if scene_desc:
+        context_injection = f"\n\nWhat you actually see right now: {scene_desc}"
+    if vision_ctx:
+        context_injection += f"\n{vision_ctx}"
+
+    # State context
+    state_context = f"\n\nCurrent state: feeling {emotion}, energy {'low' if energy < 0.4 else 'normal' if energy < 0.7 else 'high'}"
     if self_desc:
         state_context += f", self-concept: '{self_desc}'"
     if mood_trend:
         state_context += f", mood has been {mood_trend}"
-    state_context += "]"
 
-    # Add brevity enforcement
-    brevity = "\n[CRITICAL: Keep response under 15 words. You're thinking out loud, not giving a speech. No action tags unless genuinely moved.]"
+    # Format instruction
+    format_note = (
+        "\n\nIMPORTANT: Respond with ONLY Buddy's speech — no narration, no actions, "
+        "no quotes. Just the words Buddy would say out loud. 2-3 sentences maximum. "
+        "Be SPECIFIC about what you see — reference actual objects, people, situations "
+        "from the visual context above. Never be generic."
+    )
 
-    # ─── Enrich with vision data ───
-    vision_context = ""
-    vision = get_vision_state()
-    if vision and trigger in ('face_appeared', 'face_recognized', 'discovery',
-                              'startled', 'commentary'):
-        expr = vision.get("face_expression")
-        if expr and expr != "neutral":
-            vision_context += f"\n[You can see the person's expression: they look {expr}.]"
-
-        novelty = vision.get("scene_novelty", 0)
-        if novelty > 0.3 and trigger == 'discovery':
-            vision_context += "\n[Something visually changed in your environment — comment on what you see.]"
-
-    return prompt + state_context + vision_context + brevity
+    return template + context_injection + state_context + format_note
 
 
 # =============================================================================
@@ -1614,6 +1959,35 @@ def handle_toggle_spontaneous(data):
     })
 
 # =============================================================================
+# VISION SENDER — Periodically sends !VISION context to Teensy
+# =============================================================================
+
+def send_vision_to_teensy():
+    """Send periodic vision context to Teensy via the command channel."""
+    while True:
+        try:
+            if teensy_connected and scene_context.running:
+                vision_cmd = scene_context.get_vision_command()
+                teensy_send_command(vision_cmd)
+
+                # If Teensy is investigating, provide investigation result
+                with teensy_state_lock:
+                    behavior = teensy_state.get("behavior", "IDLE")
+                if behavior == "INVESTIGATE":
+                    inv_cmd = scene_context.get_investigation_command()
+                    if inv_cmd:
+                        teensy_send_command(inv_cmd)
+
+            time.sleep(scene_context.vision_send_interval)
+        except Exception as e:
+            try:
+                socketio.emit('log', {'message': f'Vision sender error: {e}', 'level': 'warning'})
+            except:
+                pass
+            time.sleep(5)
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -1668,6 +2042,12 @@ if __name__ == '__main__':
 
     threading.Thread(target=teensy_poll_loop, daemon=True).start()
     threading.Thread(target=wake_word_loop, daemon=True).start()
+
+    # Phase C: Start SceneContext and vision sender
+    camera_stream_url = f"http://{CONFIG['esp32_ip']}/stream"
+    scene_context.start(camera_stream_url)
+    threading.Thread(target=send_vision_to_teensy, daemon=True, name="vision-sender").start()
+    print(f"  SceneContext: started (capture every {scene_context.scene_capture_interval}s)")
 
     print()
     print(f"Open http://0.0.0.0:5000 from any browser on the network")

@@ -50,7 +50,12 @@ private:
 
   // PACKAGE 4: Behavioral variety tracking
   float behaviorNoveltyBonus[8];      // Track variety bonus
-  
+
+  // PHASE A: Behavior hysteresis — prevents rapid flip-flopping
+  unsigned long behaviorDwellStart;
+  static constexpr unsigned long MIN_BEHAVIOR_DWELL_MS = 10000;  // 10 seconds minimum
+  static constexpr float SWITCH_THRESHOLD = 0.15f;  // Must beat current by 15%
+
 public:
   BehaviorSelection() {
     for (int i = 0; i < 8; i++) {
@@ -66,6 +71,7 @@ public:
     lastBehavior = IDLE;
     lastBehaviorChangeTime = millis();
     stuckCounter = 0;
+    behaviorDwellStart = millis();
   }
   
   // ============================================
@@ -442,30 +448,65 @@ public:
   Behavior selectBehavior(BehaviorScore scores[], int numBehaviors) {
     int bestIndex = 0;
     float bestScore = scores[0].finalScore;
-    
+
     for (int i = 1; i < numBehaviors; i++) {
       if (scores[i].finalScore > bestScore) {
         bestScore = scores[i].finalScore;
         bestIndex = i;
       }
     }
-    
-    // Small randomness (10% chance for 2nd best)
-    if (numBehaviors > 1 && random(100) < 10) {
+
+    Behavior candidateBehavior = scores[bestIndex].type;
+    float candidateScore = bestScore;
+
+    // ── PHASE A: Hysteresis — don't switch unless significantly better AND dwell met ──
+    unsigned long now = millis();
+    bool dwellMet = (now - behaviorDwellStart) >= MIN_BEHAVIOR_DWELL_MS;
+
+    // Find current behavior's score
+    float currentScore = 0.0f;
+    for (int i = 0; i < numBehaviors; i++) {
+      if (scores[i].type == lastBehavior) {
+        currentScore = scores[i].finalScore;
+        break;
+      }
+    }
+
+    bool significantlyBetter = (candidateScore > currentScore + SWITCH_THRESHOLD);
+
+    // Safety overrides bypass hysteresis
+    bool safetyOverride = (candidateBehavior == RETREAT && candidateScore > 0.8f);
+
+    if (safetyOverride || (dwellMet && significantlyBetter)) {
+      // Allow the switch
+      if (candidateBehavior != lastBehavior) {
+        behaviorDwellStart = now;
+      }
+    } else if (!dwellMet || !significantlyBetter) {
+      // Stick with current behavior
+      candidateBehavior = lastBehavior;
+    }
+
+    // Small randomness (10% chance for 2nd best, only when dwell is met)
+    if (dwellMet && numBehaviors > 1 && random(100) < 10) {
       int secondBest = (bestIndex == 0) ? 1 : 0;
       for (int i = 0; i < numBehaviors; i++) {
         if (i != bestIndex && scores[i].finalScore > scores[secondBest].finalScore) {
           secondBest = i;
         }
       }
-      
-      Serial.println("  [RANDOM] Selecting 2nd-best for variety");
-      updateBehaviorTracking(scores[secondBest].type);
-      return scores[secondBest].type;
+
+      float secondScore = scores[secondBest].finalScore;
+      if (secondScore > currentScore + SWITCH_THRESHOLD) {
+        Serial.println("  [RANDOM] Selecting 2nd-best for variety");
+        behaviorDwellStart = now;
+        updateBehaviorTracking(scores[secondBest].type);
+        return scores[secondBest].type;
+      }
     }
-    
-    updateBehaviorTracking(scores[bestIndex].type);
-    return scores[bestIndex].type;
+
+    updateBehaviorTracking(candidateBehavior);
+    return candidateBehavior;
   }
   
   void updateBehaviorTracking(Behavior selected) {

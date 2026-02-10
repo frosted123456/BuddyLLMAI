@@ -17,10 +17,14 @@ private:
   float novelty;
   float expression;
   
-  // Need dynamics
+  // Need dynamics — PHASE A: Slowed by 3-5x for deliberate pacing
+  // Needs should take MINUTES to build meaningfully, not seconds
   float stimulationRate;
   float socialDecayRate;
   float energyCostRate;
+
+  // Satisfaction multiplier — how impactful need satisfaction is
+  static constexpr float SATISFACTION_BOOST = 1.8f;  // 1.8x more satisfying
   
   // Safety tracking (NEW)
   unsigned long lastThreatTime;
@@ -42,8 +46,8 @@ public:
     novelty = 0.6;
     expression = 0.5;
     
-    stimulationRate = 0.01;
-    socialDecayRate = 0.005;
+    stimulationRate = 0.0025;   // Was 0.01 — now ~5 min to go 0→0.7
+    socialDecayRate = 0.00167;  // Was 0.005 — now ~3 min alone to go 0→0.7
     energyCostRate = 0.0;
     
     lastThreatTime = 0;
@@ -52,33 +56,33 @@ public:
   }
   
   void update(float deltaTime, Personality& personality, SpatialMemory& memory) {
-    // STIMULATION
+    // STIMULATION — slowed 4x for deliberate pacing
     float environmentDynamism = memory.getAverageDynamism();
     if (environmentDynamism < 0.2) {
       stimulation -= stimulationRate * deltaTime * personality.getCuriosity();
     } else {
-      stimulation += 0.02 * deltaTime * environmentDynamism;
+      stimulation += 0.005 * deltaTime * environmentDynamism;  // Was 0.02
     }
-    
-    // SOCIAL
+
+    // SOCIAL — slowed 3x
     social -= socialDecayRate * deltaTime * personality.getSociability();
-    
-    // NOVELTY
+
+    // NOVELTY — slowed 4x for gradual novelty hunger
     float totalNovelty = memory.getTotalNovelty();
     if (totalNovelty < 0.1) {
-      novelty += 0.01 * deltaTime;
+      novelty += 0.0025 * deltaTime;  // Was 0.01
     } else {
-      novelty -= 0.02 * deltaTime * totalNovelty;
+      novelty -= 0.005 * deltaTime * totalNovelty;  // Was 0.02
     }
-    
-    // ENERGY
+
+    // ENERGY — slowed 2x (should take ~30 min to get tired)
     energy -= energyCostRate * deltaTime;
     if (energyCostRate < 0.01) {
-      energy += 0.015 * deltaTime;
+      energy += 0.0075 * deltaTime;  // Was 0.015
     }
-    
-    // EXPRESSION
-    expression += 0.008 * deltaTime;
+
+    // EXPRESSION — slowed 2x
+    expression += 0.004 * deltaTime;  // Was 0.008
     
     // ============================================
     // SAFETY - COMPLETELY REWRITTEN
@@ -170,19 +174,25 @@ public:
   // ============================================
   
   void satisfyStimulation(float amount) {
-    stimulation += amount;
+    stimulation += amount * SATISFACTION_BOOST;
     expression -= amount * 0.5;
     clampNeeds();
   }
-  
-  void satisfySocial(float amount) {
-    social += amount;
-    safety += amount * 0.1;  // Social interaction feels safe
+
+  // Phase A addition: vision-driven stimulation satisfaction
+  void addStimulationSatisfaction(float amount) {
+    stimulation += amount * SATISFACTION_BOOST;
     clampNeeds();
   }
-  
+
+  void satisfySocial(float amount) {
+    social += amount * SATISFACTION_BOOST;
+    safety += amount * 0.15;  // Social interaction feels safe (boosted)
+    clampNeeds();
+  }
+
   void satisfyNovelty(float amount) {
-    novelty -= amount;
+    novelty -= amount * SATISFACTION_BOOST;
     stimulation += amount * 0.3;
     clampNeeds();
   }
@@ -194,8 +204,8 @@ public:
   }
   
   void detectHumanPresence() {
-    social += 0.1;
-    safety += 0.1;  // Increased from 0.05
+    social += 0.15;  // Boosted — human presence is more socially satisfying
+    safety += 0.12;
     clampNeeds();
   }
   
