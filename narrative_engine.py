@@ -61,6 +61,10 @@ class NarrativeEngine:
         # ── Recent Notable Events ──
         self.recent_events = deque(maxlen=max_events)
 
+        # ── Object Memory ──
+        # Tracks objects across scene descriptions for persistent reference
+        self.object_memory = {}  # name → {first_seen, last_seen, times_seen, mentioned_by_buddy, state}
+
         # ── Conversation state ──
         self.last_speech_time = 0
         self.total_utterances_session = 0
@@ -465,7 +469,12 @@ class NarrativeEngine:
             if self.mood_narrative:
                 sections.append(f"Your internal state: {self.mood_narrative}")
 
-            # 5. Recent events
+            # 5. Object memory
+            obj_ctx = self._get_object_context_unlocked()
+            if obj_ctx:
+                sections.append(obj_ctx)
+
+            # 6. Recent events
             recent = [
                 e for e in self.recent_events
                 if now - e["time"] < 300
@@ -494,6 +503,128 @@ class NarrativeEngine:
                 )
 
             return "\n\n".join(sections)
+
+    # ═══════════════════════════════════════════════════════
+    # OBJECT MEMORY — Persistent awareness of things in the scene
+    # ═══════════════════════════════════════════════════════
+
+    TRACKABLE_OBJECTS = {
+        "mug": ["mug", "cup"],
+        "coffee": ["coffee"],
+        "phone": ["phone", "cell", "mobile"],
+        "laptop": ["laptop"],
+        "monitor": ["monitor", "screen", "display"],
+        "keyboard": ["keyboard"],
+        "mouse": ["mouse"],
+        "book": ["book"],
+        "pen": ["pen", "pencil"],
+        "bottle": ["bottle", "water bottle"],
+        "plate": ["plate"],
+        "headphones": ["headphones", "earbuds"],
+        "plant": ["plant"],
+        "lamp": ["lamp"],
+        "clock": ["clock"],
+        "glasses": ["glasses"],
+        "cat": ["cat"],
+        "dog": ["dog"],
+    }
+
+    def update_object_memory(self, scene_description):
+        """
+        Scan scene description for objects and update persistent memory.
+        Detects new objects, disappeared objects, and state changes.
+
+        Returns: list of events like "mug_appeared", "phone_disappeared"
+        """
+        with self.lock:
+            now = time.time()
+            desc_lower = scene_description.lower() if scene_description else ""
+            events = []
+            currently_seen = set()
+
+            for obj_name, keywords in self.TRACKABLE_OBJECTS.items():
+                if any(kw in desc_lower for kw in keywords):
+                    currently_seen.add(obj_name)
+
+                    if obj_name not in self.object_memory:
+                        # New object spotted!
+                        self.object_memory[obj_name] = {
+                            "first_seen": now,
+                            "last_seen": now,
+                            "times_seen": 1,
+                            "mentioned_by_buddy": False,
+                            "disappeared_at": None,
+                        }
+                        events.append(f"{obj_name}_appeared")
+                    else:
+                        mem = self.object_memory[obj_name]
+                        mem["last_seen"] = now
+                        mem["times_seen"] += 1
+                        # Object returned after disappearing
+                        if mem.get("disappeared_at"):
+                            gone_for = int(now - mem["disappeared_at"])
+                            events.append(f"{obj_name}_returned_after_{gone_for}s")
+                            mem["disappeared_at"] = None
+
+            # Check for objects that disappeared
+            for obj_name, mem in self.object_memory.items():
+                if (obj_name not in currently_seen and
+                        not mem.get("disappeared_at") and
+                        now - mem["last_seen"] > 20):  # 20s grace period
+                    mem["disappeared_at"] = now
+                    events.append(f"{obj_name}_disappeared")
+
+            return events
+
+    def get_object_context(self):
+        """Build object memory context for LLM consumption.
+        Note: Call this without the lock held, OR from within a locked context
+        (the internal _get_object_context_unlocked handles the actual work)."""
+        with self.lock:
+            return self._get_object_context_unlocked()
+
+    def _get_object_context_unlocked(self):
+        """Build object context (caller must hold self.lock)."""
+        now = time.time()
+        if not self.object_memory:
+            return ""
+
+        parts = []
+        for obj_name, mem in self.object_memory.items():
+            age = int(now - mem["first_seen"])
+            if age < 60:
+                age_str = f"{age}s"
+            else:
+                age_str = f"{age // 60}min"
+
+            if mem.get("disappeared_at"):
+                gone_for = int(now - mem["disappeared_at"])
+                if gone_for < 300:
+                    parts.append(
+                        f"  - {obj_name}: was here, disappeared {gone_for}s ago"
+                    )
+            elif mem["times_seen"] > 3 and not mem["mentioned_by_buddy"]:
+                parts.append(
+                    f"  - {obj_name}: been there for {age_str}, "
+                    f"you haven't mentioned it yet"
+                )
+            elif mem["mentioned_by_buddy"]:
+                parts.append(
+                    f"  - {obj_name}: noticed {age_str} ago (you mentioned it)"
+                )
+
+        if not parts:
+            return ""
+        return "Objects you're aware of:\n" + "\n".join(parts)
+
+    def mark_object_mentioned(self, text):
+        """Mark objects as mentioned by Buddy based on his speech text."""
+        with self.lock:
+            text_lower = text.lower()
+            for obj_name, keywords in self.TRACKABLE_OBJECTS.items():
+                if obj_name in self.object_memory:
+                    if any(kw in text_lower for kw in keywords):
+                        self.object_memory[obj_name]["mentioned_by_buddy"] = True
 
     # ═══════════════════════════════════════════════════════
     # TIME-SINCE HELPERS

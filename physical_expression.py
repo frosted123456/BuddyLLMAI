@@ -332,13 +332,12 @@ def calculate_speech_delay(arousal, valence, intent_strategy, ignored_streak):
     # High arousal shortens the delay (can't hold it in)
     arousal_factor = 1.0 - (arousal * 0.4)  # 0.6x at max arousal
 
-    # Being ignored shortens delay (more urgent to try again)
-    ignore_factor = max(0.3, 1.0 - (ignored_streak * 0.15))
-
-    # Low energy lengthens delay (less motivation to speak)
-    # (energy not passed here — use arousal as proxy)
+    # Being ignored LENGTHENS delay — Buddy gets quieter, withdraws
+    # (sulking behavior: not more persistent, but more reluctant)
+    ignore_factor = 1.0 + (ignored_streak * 0.25)  # 1.25x, 1.5x, 1.75x, 2.0x...
+    ignore_factor = min(3.0, ignore_factor)  # Cap at 3x
 
     delay = base_delay * arousal_factor * ignore_factor
 
     # Clamp to reasonable range
-    return max(3.0, min(60.0, delay))
+    return max(3.0, min(90.0, delay))
