@@ -21,7 +21,7 @@ Usage:
     python buddy_vision.py --esp32-ip 192.168.1.100 --debug
 
 The --rotate flag applies rotation BEFORE detection (use 90 if camera
-is mounted sideways, matching the old ESP32 firmware's 90° CCW rotation).
+is mounted sideways, matching the old ESP32 firmware's 90deg CCW rotation).
 """
 
 import cv2
@@ -35,7 +35,7 @@ import json
 import signal
 import sys
 from collections import deque
-from flask import Flask, jsonify
+from flask import Flask, jsonify, Response
 
 # ════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -53,7 +53,7 @@ DEFAULT_CONFIG = {
     "teensy_center_y": 120,
 
     # Camera rotation (0, 90, 180, 270)
-    # Set to 90 if camera is mounted sideways (old ESP32 did 90° CCW)
+    # Set to 90 if camera is mounted sideways (old ESP32 did 90deg CCW)
     "rotation": 0,
 
     # Detection settings
@@ -64,6 +64,7 @@ DEFAULT_CONFIG = {
     # Performance
     "target_tracking_fps": 30,    # Face detection rate
     "target_rich_fps": 3,         # Object/expression rate
+    "proxy_stream_fps": 12,       # Annotated MJPEG proxy stream FPS
 
     # State API
     "api_port": 5555,
@@ -87,6 +88,9 @@ class VisionState:
         self.latest_frame = None
         self.frame_timestamp = 0
         self.frame_count = 0
+
+        # Annotated frame (with bounding boxes drawn, for proxy stream)
+        self.annotated_frame = None
 
         # Face tracking state
         self.faces = []                # List of detected faces
@@ -114,9 +118,16 @@ class VisionState:
         self.udp_sent = 0
         self.errors = 0
         self.last_error = ""
+        self.reconnect_count = 0
 
         # Sequence counter (monotonic, matches Teensy expectation)
         self.sequence = 0
+
+        # Last UDP message sent to ESP32
+        self.last_udp_msg = ""
+
+        # Coordinate history — rolling buffer for /coord_history endpoint
+        self.coord_history = deque(maxlen=300)
 
     def update_frame(self, frame):
         with self.lock:
@@ -127,6 +138,16 @@ class VisionState:
     def get_frame(self):
         with self.lock:
             return self.latest_frame, self.frame_timestamp
+
+    def update_annotated_frame(self, frame):
+        with self.lock:
+            self.annotated_frame = frame
+
+    def get_annotated_frame(self):
+        with self.lock:
+            if self.annotated_frame is not None:
+                return self.annotated_frame.copy()
+            return None
 
     def update_tracking(self, faces, primary, fps, latency):
         with self.lock:
@@ -158,25 +179,56 @@ class VisionState:
             self.sequence += 1
             return self.sequence
 
+    def record_coord(self, face_x, face_y, vx, vy, conf, face_detected, udp_msg):
+        """Append a coordinate data point to the rolling history buffer."""
+        with self.lock:
+            self.coord_history.append({
+                "timestamp": time.time(),
+                "face_x": face_x,
+                "face_y": face_y,
+                "vx": vx,
+                "vy": vy,
+                "conf": conf,
+                "face_detected": face_detected,
+                "last_udp_msg": udp_msg,
+            })
+
+    def get_coord_history(self):
+        with self.lock:
+            return list(self.coord_history)
+
     def get_state_dict(self):
         """Full state for API endpoint."""
         with self.lock:
+            # Flatten primary_face fields to top level for easy dashboard access
+            pf = self.primary_face or {}
             return {
                 "face_detected": self.face_detected,
                 "primary_face": self.primary_face,
+                "face_x": pf.get("x", 0),
+                "face_y": pf.get("y", 0),
+                "face_vx": pf.get("vx", 0),
+                "face_vy": pf.get("vy", 0),
+                "face_w": pf.get("w", 0),
+                "face_h": pf.get("h", 0),
+                "confidence": pf.get("conf", 0),
+                "sequence": self.sequence,
                 "face_count": len(self.faces),
                 "tracking_fps": round(self.tracking_fps, 1),
+                "detection_fps": round(self.tracking_fps, 1),  # alias for dashboard
                 "detection_latency_ms": round(self.detection_latency_ms, 1),
                 "stream_connected": self.stream_connected,
                 "stream_fps": round(self.stream_fps, 1),
                 "frame_count": self.frame_count,
                 "udp_sent": self.udp_sent,
+                "reconnect_count": self.reconnect_count,
                 "objects": self.objects,
                 "face_expression": self.face_expression,
                 "scene_novelty": round(self.scene_novelty, 2),
                 "person_count": self.person_count,
                 "errors": self.errors,
                 "last_error": self.last_error,
+                "last_udp_msg": self.last_udp_msg,
             }
 
 
@@ -230,24 +282,24 @@ def calculate_confidence(detection_score, face_w_240):
 
     MediaPipe typically returns 0.5-0.99.
     We map to a wider range to give Teensy meaningful variation:
-        0.50 → 55   (low — barely detected)
-        0.65 → 65   (low-medium)
-        0.75 → 75   (medium-high)
-        0.85 → 82   (high)
-        0.95 → 90   (very high)
-        1.00 → 95   (maximum)
+        0.50 -> 55   (low — barely detected)
+        0.65 -> 65   (low-medium)
+        0.75 -> 75   (medium-high)
+        0.85 -> 82   (high)
+        0.95 -> 90   (very high)
+        1.00 -> 95   (maximum)
     """
     # Piecewise linear mapping for better spread
     if detection_score < 0.5:
         base_conf = 25  # Minimum accepted
     elif detection_score < 0.7:
-        # 0.5-0.7 → 55-70 (low confidence band)
+        # 0.5-0.7 -> 55-70 (low confidence band)
         base_conf = int(55 + (detection_score - 0.5) * 75)
     elif detection_score < 0.85:
-        # 0.7-0.85 → 70-85 (high confidence band)
+        # 0.7-0.85 -> 70-85 (high confidence band)
         base_conf = int(70 + (detection_score - 0.7) * 100)
     else:
-        # 0.85-1.0 → 85-95 (very high confidence band)
+        # 0.85-1.0 -> 85-95 (very high confidence band)
         base_conf = int(85 + (detection_score - 0.85) * 67)
 
     base_conf = max(25, min(base_conf, 95))
@@ -277,12 +329,17 @@ def stream_receiver_thread(config):
     while True:
         try:
             print(f"[STREAM] Connecting to {url}...")
-            cap = cv2.VideoCapture(url)
+
+            # Use FFMPEG backend for better MJPEG handling and timeout support
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Phase 1D: BUG-5 fix — minimize internal buffering
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000)   # 10s connection timeout
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)    # 5s read timeout
 
             if not cap.isOpened():
                 print("[STREAM] Failed to open stream, retrying in 3s...")
                 state.stream_connected = False
+                state.reconnect_count += 1
                 time.sleep(3)
                 continue
 
@@ -293,6 +350,7 @@ def stream_receiver_thread(config):
                 ret, frame = cap.read()
                 if not ret:
                     print("[STREAM] Frame read failed, reconnecting...")
+                    state.reconnect_count += 1
                     break
 
                 # Apply rotation if camera is mounted sideways
@@ -320,8 +378,70 @@ def stream_receiver_thread(config):
             state.stream_connected = False
             state.errors += 1
             state.last_error = str(e)
+            state.reconnect_count += 1
 
         time.sleep(2)  # Wait before reconnect
+
+
+# ════════════════════════════════════════════════════════════════
+# ANNOTATION HELPER
+# ════════════════════════════════════════════════════════════════
+
+def draw_annotations(frame, detections, frame_w, frame_h, detect_ms, face_landmarks_available):
+    """
+    Draw face detection bounding boxes, landmarks dots, and overlay text
+    onto a frame. Returns the annotated copy.
+
+    Args:
+        frame: BGR image (will be copied, not modified in place)
+        detections: list of mediapipe detection objects (or None)
+        frame_w, frame_h: frame dimensions
+        detect_ms: detection latency in milliseconds
+        face_landmarks_available: whether face landmarks flag is set
+    """
+    annotated = frame.copy()
+
+    face_count = 0
+
+    if detections:
+        face_count = len(detections)
+        for det in detections:
+            bbox = det.location_data.relative_bounding_box
+            score = det.score[0]
+
+            x1 = int(bbox.xmin * frame_w)
+            y1 = int(bbox.ymin * frame_h)
+            x2 = int((bbox.xmin + bbox.width) * frame_w)
+            y2 = int((bbox.ymin + bbox.height) * frame_h)
+
+            # Green bounding box
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            # Confidence label above box
+            label = f"{score:.2f}"
+            cv2.putText(annotated, label,
+                        (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0, 255, 0), 2)
+
+            # Draw landmark dots (keypoints) if available in detection
+            if det.location_data.relative_keypoints:
+                for kp in det.location_data.relative_keypoints:
+                    kx = int(kp.x * frame_w)
+                    ky = int(kp.y * frame_h)
+                    cv2.circle(annotated, (kx, ky), 3, (255, 0, 255), -1)
+
+    # Overlay text info bar at top
+    fps_val = state.tracking_fps
+    overlay_text = (
+        f"FPS: {fps_val:.1f} | "
+        f"Det: {detect_ms:.0f}ms | "
+        f"Faces: {face_count} | "
+        f"UDP: {state.udp_sent}"
+    )
+    cv2.putText(annotated, overlay_text,
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+    return annotated
 
 
 # ════════════════════════════════════════════════════════════════
@@ -445,6 +565,12 @@ def face_tracking_thread(config):
                     udp_sock.sendto(msg.encode(), esp32_addr)
                     state.udp_sent += 1
 
+                    # Store last UDP message
+                    state.last_udp_msg = msg
+
+                    # Record coordinate history
+                    state.record_coord(tx, ty, vx, vy, conf, True, msg)
+
                     # Update shared state
                     state.update_tracking(faces_list, {
                         "x": tx, "y": ty, "w": tw, "h": th,
@@ -466,6 +592,12 @@ def face_tracking_thread(config):
                 udp_sock.sendto(msg.encode(), esp32_addr)
                 state.udp_sent += 1
 
+                # Store last UDP message
+                state.last_udp_msg = msg
+
+                # Record coordinate history (no face)
+                state.record_coord(120, 120, 0, 0, 0, False, msg)
+
                 state.update_tracking([], None, 0, detect_ms)
 
                 # Reset velocity tracking after sustained face loss
@@ -477,6 +609,13 @@ def face_tracking_thread(config):
 
                 if config["debug"] and consecutive_no_face == 1:
                     print(f"[TRACKING] Face lost ({detect_ms:.1f}ms)")
+
+            # -- Build and store annotated frame for proxy stream --
+            annotated = draw_annotations(
+                frame, results.detections, frame_w, frame_h,
+                detect_ms, state.face_landmarks is not None
+            )
+            state.update_annotated_frame(annotated)
 
             # FPS tracking
             fps_counter.append(time.time())
@@ -540,7 +679,7 @@ def rich_vision_thread(config):
         min_tracking_confidence=0.5
     )
 
-    # Phase 2: UDP socket for sending VISION updates to ESP32 → Teensy
+    # Phase 2: UDP socket for sending VISION updates to ESP32 -> Teensy
     vision_udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     esp32_addr = (config["esp32_ip"], config["udp_port"])
 
@@ -590,8 +729,8 @@ def rich_vision_thread(config):
 
             prev_frame_gray = gray_small
 
-            # ── Phase 2: Send VISION update to Teensy via UDP ──
-            # This closes the observation loop: PC sees → Teensy feels
+            # -- Phase 2: Send VISION update to Teensy via UDP --
+            # This closes the observation loop: PC sees -> Teensy feels
             vision_cmd = json.dumps({
                 "f": 1 if state.face_detected else 0,
                 "fc": state.person_count,
@@ -716,6 +855,7 @@ def get_health():
         "tracking_fps": round(state.tracking_fps, 1),
         "latency_ms": round(state.detection_latency_ms, 1),
         "udp_sent": state.udp_sent,
+        "reconnect_count": state.reconnect_count,
         "errors": state.errors,
     })
 
@@ -729,6 +869,89 @@ def get_snapshot():
 
     _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return buf.tobytes(), 200, {'Content-Type': 'image/jpeg'}
+
+
+@api_app.route('/annotated_snapshot')
+def get_annotated_snapshot():
+    """Latest annotated frame (with face bounding boxes) as JPEG."""
+    annotated = state.get_annotated_frame()
+    if annotated is None:
+        # Fall back to raw frame if no annotated frame yet
+        frame, _ = state.get_frame()
+        if frame is None:
+            return "No frame available", 503
+        annotated = frame
+
+    _, buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return buf.tobytes(), 200, {'Content-Type': 'image/jpeg'}
+
+
+def _generate_mjpeg_stream(target_fps):
+    """Generator that yields annotated frames as MJPEG multipart chunks."""
+    frame_interval = 1.0 / target_fps
+    while True:
+        start = time.time()
+
+        annotated = state.get_annotated_frame()
+        if annotated is None:
+            # Fall back to raw frame if annotated not yet available
+            frame, _ = state.get_frame()
+            if frame is None:
+                time.sleep(0.05)
+                continue
+            annotated = frame
+
+        _, buf = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        jpg_bytes = buf.tobytes()
+
+        yield (
+            b'--frame\r\n'
+            b'Content-Type: image/jpeg\r\n'
+            b'Content-Length: ' + str(len(jpg_bytes)).encode() + b'\r\n'
+            b'\r\n' + jpg_bytes + b'\r\n'
+        )
+
+        # Throttle to target FPS
+        elapsed = time.time() - start
+        sleep_time = frame_interval - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+
+@api_app.route('/stream')
+def get_stream():
+    """
+    Annotated MJPEG proxy stream.
+    Re-serves the ESP32 camera stream with face detection overlays drawn.
+    Supports multiple simultaneous clients (solves single-client limitation).
+    """
+    target_fps = DEFAULT_CONFIG.get("proxy_stream_fps", 12)
+    return Response(
+        _generate_mjpeg_stream(target_fps),
+        mimetype='multipart/x-mixed-replace; boundary=frame',
+        headers={
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+        }
+    )
+
+
+@api_app.route('/coord_history')
+def get_coord_history():
+    """Rolling buffer of recent coordinate data points as JSON array."""
+    return jsonify(state.get_coord_history())
+
+
+@api_app.route('/last_udp_msg')
+def get_last_udp_msg():
+    """Returns the last FACE: or NO_FACE string that was sent to ESP32."""
+    with state.lock:
+        return jsonify({
+            "last_udp_msg": state.last_udp_msg,
+            "udp_sent": state.udp_sent,
+        })
 
 
 def api_server_thread(config):
@@ -755,6 +978,7 @@ def status_printer_thread(config):
               f"Expression:{s['face_expression']} | "
               f"Novelty:{s['scene_novelty']:.2f} | "
               f"UDP:{s['udp_sent']} | "
+              f"Reconnects:{s['reconnect_count']} | "
               f"Errors:{s['errors']}")
 
 
@@ -782,13 +1006,14 @@ def main():
     config["api_port"] = args.api_port
 
     print("+" + "=" * 44 + "+")
-    print("|  BUDDY VISION PIPELINE v1.0                |")
+    print("|  BUDDY VISION PIPELINE v1.1                |")
     print("+" + "=" * 44 + "+")
     print(f"  ESP32:     {config['esp32_ip']}")
     print(f"  Stream:    http://{config['esp32_ip']}/stream")
     print(f"  UDP out:   {config['esp32_ip']}:{config['udp_port']}")
     print(f"  Rotation:  {config['rotation']}deg")
     print(f"  API:       http://localhost:{config['api_port']}/state")
+    print(f"  Proxy:     http://localhost:{config['api_port']}/stream")
     print(f"  Debug:     {config['debug']}")
     print(f"  Preview:   {config['show_preview']}")
     print()
