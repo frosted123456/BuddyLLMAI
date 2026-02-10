@@ -2694,16 +2694,12 @@ def process_narrative_speech(strategy, saved_state):
             'message': f'Buddy is speaking ({strategy})'
         })
 
-        # Capture vision for face-related triggers
-        img = None
-        if strategy in ('casual_mention', 'direct_address', 'insistent_mention',
-                        'witty_observation', 'interactive_attempt'):
-            img = capture_frame()
-            if img:
-                socketio.emit('image', {'base64': img})
+        # No image capture here — scene_context already has the latest description
+        # as text. Sending an image would force llava (15-30s) instead of the
+        # fast text model (3-5s). The scene loop handles vision independently.
 
         teensy_send_with_fallback("THINKING", "EXPRESS:curious")
-        resp = query_ollama(prompt_text, img)
+        resp = query_ollama(prompt_text)
         teensy_send_command("STOP_THINKING")
 
         # ═══ PHASE 3: DELIVERY (speaking + movement) ═══
@@ -2982,7 +2978,7 @@ def handle_audio_input(data):
         text = transcribe_audio(base64.b64decode(data.get('audio', '')))
         if text and len(text) > 2: 
             emit('log', {'message': f'Heard: "{text}"', 'level': 'success'})
-            threading.Thread(target=process_input, args=(text, data.get('include_vision', True))).start()
+            threading.Thread(target=process_input, args=(text, data.get('include_vision', False))).start()
         else: 
             teensy_send_command("IDLE")
             emit('log', {'message': "Didn't catch that", 'level': 'warning'})
