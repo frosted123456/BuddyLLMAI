@@ -129,6 +129,16 @@ class VisionState:
         # Coordinate history — rolling buffer for /coord_history endpoint
         self.coord_history = deque(maxlen=300)
 
+        # ── Response Detection (for narrative engine) ──
+        self.expression_history = deque(maxlen=30)   # (expression, timestamp)
+        self.last_stable_expression = "neutral"
+        self.expression_changed_at = 0
+        self.gaze_direction = "center"               # left / center / right
+        self.person_approached = False
+        self.person_left_at = 0
+        self.face_appeared_at = 0
+        self._prev_face_detected = False
+
     def update_frame(self, frame):
         with self.lock:
             self.latest_frame = frame
@@ -717,6 +727,30 @@ def rich_vision_thread(config):
                 state.face_expression = None
                 state.face_landmarks = None
 
+            # -- Response Detection: track expression changes --
+            if expression:
+                now_ts = time.time()
+                with state.lock:
+                    state.expression_history.append((expression, now_ts))
+
+                    # Check for stable expression change
+                    if expression != state.last_stable_expression:
+                        # Check if the new expression has been consistent for >1s
+                        recent_exprs = [
+                            e for e, t in state.expression_history
+                            if now_ts - t < 2.0
+                        ]
+                        if recent_exprs and all(e == expression for e in recent_exprs[-3:]):
+                            state.last_stable_expression = expression
+                            state.expression_changed_at = now_ts
+
+                    # Track face appeared/left transitions
+                    if state.face_detected and not state._prev_face_detected:
+                        state.face_appeared_at = now_ts
+                    elif not state.face_detected and state._prev_face_detected:
+                        state.person_left_at = now_ts
+                    state._prev_face_detected = state.face_detected
+
             # -- Scene Novelty Detection --
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray_small = cv2.resize(gray, (160, 120))
@@ -942,6 +976,25 @@ def get_stream():
 def get_coord_history():
     """Rolling buffer of recent coordinate data points as JSON array."""
     return jsonify(state.get_coord_history())
+
+
+@api_app.route('/response_detection')
+def get_response_detection():
+    """
+    Response detection state for the narrative engine.
+    Reports whether the person looked at Buddy, smiled, changed expression, etc.
+    """
+    with state.lock:
+        return jsonify({
+            "face_detected": state.face_detected,
+            "expression": state.face_expression,
+            "last_stable_expression": state.last_stable_expression,
+            "expression_changed_at": state.expression_changed_at,
+            "face_appeared_at": state.face_appeared_at,
+            "person_left_at": state.person_left_at,
+            "person_count": state.person_count,
+            "scene_novelty": round(state.scene_novelty, 2),
+        })
 
 
 @api_app.route('/last_udp_msg')

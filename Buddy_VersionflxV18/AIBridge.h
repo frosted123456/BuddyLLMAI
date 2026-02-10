@@ -23,6 +23,8 @@
 //   !IDLE                → Clear AI state, return to behavior system
 //   !SPOKE               → Acknowledge spontaneous speech (resets urge)
 //   !VISION:json         → Update behavior engine with PC vision observations (Phase 2)
+//   !PERFORM:type        → Speech performance arc movements (pre_speech/watching/deflated/acknowledged)
+//   !PHYSICAL:name       → Physical expression (sigh/double_take/settle/expectant/dismissive/curious_tilt)
 
 #ifndef AI_BRIDGE_H
 #define AI_BRIDGE_H
@@ -172,6 +174,12 @@ public:
     }
     else if (strncmp(cmdLine, "NOD:", 4) == 0) {
       cmdNod(cmdLine + 4);
+    }
+    else if (strncmp(cmdLine, "PERFORM:", 8) == 0) {
+      cmdPerform(cmdLine + 8);
+    }
+    else if (strncmp(cmdLine, "PHYSICAL:", 9) == 0) {
+      cmdPhysical(cmdLine + 9);
     }
     else if (strncmp(cmdLine, "IDLE", 4) == 0) {
       cmdIdle();
@@ -346,6 +354,155 @@ public:
 
     // No response — this is a continuous feed, not a request/response command.
     // Saves UART bandwidth and avoids contention.
+  }
+
+  // ============================================
+  // !PERFORM:type — Speech Performance Arc movements
+  // Called by Python narrative engine before/during/after speech
+  // Types: pre_speech, watching, deflated, acknowledged, lean_forward
+  // ============================================
+
+  void cmdPerform(const char* args) {
+    if (servos == nullptr) {
+      responseStream->println("{\"ok\":false,\"reason\":\"not_initialized\"}");
+      return;
+    }
+
+    // Don't override active reflex tracking
+    if (reflex != nullptr && reflex->isActive()) {
+      responseStream->println("{\"ok\":false,\"reason\":\"tracking_active\"}");
+      return;
+    }
+
+    stopAIAnim();
+
+    int curBase, curNod, curTilt;
+    servos->getPosition(curBase, curNod, curTilt);
+
+    MovementStyleParams style;
+    if (engine != nullptr) {
+      style = engine->getMovementStyle();
+    } else {
+      style.speed = 0.5f;
+    }
+
+    if (strcmp(args, "pre_speech") == 0) {
+      // "Inhale before speaking" — center, slight lean forward
+      style.speed = 0.6f;
+      servos->smoothMoveTo(90, 108, curTilt, style);
+    }
+    else if (strcmp(args, "watching") == 0) {
+      // Post-speech — hold attention, slight lean forward
+      style.speed = 0.4f;
+      servos->smoothMoveTo(90, 108, curTilt, style);
+    }
+    else if (strcmp(args, "deflated") == 0) {
+      // Ignored — gaze drops, small settle
+      style.speed = 0.3f;
+      servos->smoothMoveTo(curBase, constrain(curNod + 10, 80, 150), curTilt, style);
+    }
+    else if (strcmp(args, "acknowledged") == 0) {
+      // Got a response — settle back contentedly
+      style.speed = 0.4f;
+      servos->smoothMoveTo(90, 115, curTilt, style);
+    }
+    else if (strcmp(args, "lean_forward") == 0) {
+      // Expectant — lean in
+      style.speed = 0.5f;
+      servos->smoothMoveTo(90, 105, curTilt, style);
+    }
+    else {
+      responseStream->print("{\"ok\":false,\"reason\":\"unknown_perform\",\"type\":\"");
+      responseStream->print(args);
+      responseStream->println("\"}");
+      return;
+    }
+
+    responseStream->println("{\"ok\":true}");
+  }
+
+  // ============================================
+  // !PHYSICAL:name — Physical expressions (non-verbal communication)
+  // Called by Python when Buddy expresses physically instead of speaking
+  // Names: sigh, double_take, settle, expectant, dismissive, curious_tilt, startled
+  // ============================================
+
+  void cmdPhysical(const char* args) {
+    if (servos == nullptr || engine == nullptr) {
+      responseStream->println("{\"ok\":false,\"reason\":\"not_initialized\"}");
+      return;
+    }
+
+    if (reflex != nullptr && reflex->isActive()) {
+      responseStream->println("{\"ok\":false,\"reason\":\"tracking_active\"}");
+      return;
+    }
+
+    stopAIAnim();
+
+    int curBase, curNod, curTilt;
+    servos->getPosition(curBase, curNod, curTilt);
+
+    MovementStyleParams style = engine->getMovementStyle();
+
+    if (strcmp(args, "sigh") == 0) {
+      // Sink down slowly, hold, return
+      style.speed = 0.25f;  // Very slow
+      int nodDown = constrain(curNod + 10, 80, 150);
+      servos->smoothMoveTo(curBase, nodDown, curTilt, style);
+      // Note: Python handles the timing/return via subsequent commands
+    }
+    else if (strcmp(args, "double_take") == 0) {
+      // Quick look away then snap back
+      style.speed = 0.9f;  // Fast
+      int awayBase = (curBase > 90) ?
+                     constrain(curBase - 30, 10, 170) :
+                     constrain(curBase + 30, 10, 170);
+      servos->smoothMoveTo(awayBase, curNod, curTilt, style);
+      // Python sends follow-up LOOK to snap back
+    }
+    else if (strcmp(args, "settle") == 0) {
+      // Sink deeper into rest
+      style.speed = 0.2f;  // Very slow
+      servos->smoothMoveTo(curBase, constrain(curNod + 12, 80, 150), curTilt, style);
+    }
+    else if (strcmp(args, "expectant") == 0) {
+      // Lean forward, look at person
+      style.speed = 0.5f;
+      servos->smoothMoveTo(90, 105, curTilt, style);
+    }
+    else if (strcmp(args, "dismissive") == 0) {
+      // Slow turn away
+      style.speed = 0.2f;  // Very slow, deliberate
+      int awayBase = (curBase >= 90) ?
+                     constrain(curBase - 40, 10, 170) :
+                     constrain(curBase + 40, 10, 170);
+      servos->smoothMoveTo(awayBase, curNod, curTilt, style);
+    }
+    else if (strcmp(args, "curious_tilt") == 0) {
+      // Curious head tilt — delegate to EXPRESS:curious
+      if (animator != nullptr && !animator->isCurrentlyAnimating()) {
+        Personality& pers = engine->getPersonality();
+        Needs& needs = engine->getNeeds();
+        animator->expressEmotion(EMOTION_CURIOUS, pers, needs);
+      }
+    }
+    else if (strcmp(args, "startled") == 0) {
+      // Quick startle — delegate to EXPRESS:startled
+      if (animator != nullptr && !animator->isCurrentlyAnimating()) {
+        Personality& pers = engine->getPersonality();
+        Needs& needs = engine->getNeeds();
+        animator->expressEmotion(EMOTION_STARTLED, pers, needs);
+      }
+    }
+    else {
+      responseStream->print("{\"ok\":false,\"reason\":\"unknown_physical\",\"name\":\"");
+      responseStream->print(args);
+      responseStream->println("\"}");
+      return;
+    }
+
+    responseStream->println("{\"ok\":true}");
   }
 
   // ============================================

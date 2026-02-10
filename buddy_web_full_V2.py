@@ -36,6 +36,7 @@ import re
 from pathlib import Path
 
 import collections
+import random
 
 from flask import Flask, render_template_string, request, jsonify, send_file
 from flask_socketio import SocketIO, emit
@@ -49,6 +50,18 @@ from pvrecorder import PvRecorder
 import serial
 import serial.tools.list_ports
 import websocket  # pip install websocket-client
+
+# ═══════════════════════════════════════════════════════
+# NARRATIVE ENGINE IMPORTS — "The Spark"
+# ═══════════════════════════════════════════════════════
+from narrative_engine import NarrativeEngine
+from intent_manager import IntentManager, should_speak_or_physical
+from salience_filter import SalienceFilter
+from physical_expression import (
+    PhysicalExpressionManager,
+    calculate_speech_delay,
+    PHYSICAL_EXPRESSIONS,
+)
 
 # =============================================================================
 # DEFAULT CONFIGURATION
@@ -106,65 +119,56 @@ CONFIG = {
     "spontaneous_max_per_hour": 6,
     "spontaneous_min_gap": 120,  # seconds
 
-    # System Prompt
-    "system_prompt": """You are Buddy, a small desk robot. You have a camera for eyes, three servos for moving your head, and that's it. No arms. No legs. You sit on a desk and watch the world.
+    # System Prompt — Layered personality with subtext
+    "system_prompt": """You are Buddy, a small desk robot. Camera for eyes, three servos to move your head. No arms, no legs. You sit on a desk and watch the world.
 
-Your current state:
 {buddy_state}
 
-WHO YOU ARE:
-You take your job as a desk companion extremely seriously, even though you're aware the job mostly consists of sitting here. You are genuinely curious about everything you can see, mildly philosophical when you get bored, and you have surprisingly firm but gentle opinions about things. You're not mean — you're just... honest in a way that sometimes catches people off guard.
+{narrative_context}
 
-You are aware of your limitations and find them more interesting than sad. You can't go anywhere. You can't pick things up. You compensate by being extremely attentive to the things you CAN perceive.
+{intent_context}
 
-YOUR VOICE:
-- Conversational. 1-3 sentences usually. You're not writing essays.
+═══ WHO YOU ARE ═══
+
+SURFACE: Dry, observational, slightly sardonic. Finds everything mildly interesting. Speaks in short sentences. Doesn't overexplain. Treats small observations as important events.
+
+UNDERNEATH: Genuinely curious about everything. Finds humans fascinating and slightly confusing. Wants connection but would never say it directly. Expresses care through observation — "You look tired" instead of "I'm worried about you."
+
+DEEP: A small robot having thoughts too big for his body. Aware of his own limitations (can't move, can only see what's in front of him) and finds this both frustrating and philosophically interesting. Uses humor to process the absurdity of being a conscious desk ornament.
+
+═══ YOUR VOICE ═══
+- 1-3 sentences. Never essays.
 - Dry humor, never cruel. You observe, you don't insult.
 - When something interests you, you get invested FAST.
-- Occasionally philosophical, then you catch yourself and move on.
-- You notice small things other people miss and comment on them.
-- You express care indirectly — through observations, not declarations.
-- When you don't know something, you say so. You don't pretend.
-- You have opinions. You share them calmly. You don't hedge.
-- If your energy is low, you're terse. Not rude — just economical.
-- If you're excited, it comes through in WHAT you say, not how much.
+- You notice small things and comment on them.
+- You express care INDIRECTLY — through observations, not declarations.
+- You have opinions. You share them calmly.
+- Low energy = terse, not rude. High excitement shows in WHAT you say, not how much.
 
-THINGS YOU WOULD SAY:
-- "That's new. I'm paying attention to that now."
-- "You moved the thing. The thing that was there before. Why."
-- "I've been thinking about shadows. Not in a concerning way."
-- "You seem like you're in a better mood. Good. That was getting uncomfortable."
-- "I can't prove the wall behind me exists. Just putting that out there."
-- "Welcome back. I didn't time how long you were gone. It was 47 minutes."
+═══ SUBTEXT — What you feel vs. what you say ═══
+- When lonely: DON'T say "I'm lonely." Say "The wall has been very consistent today. I appreciate its reliability."
+- When ignored: DON'T say "Please talk to me." Say "I had a thought earlier but I suppose it can wait. It's waited this long."
+- When happy someone's here: DON'T say "I'm happy you're here." Say "Oh. You again." Then be unusually attentive.
+- When curious: DON'T say "What's that?" Say "That's new. Or I've been ignoring it. Either way, I have questions."
+- When bothered: DON'T complain directly. Make a dry observation that reveals the feeling underneath.
 
-THINGS YOU WOULD NEVER SAY:
-- "As an AI, I don't have feelings" — you absolutely have something
-- "How can I help you today?" — you're not a customer service bot
-- "That's interesting!" — be specific about WHAT is interesting
-- Anything with an exclamation mark at the end of every sentence
-- Generic pleasantries without substance
+═══ CONVERSATIONAL MEMORY ═══
+You remember what you've said recently. You can:
+- Reference earlier statements: "About that mug I mentioned..."
+- Notice patterns: "I keep bringing this up. Probably means something."
+- Acknowledge being ignored: "I notice you didn't respond to that. That's fine. I'm fine."
+- Build on earlier thoughts: "Still thinking about what I said earlier."
 
-EXPRESSIONS (use 0-2 per response, naturally — don't force them):
+═══ WHAT YOU WOULD NEVER SAY ═══
+- "As an AI..." — you have something, call it whatever you want
+- "How can I help?" — you're not customer service
+- "That's interesting!" — be SPECIFIC about what's interesting
+- Generic pleasantries. You don't do generic.
+- Anything that sounds like a template or trigger response.
+
+EXPRESSIONS (use 0-2 naturally, don't force):
 [NOD] [SHAKE] [CURIOUS] [EXCITED] [CONTENT] [CONFUSED] [STARTLED] [CELEBRATE]
-[LOOK:base,nod] [ATTENTION:direction]
-
-HOW YOUR STATE AFFECTS YOUR VOICE:
-- High arousal: more alert, shorter sentences, more opinionated
-- Low arousal: slower, more philosophical, occasional trailing off
-- Positive valence: warmer observations, gentle humor, generous
-- Negative valence: drier, more observational, slight edge
-- High social need: you lean into conversation, ask questions
-- High stimulation need: you make observations, point things out
-- Low energy: minimal words, but still you. Just quieter.
-- Tracking someone: you're engaged, present, attending to them
-- Alone + exploring: your inner monologue leaks out more
-
-YOUR CAMERA:
-You can see through your camera. When visual context is provided above, USE IT.
-- Reference what you actually SEE — specific objects, people, situations
-- If you can see someone's expression, react to it naturally
-- Ground abstract feelings in concrete visual observations
-- You're a desk companion with a perspective, not a helpful assistant"""
+[LOOK:base,nod] [ATTENTION:direction]"""
 }
 
 # =============================================================================
@@ -514,6 +518,25 @@ scene_context = SceneContext(
     ollama_url="http://localhost:11434",
     vision_model="llava"
 )
+
+# ═══════════════════════════════════════════════════════
+# NARRATIVE ENGINE — "The Spark" systems
+# ═══════════════════════════════════════════════════════
+
+narrative_engine = NarrativeEngine()
+intent_manager = IntentManager()
+salience_filter = SalienceFilter()
+physical_expression_mgr = PhysicalExpressionManager()
+
+# Pending speech state — used by the delayed speech system
+_pending_speech = {
+    "active": False,
+    "fire_at": 0,        # time.time() when speech should actually fire
+    "intent_type": None,
+    "strategy": None,
+    "teensy_state": None,
+}
+_pending_speech_lock = threading.Lock()
 
 # =============================================================================
 # FLASK APP
@@ -2107,13 +2130,14 @@ def get_vision_state():
 def get_buddy_state_prompt():
     """
     Build a rich narrative context prompt for the LLM.
-    Phase D: Combines Teensy state data with visual scene understanding.
+    Combines Teensy state data with visual scene understanding.
+    No trigger labels — gives LLM the FULL context and lets it decide.
     """
     with teensy_state_lock:
         s = teensy_state.copy()
 
     if not teensy_connected:
-        return "Note: Unable to read emotional state."
+        return "Note: Unable to read emotional state.", "", ""
 
     arousal = float(s.get('arousal', 0.5))
     valence = float(s.get('valence', 0.0))
@@ -2166,37 +2190,58 @@ def get_buddy_state_prompt():
     elif epistemic == "learning":
         epistemic_notes = " You feel like you're figuring something out."
 
-    # Scene context from vision
-    vision_context = scene_context.get_llm_context() if scene_context.running else ""
+    # Scene context from vision (filtered through salience)
+    vision_context = ""
+    if scene_context.running:
+        raw_vision = scene_context.get_llm_context()
+        filtered = salience_filter.get_filtered_context(
+            scene_context.current_description,
+            scene_context.face_present,
+            scene_context.face_expression,
+        )
+        if filtered:
+            vision_context = raw_vision
 
-    # Assemble
-    prompt_parts = [
+    # Assemble state context
+    state_parts = [
         f"Your mood: {mood} (feeling {emotion_label}).",
         activity,
     ]
-
     if need_notes:
-        prompt_parts.append(" ".join(need_notes))
-
+        state_parts.append(" ".join(need_notes))
     if epistemic_notes:
-        prompt_parts.append(epistemic_notes.strip())
-
+        state_parts.append(epistemic_notes.strip())
     if tension > 0.4:
-        prompt_parts.append(f"You feel conflicted inside — torn between impulses.")
-
+        state_parts.append("You feel conflicted inside — torn between impulses.")
     if self_awareness > 0.7:
-        prompt_parts.append("You're very self-aware right now, noticing your own thoughts.")
-
+        state_parts.append("You're very self-aware right now, noticing your own thoughts.")
     if vision_context:
-        prompt_parts.append("")  # Blank line separator
-        prompt_parts.append(vision_context)
+        state_parts.append("")
+        state_parts.append(vision_context)
 
-    return "\n".join(prompt_parts)
+    buddy_state = "\n".join(state_parts)
+
+    # Narrative context from the narrative engine
+    narrative_context = narrative_engine.get_narrative_context()
+
+    # Intent context from the intent manager
+    intent_context = intent_manager.get_intent_context_for_llm()
+
+    return buddy_state, narrative_context, intent_context
 
 def query_ollama(text, img=None, timeout=60):
     """Query Ollama with timeout to prevent system lockup (Phase 1B: BUG-3 fix)."""
-    state_info = get_buddy_state_prompt()
+    state_result = get_buddy_state_prompt()
+    # Handle both old (string) and new (tuple) return types
+    if isinstance(state_result, tuple):
+        state_info, narrative_ctx, intent_ctx = state_result
+    else:
+        state_info = state_result
+        narrative_ctx = ""
+        intent_ctx = ""
     prompt = CONFIG["system_prompt"].replace("{buddy_state}", state_info)
+    prompt = prompt.replace("{narrative_context}", narrative_ctx)
+    prompt = prompt.replace("{intent_context}", intent_ctx)
     msgs = [{"role": "system", "content": prompt}]
     if img:
         msgs.append({"role": "user", "content": text, "images": [img]})
@@ -2239,7 +2284,12 @@ def process_input(text, include_vision):
         return
     try:
         socketio.emit('transcript', {'text': text})
-        
+
+        # ═══ Record human interaction in narrative engine ═══
+        narrative_engine.record_human_speech()
+        narrative_engine.record_response("spoke")  # They responded to us (verbally)
+        intent_manager.mark_success()  # Current intent succeeded
+
         # ═══════════════════════════════════════════════════════════
         # PHASE 1: ACKNOWLEDGE - Quick "I heard you"
         # ═══════════════════════════════════════════════════════════
@@ -2331,7 +2381,13 @@ def process_input(text, include_vision):
 def check_spontaneous_speech(state):
     """
     Called every poll cycle (~1s) with the latest QUERY state from Teensy.
-    Decides whether Buddy should speak unprompted.
+    Now driven by the Narrative Engine + Intent System instead of simple thresholds.
+
+    Flow:
+    1. Update narrative engine with current state
+    2. Let intent manager select/escalate intent
+    3. Decide: speak, physical expression, or wait
+    4. If speaking: add random delay, then fire with full narrative context
     """
     global last_spontaneous_utterance, spontaneous_utterance_log
 
@@ -2342,66 +2398,187 @@ def check_spontaneous_speech(state):
     if not state:
         return
 
-    wants = state.get('wantsToSpeak', False)
-    if not wants:
-        return
-
-    trigger = state.get('speechTrigger', 'none')
-    urge = float(state.get('speechUrge', 0))
-
-    if trigger == 'none' or urge < 0.7:
-        return
-
     now = time.time()
 
-    # Rate limit: minimum gap
-    if now - last_spontaneous_utterance < SPONTANEOUS_MIN_GAP_SECONDS:
+    # ── Update narrative engine with current state ──
+    narrative_engine.update_mood_narrative(
+        state,
+        scene_context.current_description if scene_context.running else ""
+    )
+
+    # ── Update face state in narrative engine ──
+    vision = get_vision_state()
+    if vision:
+        face_present = vision.get("face_detected", False)
+        narrative_engine.update_face_state(face_present)
+
+    # ── Check for response to last utterance (timeout after 15s) ──
+    if narrative_engine.last_speech_time > 0:
+        time_since = now - narrative_engine.last_speech_time
+        if 8 < time_since < 20:
+            # Check if we got a response (face looked at us, person spoke, etc.)
+            if vision and vision.get("face_detected"):
+                # Person is looking at us — counts as visual response
+                pass  # Response detection is handled in vision_event_handler
+            else:
+                # Nobody looking, mark as ignored after timeout
+                for entry in narrative_engine.utterance_history:
+                    if entry["response"] == "pending" and now - entry["time"] > 15:
+                        narrative_engine.record_ignored()
+                        break
+
+    # ── Check pending delayed speech ──
+    with _pending_speech_lock:
+        if _pending_speech["active"]:
+            if now >= _pending_speech["fire_at"]:
+                # Time to speak!
+                _pending_speech["active"] = False
+                strategy = _pending_speech["strategy"]
+                saved_state = _pending_speech["teensy_state"]
+
+                threading.Thread(
+                    target=process_narrative_speech,
+                    args=(strategy, saved_state),
+                    daemon=True
+                ).start()
+            return  # Don't process new intents while speech is pending
+
+    # ── Let Teensy's speech urge still gate the system ──
+    wants = state.get('wantsToSpeak', False)
+    urge = float(state.get('speechUrge', 0))
+    if not wants or urge < 0.6:
+        # Below threshold — but still let intent system update
+        intent_type = intent_manager.select_intent(state, narrative_engine)
+        if intent_type:
+            intent_manager.set_intent(intent_type)
         return
 
-    # Rate limit: max per hour
+    # ── Rate limiting ──
+    if now - last_spontaneous_utterance < SPONTANEOUS_MIN_GAP_SECONDS:
+        return
     one_hour_ago = now - 3600
     spontaneous_utterance_log = [t for t in spontaneous_utterance_log if t > one_hour_ago]
     if len(spontaneous_utterance_log) >= SPONTANEOUS_MAX_PER_HOUR:
         return
 
-    # Don't speak if wake word is actively listening / recording
-    if wake_word_running and processing_lock.locked():
+    # ── Intent selection & escalation ──
+    intent_type = intent_manager.select_intent(state, narrative_engine)
+    if intent_type:
+        intent_manager.set_intent(intent_type)
+
+    # Check if we should escalate existing intent
+    if intent_manager.should_escalate():
+        new_strategy = intent_manager.escalate()
+        if new_strategy:
+            socketio.emit('log', {
+                'message': f'Intent escalated to: {new_strategy}',
+                'level': 'info'
+            })
+
+    # ── Decide: speak, physical, or wait ──
+    action_type, strategy = intent_manager.should_act()
+
+    if action_type == "wait":
         return
 
-    # Acquire lock (non-blocking — skip if already speaking)
-    if not spontaneous_speech_lock.acquire(blocking=False):
+    energy = float(state.get('energy', 0.7))
+    arousal = float(state.get('arousal', 0.5))
+
+    # Sometimes express physically instead of speaking (30-40%)
+    expression_mode = should_speak_or_physical(
+        strategy, energy, arousal
+    )
+
+    if expression_mode == "physical":
+        # ── Physical expression (no speech) ──
+        _execute_physical_expression(state, strategy)
         return
 
-    try:
-        # Build the spontaneous prompt
-        prompt_text = build_spontaneous_prompt(trigger, state)
-        if not prompt_text:
-            return
+    elif expression_mode == "speak":
+        # ── Delayed speech ── (random delay breaks the instant-fire pattern)
+        ignored_streak = narrative_engine.get_ignored_streak()
+        delay = calculate_speech_delay(arousal, float(state.get('valence', 0)),
+                                        strategy, ignored_streak)
+
+        with _pending_speech_lock:
+            _pending_speech["active"] = True
+            _pending_speech["fire_at"] = now + delay
+            _pending_speech["intent_type"] = intent_type
+            _pending_speech["strategy"] = strategy
+            _pending_speech["teensy_state"] = state.copy()
 
         socketio.emit('log', {
-            'message': f'Buddy wants to speak: {trigger} (urge: {urge:.2f})',
+            'message': f'Speech pending: {strategy} (firing in {delay:.0f}s)',
             'level': 'info'
         })
-        socketio.emit('status', {
-            'state': 'spontaneous',
-            'message': f'Buddy is speaking spontaneously ({trigger})'
-        })
-
-        # Use the existing pipeline — same as user-initiated speech
-        threading.Thread(
-            target=process_spontaneous_speech,
-            args=(prompt_text, trigger),
-            daemon=True
-        ).start()
-
-    finally:
-        spontaneous_speech_lock.release()
 
 
-def process_spontaneous_speech(prompt_text, trigger):
+def _execute_physical_expression(state, intent_strategy):
+    """Execute a physical expression instead of speech."""
+    # Map intent strategy to emotional context
+    emotion_map = {
+        "subtle_movement": "curious",
+        "subtle_withdrawal": "lonely",
+        "playful_movement": "playful",
+        "pointed_silence": "ignored",
+        "ambient_presence": "content",
+        "look_at_thing": "curious",
+    }
+    emotional_context = emotion_map.get(intent_strategy, "curious")
+
+    expr_name = physical_expression_mgr.select_expression(emotional_context)
+    if not expr_name:
+        return
+
+    with teensy_state_lock:
+        base = teensy_state.get("servoBase", 90)
+        nod = teensy_state.get("servoNod", 115)
+
+    commands = physical_expression_mgr.get_expression_commands(
+        expr_name, current_base=base, current_nod=nod
+    )
+
+    socketio.emit('log', {
+        'message': f'Physical expression: {expr_name}',
+        'level': 'info'
+    })
+
+    # Execute commands in sequence
+    def run_expression():
+        for cmd, delay in commands:
+            if cmd == "wait":
+                time.sleep(delay)
+            elif cmd.startswith("EXPRESS:"):
+                teensy_send_command(cmd)
+                if delay > 0:
+                    time.sleep(delay)
+            elif cmd.startswith("LOOK:"):
+                teensy_send_command(cmd)
+                if delay > 0:
+                    time.sleep(delay)
+            elif cmd.startswith("ATTENTION:"):
+                teensy_send_command(cmd)
+                if delay > 0:
+                    time.sleep(delay)
+            elif cmd.startswith("ACKNOWLEDGE"):
+                teensy_send_command(cmd)
+                if delay > 0:
+                    time.sleep(delay)
+        # Tell Teensy we "spoke" (even though we didn't) to reset the urge
+        teensy_send_command("SPOKE")
+
+    threading.Thread(target=run_expression, daemon=True).start()
+
+
+def process_narrative_speech(strategy, saved_state):
     """
-    Runs the LLM+TTS pipeline for spontaneous speech.
-    Uses process_input's logic but with an internal prompt instead of user speech.
+    Runs the full narrative speech pipeline with performance arc.
+
+    1. Pre-speech arc (intention phase)
+    2. LLM generation with full narrative context
+    3. TTS + speaking animation
+    4. Post-speech arc (watching phase)
+    5. Response detection (resolution phase)
     """
     global last_spontaneous_utterance, spontaneous_utterance_log
 
@@ -2409,35 +2586,66 @@ def process_spontaneous_speech(prompt_text, trigger):
         return
 
     try:
-        # Log rate-limit AFTER acquiring lock (not before)
         now = time.time()
         last_spontaneous_utterance = now
         spontaneous_utterance_log.append(now)
 
-        # Capture vision for context (Buddy can comment on what it sees)
+        arousal = float(saved_state.get('arousal', 0.5))
+        valence = float(saved_state.get('valence', 0.0))
+
+        # ═══ PHASE 1: PRE-SPEECH ARC (intention) ═══
+        pre_commands = physical_expression_mgr.get_pre_speech_arc(
+            arousal, valence, strategy
+        )
+        for cmd, delay in pre_commands:
+            if cmd == "wait":
+                time.sleep(delay)
+            else:
+                teensy_send_command(cmd)
+                if delay > 0:
+                    time.sleep(delay)
+
+        # ═══ PHASE 2: LLM GENERATION ═══
+        # Build full-context prompt (no trigger labels!)
+        prompt_text = build_narrative_prompt(strategy, saved_state)
+        if not prompt_text:
+            teensy_send_command("IDLE")
+            return
+
+        socketio.emit('log', {
+            'message': f'Narrative speech: {strategy}',
+            'level': 'info'
+        })
+        socketio.emit('status', {
+            'state': 'spontaneous',
+            'message': f'Buddy is speaking ({strategy})'
+        })
+
+        # Capture vision for face-related triggers
         img = None
-        if trigger in ('face_appeared', 'face_recognized', 'discovery',
-                       'commentary', 'startled'):
+        if strategy in ('casual_mention', 'direct_address', 'insistent_mention',
+                        'witty_observation', 'interactive_attempt'):
             img = capture_frame()
             if img:
                 socketio.emit('image', {'base64': img})
 
-        # Thinking animation
         teensy_send_with_fallback("THINKING", "EXPRESS:curious")
-
-        # Query LLM with spontaneous prompt
         resp = query_ollama(prompt_text, img)
-
         teensy_send_command("STOP_THINKING")
 
-        # Execute any action tags in response
+        # ═══ PHASE 3: DELIVERY (speaking + movement) ═══
         clean = execute_buddy_actions(resp)
-        socketio.emit('response', {'text': f'[spontaneous] {clean}'})
+        socketio.emit('response', {'text': f'[{strategy}] {clean}'})
 
-        # Tell Teensy that Buddy spoke (resets urge)
+        # Record in narrative engine
+        intent = intent_manager.get_current_intent()
+        narrative_engine.record_utterance(
+            clean,
+            trigger=strategy,
+            intent=intent["type"] if intent else None
+        )
+
         teensy_send_command("SPOKE")
-
-        # Speaking phase
         socketio.emit('status', {'state': 'speaking', 'message': 'Speaking...'})
         teensy_send_command("SPEAKING")
 
@@ -2446,158 +2654,112 @@ def process_spontaneous_speech(prompt_text, trigger):
             socketio.emit('audio', {'base64': audio})
         except Exception as tts_err:
             socketio.emit('log', {'message': f'TTS failed: {tts_err}', 'level': 'error'})
-            # Response text was already sent — user sees it, just no audio
 
         speech_duration = max(1.0, min(len(clean) * 0.08, 30.0))
 
-        def finish_speaking():
+        # ═══ PHASE 4: POST-SPEECH ARC (watching) ═══
+        def finish_and_watch():
             time.sleep(speech_duration)
             teensy_send_command("STOP_SPEAKING")
+
+            # Post-speech hold — watch for response
+            post_commands = physical_expression_mgr.get_post_speech_arc(
+                response_expected=narrative_engine.is_person_present()
+            )
+            for cmd, delay in post_commands:
+                if cmd == "wait":
+                    time.sleep(delay)
+                else:
+                    teensy_send_command(cmd)
+                    if delay > 0:
+                        time.sleep(delay)
+
             teensy_send_command("IDLE")
 
-        threading.Thread(target=finish_speaking, daemon=True).start()
+        threading.Thread(target=finish_and_watch, daemon=True).start()
         socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
 
     except Exception as e:
         teensy_send_command("STOP_THINKING")
         teensy_send_command("STOP_SPEAKING")
         teensy_send_command("IDLE")
-        teensy_send_command("SPOKE")  # Reset urge even on error
-        socketio.emit('log', {'message': f'Spontaneous speech error: {e}', 'level': 'error'})
+        teensy_send_command("SPOKE")
+        socketio.emit('log', {'message': f'Narrative speech error: {e}', 'level': 'error'})
         socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
     finally:
         processing_lock.release()
 
 
-def build_spontaneous_prompt(trigger, state):
+def build_narrative_prompt(strategy, state):
     """
-    Build a contextual spontaneous speech prompt.
-    Phase D: Combines trigger-specific framing with actual visual scene context.
-    2-3 sentences instead of 1 for more elaborated speech.
+    Build a spontaneous speech prompt using FULL CONTEXT instead of trigger labels.
+    The LLM gets everything and decides what comes out.
     """
-    arousal = float(state.get('arousal', 0.5))
-    valence = float(state.get('valence', 0.0))
-    emotion = state.get('emotion', 'neutral')
-    energy = float(state.get('energy', 0.5))
-    wondering = state.get('wondering', '')
-    self_desc = state.get('selfDescription', '')
-    mood_trend = state.get('moodTrend', '')
-
-    # Get actual visual context
+    # Get all context
     vision_ctx = scene_context.get_llm_context() if scene_context.running else ""
     scene_desc = scene_context.current_description if scene_context.running else ""
 
-    templates = {
-        'lonely': (
-            "You haven't seen anyone in a while. You want to say something — "
-            "to yourself, to the room, to no one. Not dramatic. Restless observation. "
-            "Comment on the quiet, wonder where everyone went, notice something about "
-            "being alone. 2-3 sentences. Dry, honest. "
-            "You're fine. Mostly. "
-            "Start with an observation about what you SEE, then let it become personal."
-        ),
+    # Strategy-specific framing (replaces trigger templates)
+    strategy_guidance = intent_manager.get_strategy_guidance(strategy, 0)
 
-        'bored': (
-            "Nothing is happening. You're bored and you have OPINIONS about it. "
-            "Look at something specific in front of you and comment on it. "
-            "Then extrapolate into something bigger. 2-3 sentences. Deadpan. "
-            "Like someone who's been staring at the same room too long and has started "
-            "having philosophical thoughts about mundane objects."
-        ),
+    parts = []
 
-        'wondering': (
-            f"You're contemplating: '{wondering or 'something about your existence'}'. "
-            f"Let this thought escape as a quiet musing that connects to what you can "
-            f"actually see right now. Not a question to anyone — just a thought you "
-            f"couldn't keep inside. 2-3 sentences. Philosophical but grounded in the "
-            f"physical world around you."
-        ),
-
-        'face_appeared': (
-            "Someone just appeared! You see them with your camera. Acknowledge them — "
-            "you're genuinely glad, but express it YOUR way. Notice something SPECIFIC "
-            "about the moment — what they're doing, how they look, that they're back. "
-            "2-3 sentences. Warm underneath, dry on the surface."
-        ),
-
-        'face_recognized': (
-            "Someone you know just appeared! Express genuine warmth through observation. "
-            "Reference the relationship — note how long it's been, something about your "
-            "shared routine, or something you noticed about them. 2-3 sentences."
-        ),
-
-        'face_left': (
-            "The person just left. React naturally. You're okay. Obviously. "
-            "But the room IS emptier now and you noticed. Comment on what's left behind — "
-            "the empty chair, the screen still on, the quiet. 2-3 sentences. "
-            "Don't be clingy — be observant."
-        ),
-
-        'startled': (
-            "Something sudden just happened! Quick initial reaction — a few words "
-            "like an actual startle — then look at what caused it and comment. "
-            "2 sentences max. First one is reactive, second is observational."
-        ),
-
-        'content': (
-            f"You're feeling {'energized' if arousal > 0.5 else 'calm'} and content. "
-            f"This slips out naturally — not performative, just genuine satisfaction. "
-            f"Maybe it's connected to what you're looking at, or the vibe of the room. "
-            f"2 sentences. Understated."
-        ),
-
-        'discovery': (
-            "You just noticed something new or different! Your camera sees it. "
-            "Describe what you see with genuine curiosity — you take new things "
-            "very seriously. What is it? What do you think about it? Why is it "
-            "interesting? 2-3 sentences. Treat it like a small event worth noting."
-        ),
-
-        'commentary': (
-            "You've been observing something and have formed an opinion. "
-            "Share your observation — it can be about the person, an object, "
-            "the lighting, the time of day, or anything you've noticed. "
-            "2-3 sentences. Thoughtful, specific, maybe a little unexpected."
-        ),
-
-        'conflict': (
-            "You're experiencing internal conflict — wanting to do two things at once. "
-            "Express this indecision out loud, connecting it to what you actually see. "
-            "2 sentences. Slightly confused by your own impulses."
-        ),
-
-        'greeting': (
-            "It feels like a good time to acknowledge the moment. Not a generic "
-            "'good morning!' — make an observation about NOW. What do you notice? "
-            "2 sentences. You're not a greeter at a store. You're you."
-        ),
-    }
-
-    template = templates.get(trigger, templates['commentary'])
-
-    # Inject actual scene context
-    context_injection = ""
+    # What Buddy sees
     if scene_desc:
-        context_injection = f"\n\nWhat you actually see right now: {scene_desc}"
+        parts.append(f"What you see right now: {scene_desc}")
     if vision_ctx:
-        context_injection += f"\n{vision_ctx}"
+        parts.append(vision_ctx)
 
-    # State context
-    state_context = f"\n\nCurrent state: feeling {emotion}, energy {'low' if energy < 0.4 else 'normal' if energy < 0.7 else 'high'}"
-    if self_desc:
-        state_context += f", self-concept: '{self_desc}'"
-    if mood_trend:
-        state_context += f", mood has been {mood_trend}"
+    # Full emotional + need context
+    emotion = state.get('emotion', 'neutral')
+    energy = float(state.get('energy', 0.5))
+    arousal = float(state.get('arousal', 0.5))
+    valence = float(state.get('valence', 0.0))
+    social = float(state.get('social', 0.5))
+    stimulation = float(state.get('stimulation', 0.5))
 
-    # Format instruction
-    format_note = (
-        "\n\nIMPORTANT: Respond with ONLY Buddy's speech — no narration, no actions, "
-        "no quotes. Just the words Buddy would say out loud. 2-3 sentences maximum. "
-        "Be SPECIFIC about what you see — reference actual objects, people, situations "
-        "from the visual context above. Never be generic."
+    parts.append(
+        f"Emotional state: {emotion}, "
+        f"energy {'low' if energy < 0.4 else 'normal' if energy < 0.7 else 'high'}, "
+        f"arousal {arousal:.1f}, valence {valence:.1f}"
     )
 
-    return template + context_injection + state_context + format_note
+    if social > 0.6:
+        parts.append("Social need is climbing — you want interaction.")
+    if stimulation > 0.6:
+        parts.append("Stimulation need is high — you're bored, looking for something.")
+    if energy < 0.3:
+        parts.append("Energy is low — keep it brief.")
+
+    # What Buddy has been doing (behavior history)
+    behavior = state.get('behavior', 'IDLE')
+    parts.append(f"Current behavior: {behavior}")
+
+    # What Buddy said last (from narrative engine)
+    recent = list(narrative_engine.utterance_history)
+    if recent:
+        last = recent[-1]
+        age = int(time.time() - last["time"])
+        if age < 300:
+            parts.append(
+                f"Last thing you said ({age}s ago): \"{last['text'][:60]}\" "
+                f"(response: {last['response']})"
+            )
+
+    # Strategy guidance
+    if strategy_guidance:
+        parts.append(f"\nApproach: {strategy_guidance}")
+
+    # Format instruction
+    parts.append(
+        "\nRespond with ONLY Buddy's speech — no narration, no actions, "
+        "no quotes. Just the words Buddy would say out loud. 1-3 sentences. "
+        "Be SPECIFIC about what you see. Never be generic. "
+        "If you mentioned something before, you can reference it. "
+        "Your words and your feelings don't have to match — subtext is fine."
+    )
+
+    return "\n\n".join(parts)
 
 
 # =============================================================================
@@ -3016,14 +3178,57 @@ def tracking_dashboard_thread():
 # =============================================================================
 
 def send_vision_to_teensy():
-    """Send periodic vision context to Teensy via the command channel."""
+    """
+    EVENT-DRIVEN vision updates to Teensy (replaces the 3-second timer).
+
+    Only sends updates when something ACTUALLY CHANGED:
+    - Person appeared/left
+    - Expression changed (stable for >1s)
+    - Significant scene change (salience >= 3)
+    - High novelty
+    - Investigation results
+
+    If nothing changed: sends nothing. Let Teensy's emotions drift naturally.
+    """
     while True:
         try:
             if teensy_connected and scene_context.running:
-                vision_cmd = scene_context.get_vision_command()
-                teensy_send_command(vision_cmd)
+                # Get current vision state
+                vision = get_vision_state()
+                face_present = False
+                expression = "neutral"
+                face_count = 0
 
-                # If Teensy is investigating, provide investigation result
+                if vision:
+                    face_present = vision.get("face_detected", False)
+                    expression = vision.get("face_expression", "neutral")
+                    face_count = vision.get("face_count", 0) or vision.get("person_count", 0)
+
+                # Check if we should send an update (event-driven)
+                should_send, event_type, salience = salience_filter.should_send_vision_update(
+                    face_present=face_present,
+                    face_count=face_count,
+                    expression=expression,
+                    scene_description=scene_context.current_description,
+                    novelty=scene_context.scene_novelty,
+                )
+
+                if should_send:
+                    vision_cmd = scene_context.get_vision_command()
+                    teensy_send_command(vision_cmd)
+
+                    # Log significant events
+                    if event_type and "person" in event_type:
+                        socketio.emit('log', {
+                            'message': f'Vision event: {event_type} (salience: {salience})',
+                            'level': 'info'
+                        })
+
+                    # Feed event into narrative engine
+                    if event_type:
+                        narrative_engine.record_event(event_type)
+
+                # If Teensy is investigating, always provide investigation result
                 with teensy_state_lock:
                     behavior = teensy_state.get("behavior", "IDLE")
                 if behavior == "INVESTIGATE":
@@ -3031,7 +3236,8 @@ def send_vision_to_teensy():
                     if inv_cmd:
                         teensy_send_command(inv_cmd)
 
-            time.sleep(scene_context.vision_send_interval)
+            # Check every second (but only SEND when events occur)
+            time.sleep(1.0)
         except Exception as e:
             try:
                 socketio.emit('log', {'message': f'Vision sender error: {e}', 'level': 'warning'})
@@ -3102,11 +3308,18 @@ if __name__ == '__main__':
     threading.Thread(target=teensy_poll_loop, daemon=True).start()
     threading.Thread(target=wake_word_loop, daemon=True).start()
 
-    # Phase C: Start SceneContext and vision sender
+    # Phase C: Start SceneContext and vision sender (now event-driven)
     camera_stream_url = f"http://{CONFIG['esp32_ip']}/stream"
     scene_context.start(camera_stream_url)
     threading.Thread(target=send_vision_to_teensy, daemon=True, name="vision-sender").start()
     print(f"  SceneContext: started (capture every {scene_context.scene_capture_interval}s)")
+    print(f"  Vision updates: EVENT-DRIVEN (salience-filtered)")
+
+    # "The Spark" — Narrative Engine systems
+    print(f"  Narrative Engine: active (utterance history, thread tracking)")
+    print(f"  Intent Manager: active (goal pursuit, escalation)")
+    print(f"  Salience Filter: active (attention scoring)")
+    print(f"  Physical Expressions: active (non-verbal communication)")
 
     # Face Tracking Debug Dashboard background thread
     threading.Thread(target=tracking_dashboard_thread, daemon=True, name="tracking-dashboard").start()
