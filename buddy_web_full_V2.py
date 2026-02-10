@@ -2020,8 +2020,14 @@ if __name__ == '__main__':
 
     # Phase 1H: OPT-3 — Validate Ollama model availability
     try:
-        models = ollama.list()
-        names = [m.get('name', '') for m in models.get('models', [])]
+        result = ollama.list()
+        # Handle both old dict API and new object API (ollama >= 0.4)
+        model_list = result.get('models', []) if isinstance(result, dict) else getattr(result, 'models', [])
+        names = []
+        for m in model_list:
+            name = m.get('name', '') if isinstance(m, dict) else getattr(m, 'model', getattr(m, 'name', ''))
+            if name:
+                names.append(name)
         if not any(CONFIG['ollama_model'] in n for n in names):
             print(f"  WARNING: Model '{CONFIG['ollama_model']}' not found!")
             print(f"  Available: {', '.join(names[:5])}")
