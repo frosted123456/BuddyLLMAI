@@ -267,8 +267,11 @@ class NarrativeEngine:
 
     def update_mood_narrative(self, teensy_state, scene_context_summary=""):
         """
-        Build a human-readable mood narrative from all available context.
+        Build a structured mood summary from all available context.
         Called periodically (every ~5 seconds) or after significant events.
+
+        Uses factual/data-like descriptions — NOT prose the LLM might echo.
+        The LLM should create its own inner voice from these facts.
         """
         with self.lock:
             now = time.time()
@@ -277,7 +280,7 @@ class NarrativeEngine:
 
             parts = []
 
-            # Emotional foundation
+            # Emotional state as data
             emotion = teensy_state.get("emotion", "NEUTRAL")
             arousal = float(teensy_state.get("arousal", 0.5))
             valence = float(teensy_state.get("valence", 0.0))
@@ -285,68 +288,65 @@ class NarrativeEngine:
             energy = float(teensy_state.get("energy", 0.7))
             stimulation = float(teensy_state.get("stimulation", 0.5))
 
-            # Why does Buddy feel this way?
+            # Mood cause — factual, not narrative
             if valence > 0.3:
-                if hr["pattern"] == "engaging":
-                    parts.append("Feeling good — having a real conversation.")
-                elif hr["face_present"]:
-                    parts.append("Someone is here, which helps.")
-                else:
-                    parts.append("In a decent mood despite being alone.")
+                cause = "conversation" if hr["pattern"] == "engaging" else (
+                    "company" if hr["face_present"] else "internal"
+                )
+                parts.append(f"Mood: positive (cause: {cause})")
             elif valence < -0.2:
                 if hr["pattern"] == "mostly_ignoring":
-                    parts.append("Feeling a bit deflated. Tried talking, got nothing back.")
+                    parts.append("Mood: deflated (cause: being ignored)")
                 elif hr["pattern"] == "absent":
                     gone = int(now - hr.get("face_absent_since", now))
-                    parts.append(f"Been alone for about {gone // 60} minutes. It shows.")
+                    parts.append(f"Mood: low (cause: alone {gone // 60}min)")
                 elif social > 0.6:
-                    parts.append("Social battery is draining. Could use some interaction.")
+                    parts.append("Mood: low (cause: social need unmet)")
                 else:
-                    parts.append("Mood is low. Not entirely sure why.")
+                    parts.append("Mood: low (cause: unclear)")
             else:
                 if arousal > 0.6:
-                    parts.append("Alert and watching. Something might happen.")
+                    parts.append("Mood: neutral-alert, watchful")
                 elif energy < 0.3:
-                    parts.append("Running low on energy. Getting quieter.")
+                    parts.append("Mood: neutral-low, energy depleted")
                 else:
-                    parts.append("Neutral. Existing. Taking it in.")
+                    parts.append("Mood: neutral")
 
-            # Social situation
+            # Social facts
             if hr["ignored_streak"] >= 3:
                 parts.append(
-                    f"Spoke {hr['ignored_streak']} times without getting a response. "
-                    "Starting to wonder if anyone's listening."
+                    f"Ignored {hr['ignored_streak']}x consecutively, zero responses"
                 )
             elif hr["ignored_streak"] >= 1:
-                parts.append("Last thing I said didn't land. Noted.")
+                parts.append("Last utterance: no response")
 
             if hr["face_present"]:
                 since = int(now - hr.get("face_present_since", now))
                 if since > 300:
-                    parts.append(f"Person has been here about {since // 60} minutes.")
+                    parts.append(f"Person present: {since // 60}min")
                 elif since > 30:
-                    parts.append(f"Person arrived about {since} seconds ago.")
+                    parts.append(f"Person present: {since}s")
             elif hr.get("face_absent_since"):
                 gone = int(now - hr["face_absent_since"])
                 if gone > 600:
-                    parts.append(f"Nobody for {gone // 60} minutes now.")
+                    parts.append(f"Alone: {gone // 60}min")
 
-            # Unresolved threads
+            # Unresolved threads — factual
             unresolved = [t for t in self.open_threads
                          if not t["acknowledged"] and
                          t["times_mentioned"] >= 2 and
                          now - t["last_mentioned"] < 600]
             if unresolved:
                 topics = ", ".join(t["topic"] for t in unresolved[:2])
-                parts.append(f"Keep coming back to: {topics}. Nobody's biting.")
+                parts.append(f"Unacknowledged topics: {topics}")
 
-            # Stimulation
+            # Need levels as data
             if stimulation > 0.7:
-                parts.append("Bored. Looking for something to notice.")
+                parts.append("Stimulation need: high (understimulated)")
             elif stimulation > 0.5:
-                parts.append("Could use something interesting happening.")
+                parts.append("Stimulation need: moderate")
 
-            self.mood_narrative = " ".join(parts)
+            self.mood_narrative = " | ".join(parts)
 
     # ═══════════════════════════════════════════════════════
     # EVENT LOGGING
