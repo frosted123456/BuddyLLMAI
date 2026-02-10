@@ -2231,14 +2231,7 @@ def get_buddy_state_prompt():
 
 def query_ollama(text, img=None, timeout=60):
     """Query Ollama with timeout to prevent system lockup (Phase 1B: BUG-3 fix)."""
-    state_result = get_buddy_state_prompt()
-    # Handle both old (string) and new (tuple) return types
-    if isinstance(state_result, tuple):
-        state_info, narrative_ctx, intent_ctx = state_result
-    else:
-        state_info = state_result
-        narrative_ctx = ""
-        intent_ctx = ""
+    state_info, narrative_ctx, intent_ctx = get_buddy_state_prompt()
     prompt = CONFIG["system_prompt"].replace("{buddy_state}", state_info)
     prompt = prompt.replace("{narrative_context}", narrative_ctx)
     prompt = prompt.replace("{intent_context}", intent_ctx)
@@ -2286,9 +2279,18 @@ def process_input(text, include_vision):
         socketio.emit('transcript', {'text': text})
 
         # ═══ Record human interaction in narrative engine ═══
+        # Check for "Oh NOW you're interested" before clearing the streak
+        pre_streak = narrative_engine.get_ignored_streak()
         narrative_engine.record_human_speech()
         narrative_engine.record_response("spoke")  # They responded to us (verbally)
         intent_manager.mark_success()  # Current intent succeeded
+
+        # If they spoke after ignoring us, note it for narrative color
+        if pre_streak >= 2:
+            narrative_engine.record_event(
+                f"broke_ignore_streak:{pre_streak}",
+                buddy_reaction="sardonic_acknowledgment"
+            )
 
         # ═══════════════════════════════════════════════════════════
         # PHASE 1: ACKNOWLEDGE - Quick "I heard you"
@@ -2412,20 +2414,18 @@ def check_spontaneous_speech(state):
         face_present = vision.get("face_detected", False)
         narrative_engine.update_face_state(face_present)
 
-    # ── Check for response to last utterance (timeout after 15s) ──
-    if narrative_engine.last_speech_time > 0:
-        time_since = now - narrative_engine.last_speech_time
-        if 8 < time_since < 20:
-            # Check if we got a response (face looked at us, person spoke, etc.)
-            if vision and vision.get("face_detected"):
-                # Person is looking at us — counts as visual response
-                pass  # Response detection is handled in vision_event_handler
-            else:
-                # Nobody looking, mark as ignored after timeout
-                for entry in narrative_engine.utterance_history:
-                    if entry["response"] == "pending" and now - entry["time"] > 15:
-                        narrative_engine.record_ignored()
-                        break
+    # ── Stale utterance cleanup — mark old pending utterances as ignored ──
+    # Primary response detection happens in finish_and_watch() after speech.
+    # This catches edge cases where the post-speech detection thread didn't run
+    # (e.g., if speech was interrupted or process crashed).
+    with narrative_engine.lock:
+        for entry in narrative_engine.utterance_history:
+            if entry["response"] == "pending" and now - entry["time"] > 30:
+                entry["response"] = "ignored"
+                entry["response_type"] = "timeout"
+                narrative_engine.human_responsiveness["ignored_streak"] += 1
+                narrative_engine._recalculate_responsiveness()
+                break  # Only process one per cycle
 
     # ── Check pending delayed speech ──
     with _pending_speech_lock:
@@ -2474,6 +2474,35 @@ def check_spontaneous_speech(state):
                 'message': f'Intent escalated to: {new_strategy}',
                 'level': 'info'
             })
+            # Escalation immediately makes Buddy act on the new strategy
+            # (bypasses the normal should_act check which might return "wait")
+            energy = float(state.get('energy', 0.7))
+            arousal = float(state.get('arousal', 0.5))
+            ignored_streak = narrative_engine.get_ignored_streak()
+            expression_mode = should_speak_or_physical(
+                new_strategy, energy, arousal, ignored_streak
+            )
+            if expression_mode == "physical":
+                _execute_physical_expression(state, new_strategy)
+                return
+            elif expression_mode == "speak":
+                delay = calculate_speech_delay(
+                    arousal, float(state.get('valence', 0)),
+                    new_strategy, ignored_streak
+                )
+                # Escalation = more urgent → halve the delay
+                delay = max(3.0, delay * 0.5)
+                with _pending_speech_lock:
+                    _pending_speech["active"] = True
+                    _pending_speech["fire_at"] = now + delay
+                    _pending_speech["intent_type"] = intent_type
+                    _pending_speech["strategy"] = new_strategy
+                    _pending_speech["teensy_state"] = state.copy()
+                socketio.emit('log', {
+                    'message': f'Escalated speech pending: {new_strategy} (firing in {delay:.0f}s)',
+                    'level': 'info'
+                })
+                return
 
     # ── Decide: speak, physical, or wait ──
     action_type, strategy = intent_manager.should_act()
@@ -2485,8 +2514,10 @@ def check_spontaneous_speech(state):
     arousal = float(state.get('arousal', 0.5))
 
     # Sometimes express physically instead of speaking (30-40%)
+    # When ignored, sulking behavior kicks in — more physical, less speech
+    ignored_streak = narrative_engine.get_ignored_streak()
     expression_mode = should_speak_or_physical(
-        strategy, energy, arousal
+        strategy, energy, arousal, ignored_streak
     )
 
     if expression_mode == "physical":
@@ -2645,6 +2676,9 @@ def process_narrative_speech(strategy, saved_state):
             intent=intent["type"] if intent else None
         )
 
+        # Mark any objects Buddy mentioned in his speech
+        narrative_engine.mark_object_mentioned(clean)
+
         teensy_send_command("SPOKE")
         socketio.emit('status', {'state': 'speaking', 'message': 'Speaking...'})
         teensy_send_command("SPEAKING")
@@ -2657,16 +2691,99 @@ def process_narrative_speech(strategy, saved_state):
 
         speech_duration = max(1.0, min(len(clean) * 0.08, 30.0))
 
-        # ═══ PHASE 4: POST-SPEECH ARC (watching) ═══
+        # ═══ PHASE 4: POST-SPEECH ARC (watching) + RESPONSE DETECTION ═══
         def finish_and_watch():
             time.sleep(speech_duration)
             teensy_send_command("STOP_SPEAKING")
 
+            person_present = narrative_engine.is_person_present()
+
             # Post-speech hold — watch for response
             post_commands = physical_expression_mgr.get_post_speech_arc(
-                response_expected=narrative_engine.is_person_present()
+                response_expected=person_present
             )
             for cmd, delay in post_commands:
+                if cmd == "wait":
+                    time.sleep(delay)
+                else:
+                    teensy_send_command(cmd)
+                    if delay > 0:
+                        time.sleep(delay)
+
+            # ═══ PHASE 5: RESPONSE DETECTION ═══
+            # Poll vision for 12 seconds to see if the person reacted
+            response_detected = None
+            if person_present:
+                # Get baseline expression BEFORE we spoke
+                baseline_vision = get_vision_state()
+                baseline_expr = (baseline_vision or {}).get(
+                    "last_stable_expression", "neutral"
+                )
+
+                poll_end = time.time() + 12.0
+                while time.time() < poll_end:
+                    time.sleep(1.0)
+                    vision = get_vision_state()
+                    if not vision:
+                        continue
+
+                    # Check: did person look at us?
+                    if vision.get("face_detected"):
+                        expr = vision.get("expression", "neutral")
+                        expr_changed_at = vision.get("expression_changed_at", 0)
+
+                        # Expression changed since we spoke = reaction
+                        if expr_changed_at and expr_changed_at > now:
+                            if expr in ("happy", "smiling"):
+                                response_detected = "smiled"
+                            elif expr in ("surprised",):
+                                response_detected = "looked"
+                            elif expr != baseline_expr:
+                                response_detected = "looked"
+                            break
+
+                        # Face appeared after it was absent = they turned to look
+                        appeared_at = vision.get("face_appeared_at", 0)
+                        if appeared_at and appeared_at > now:
+                            response_detected = "looked"
+                            break
+                    else:
+                        # Person left during our speech
+                        left_at = vision.get("person_left_at", 0)
+                        if left_at and left_at > now:
+                            response_detected = "left"
+                            break
+
+            # ═══ PHASE 6: RESOLUTION ARC ═══
+            if response_detected:
+                # Check if this breaks an ignored streak → trigger sarcastic return
+                pre_response_streak = narrative_engine.get_ignored_streak()
+                narrative_engine.record_response(response_detected)
+                intent_manager.mark_success()
+
+                # "Oh NOW you're interested" — response after being ignored
+                if pre_response_streak >= 2:
+                    intent_manager.set_intent(
+                        "acknowledge_return",
+                        reason=f"Responded after ignoring {pre_response_streak} times"
+                    )
+
+                resolution_commands = physical_expression_mgr.get_resolution_arc(
+                    response_detected
+                )
+                socketio.emit('log', {
+                    'message': f'Response detected: {response_detected}'
+                              + (f' (broke {pre_response_streak}-ignore streak!)'
+                                 if pre_response_streak >= 2 else ''),
+                    'level': 'info'
+                })
+            else:
+                narrative_engine.record_ignored()
+                resolution_commands = physical_expression_mgr.get_resolution_arc(
+                    "ignored"
+                )
+
+            for cmd, delay in resolution_commands:
                 if cmd == "wait":
                     time.sleep(delay)
                 else:
@@ -2735,16 +2852,23 @@ def build_narrative_prompt(strategy, state):
     behavior = state.get('behavior', 'IDLE')
     parts.append(f"Current behavior: {behavior}")
 
-    # What Buddy said last (from narrative engine)
-    recent = list(narrative_engine.utterance_history)
-    if recent:
-        last = recent[-1]
-        age = int(time.time() - last["time"])
-        if age < 300:
-            parts.append(
-                f"Last thing you said ({age}s ago): \"{last['text'][:60]}\" "
-                f"(response: {last['response']})"
-            )
+    # Object awareness (what's on the desk, what appeared/disappeared)
+    # NOTE: Full utterance history, threads, and object memory are already in
+    # the system prompt via {narrative_context}. Here we only add immediate
+    # context that's specific to THIS moment's strategy.
+    obj_ctx = narrative_engine.get_object_context()
+    if obj_ctx:
+        parts.append(obj_ctx)
+
+    # Ignored streak context — important for tone calibration
+    ignored_streak = narrative_engine.get_ignored_streak()
+    if ignored_streak >= 3:
+        parts.append(
+            f"You've been ignored {ignored_streak} times in a row. "
+            "Adjust your approach accordingly — get quieter, not louder."
+        )
+    elif ignored_streak >= 1:
+        parts.append("Your last remark didn't get a response.")
 
     # Strategy guidance
     if strategy_guidance:
@@ -3227,6 +3351,14 @@ def send_vision_to_teensy():
                     # Feed event into narrative engine
                     if event_type:
                         narrative_engine.record_event(event_type)
+
+                # Update object memory from scene descriptions
+                if scene_context.current_description:
+                    obj_events = narrative_engine.update_object_memory(
+                        scene_context.current_description
+                    )
+                    for obj_event in obj_events:
+                        narrative_engine.record_event(obj_event, "noticed_object")
 
                 # If Teensy is investigating, always provide investigation result
                 with teensy_state_lock:

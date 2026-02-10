@@ -95,6 +95,15 @@ INTENT_TYPES = {
             "direct_statement",       # Level 2: Say what's actually bothering him
         ],
     },
+    "acknowledge_return": {
+        "description": "Person finally showed up or paid attention after ignoring Buddy",
+        "escalation_window": 30,
+        "max_level": 1,
+        "strategies": [
+            "sarcastic_greeting",     # Level 0: "Oh. You again." / "Oh NOW you're interested."
+            "grudging_engagement",    # Level 1: Engage but make it clear you noticed the absence
+        ],
+    },
 }
 
 # Strategies that use speech vs. physical expression only
@@ -104,7 +113,7 @@ SPEECH_STRATEGIES = {
     "understated_comment", "indirect_plea", "vulnerable_admission",
     "witty_observation", "interactive_attempt", "internal_musing",
     "philosophical_tangent", "low_key_comment", "dry_comment",
-    "direct_statement",
+    "direct_statement", "sarcastic_greeting", "grudging_engagement",
 }
 
 PHYSICAL_ONLY_STRATEGIES = {
@@ -321,6 +330,17 @@ class IntentManager:
                 "Bring it up again. You already mentioned this. "
                 "'About that thing I noticed earlier...' or 'Still thinking about that mug.'"
             ),
+            "sarcastic_greeting": (
+                "Person just appeared or paid attention after ignoring you. "
+                "Be sarcastic about it. 'Oh. You again.' or 'Oh NOW you're interested.' "
+                "or 'Nice of you to stop by.' Don't be mean — be dry. "
+                "Subtext: you noticed their absence and you want them to know."
+            ),
+            "grudging_engagement": (
+                "You're engaging now, but make it clear you noticed the absence. "
+                "'I had things to say earlier but the moment passed.' "
+                "Then slowly warm up. Don't hold the grudge too long."
+            ),
         }
         return guidance_map.get(strategy, "")
 
@@ -354,6 +374,11 @@ class IntentManager:
         pattern = narrative_engine.get_pattern()
 
         # Priority-based intent selection
+        # 0. Person appeared/returned AFTER being ignored → sarcastic acknowledgment
+        #    "Oh NOW you're interested." / "Oh. You again."
+        if person_present and ignored_streak >= 2 and pattern in ("present", "just_left"):
+            return "acknowledge_return"
+
         # 1. If person just appeared → greet / get attention
         if person_present and pattern in ("unknown", "present"):
             if social > 0.5:
@@ -395,12 +420,15 @@ class IntentManager:
         return None
 
 
-def should_speak_or_physical(intent_strategy, energy, arousal):
+def should_speak_or_physical(intent_strategy, energy, arousal, ignored_streak=0):
     """
     Given an intent strategy, decide if Buddy should speak or express physically.
 
     ~30-40% of the time when speech would happen, use physical expression instead.
     This breaks the "every urge = speech" pattern.
+
+    When ignored repeatedly, Buddy sulks — prefers physical expression over speech.
+    (Quieter, more withdrawn, less likely to try talking.)
 
     Returns: "speak" | "physical" | "silence"
     """
@@ -408,9 +436,15 @@ def should_speak_or_physical(intent_strategy, energy, arousal):
         return "physical"
 
     if intent_strategy in SPEECH_STRATEGIES:
-        # Lower energy → more likely to stay physical
+        # Base speech probability: ~65-85%
         speech_probability = 0.65 + (energy * 0.15) + (arousal * 0.1)
-        speech_probability = max(0.4, min(0.85, speech_probability))
+
+        # Sulking: each ignored utterance reduces speech probability by 12%
+        # After 3 ignores: probability drops by ~36% → mostly physical
+        sulk_penalty = ignored_streak * 0.12
+        speech_probability -= sulk_penalty
+
+        speech_probability = max(0.15, min(0.85, speech_probability))
 
         if random.random() < speech_probability:
             return "speak"
