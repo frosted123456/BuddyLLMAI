@@ -115,13 +115,14 @@ public:
     targetDominance += (personality.getRiskTolerance() - 0.5) * 0.3;
     targetDominance += (personality.getPersistence() - 0.5) * 0.2;
     
-    // === UPDATE WITH MOMENTUM ===
-    arousalVelocity = (targetArousal - arousal) * 0.3;
-    valenceVelocity = (targetValence - valence) * 0.3;
-    
-    arousal += arousalVelocity * dt * 5.0;  // Fast response
+    // === UPDATE WITH MOMENTUM — PHASE A: Smoother transitions ===
+    // Reduced from 0.3 to 0.15 for more deliberate emotional shifts
+    arousalVelocity = (targetArousal - arousal) * 0.15;
+    valenceVelocity = (targetValence - valence) * 0.15;
+
+    arousal += arousalVelocity * dt * 5.0;
     valence += valenceVelocity * dt * 5.0;
-    dominance += (targetDominance - dominance) * dt * 3.0;  // Slower
+    dominance += (targetDominance - dominance) * dt * 2.0;  // Was 3.0
     
     // Pull toward baseline mood (slow return to normal)
     valence += (baselineValence - valence) * 0.05 * dt;
@@ -163,6 +164,13 @@ public:
     // Small shifts — these are environmental influences, not events.
     valence = constrain(valence + valenceShift, -1.0f, 1.0f);
     arousal = constrain(arousal + arousalShift, 0.0f, 1.0f);
+  }
+
+  // 3-parameter nudge: arousal, valence, dominance (used by vision context)
+  void nudge(float arousalShift, float valenceShift, float dominanceShift) {
+    arousal = constrain(arousal + arousalShift, 0.0f, 1.0f);
+    valence = constrain(valence + valenceShift, -1.0f, 1.0f);
+    dominance = constrain(dominance + dominanceShift, 0.0f, 1.0f);
   }
 
   // ============================================

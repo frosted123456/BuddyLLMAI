@@ -120,6 +120,13 @@ private:
   float emotionSnapshot_valence;
   unsigned long behaviorStartTime;
 
+  // Phase B: Investigation hold state
+  bool isInvestigating;
+  unsigned long investigationStartTime;
+  bool investigationDescriptionReceived;
+  static constexpr unsigned long INVESTIGATION_TIMEOUT_MS = 8000;
+  static constexpr unsigned long INVESTIGATION_HOLD_MS = 3000;
+
   // Person tracking
   static const int MAX_PEOPLE = 10;
   PersonRecord people[MAX_PEOPLE];
@@ -170,6 +177,11 @@ public:
     animator = nullptr;
     servoController = nullptr;
     reflexController = nullptr;
+
+    // Phase B: Investigation hold
+    isInvestigating = false;
+    investigationStartTime = 0;
+    investigationDescriptionReceived = false;
 
     // Person tracking initialization
     currentPersonID = -1;
@@ -1291,19 +1303,63 @@ public:
   
   void executeIdle() {
     // ═══════════════════════════════════════════════════════════
-    // VERIFICATION: Confirm behavior is executing
+    // PHASE A: IDLE Sub-States — alive resting creature, not powered-off
     // ═══════════════════════════════════════════════════════════
-    static unsigned long lastIdleLog = 0;
-    if (millis() - lastIdleLog > 3000) {  // Log every 3 seconds max
-      Serial.println("[BEHAVIOR] IDLE: Resting in neutral position");
-      lastIdleLog = millis();
+    static unsigned long lastIdleAction = 0;
+    static int idlePhase = 0;
+    unsigned long now = millis();
+    unsigned long idleElapsed = now - lastIdleAction;
+
+    if (animator == nullptr || servoController == nullptr) {
+      needs.consumeEnergy(-0.02);
+      return;
     }
 
-    ServoAngles neutral = bodySchema.lookAt(0, 50, 20);
+    MovementStyleParams style = movementGenerator.generate(emotion, personality, needs);
 
-    if (animator != nullptr && servoController != nullptr) {
-      MovementStyleParams style = movementGenerator.generate(emotion, personality, needs);
-      servoController->smoothMoveTo(neutral.base, neutral.nod, neutral.tilt, style);
+    switch (idlePhase) {
+      case 0:  // Settled gaze — hold current position with micro breathing
+        if (idleElapsed > 8000) {
+          // Tiny breathing motion: subtle nod shift (1-2 degrees)
+          int curBase, curNod, curTilt;
+          servoController->getPosition(curBase, curNod, curTilt);
+          int breathNod = curNod + random(-2, 3);
+          breathNod = constrain(breathNod, 80, 150);
+          style.speed = 0.15;  // Very slow
+          style.smoothness = 0.8;
+          servoController->smoothMoveTo(curBase, breathNod, curTilt, style);
+          idlePhase = 1;
+          lastIdleAction = now;
+        }
+        break;
+
+      case 1:  // Subtle look — small glance to a nearby direction
+        if (idleElapsed > 12000) {
+          int curBase, curNod, curTilt;
+          servoController->getPosition(curBase, curNod, curTilt);
+          // Small random head movement (5-10 degrees from current)
+          int glanceBase = curBase + random(-10, 11);
+          int glanceNod = curNod + random(-5, 6);
+          glanceBase = constrain(glanceBase, 10, 170);
+          glanceNod = constrain(glanceNod, 80, 150);
+          style.speed = 0.2;
+          style.smoothness = 0.7;
+          servoController->smoothMoveTo(glanceBase, glanceNod, curTilt, style);
+          idlePhase = 2;
+          lastIdleAction = now;
+        }
+        break;
+
+      case 2:  // Return — drift back to neutral/forward
+        if (idleElapsed > 5000) {
+          ServoAngles neutral = bodySchema.lookAt(0, 50, 20);
+          style.speed = 0.15;
+          style.smoothness = 0.8;
+          servoController->smoothMoveTo(neutral.base, neutral.nod, neutral.tilt, style);
+          idlePhase = 0;
+          lastIdleAction = now;
+        }
+        break;
     }
 
     needs.consumeEnergy(-0.02);
@@ -1355,13 +1411,24 @@ public:
   
   void executeInvestigate() {
     // ═══════════════════════════════════════════════════════════
-    // VERIFICATION: Confirm behavior is executing
+    // PHASE B: Investigation hold state — lets Python capture + describe
     // ═══════════════════════════════════════════════════════════
-    static unsigned long lastInvestigateLog = 0;
-    if (millis() - lastInvestigateLog > 3000) {  // Log every 3 seconds max
-      Serial.println("[BEHAVIOR] INVESTIGATE: Examining point of interest");
-      lastInvestigateLog = millis();
+    unsigned long now = millis();
+
+    if (!isInvestigating) {
+      // Starting new investigation
+      isInvestigating = true;
+      investigationStartTime = now;
+      investigationDescriptionReceived = false;
+
+      static unsigned long lastInvestigateLog = 0;
+      if (now - lastInvestigateLog > 3000) {
+        Serial.println("[BEHAVIOR] INVESTIGATE: Examining point of interest (holding)");
+        lastInvestigateLog = now;
+      }
     }
+
+    unsigned long elapsed = now - investigationStartTime;
 
     // Enable reflexive face tracking (if investigating a face)
     if (reflexController != nullptr) {
@@ -1370,26 +1437,47 @@ public:
 
     int focusDir = attention.getFocusDirection();
     float distance = spatialMemory.getAverageDistance(focusDir);
-
     ServoAngles angles = bodySchema.lookAtDirection(focusDir, distance);
     bodySchema.setAttentionDirection(focusDir, distance, 0.8);
 
-    // ═══════════════════════════════════════════════════════════════════
-    // CRITICAL FIX: Check if reflex is handling movement
-    // ═══════════════════════════════════════════════════════════════════
     bool reflexIsHandlingMovement = (reflexController != nullptr &&
                                      reflexController->isActive());
 
-    if (!reflexIsHandlingMovement && animator != nullptr && servoController != nullptr) {
-      // Only move servos if reflex is NOT active
-      MovementStyleParams style = movementGenerator.generate(emotion, personality, needs);
+    // Phase 1: Hold still for Python to capture frame (first 3 seconds)
+    if (elapsed < INVESTIGATION_HOLD_MS) {
+      // Orient toward target but minimize movement — let camera capture
+      if (!reflexIsHandlingMovement && servoController != nullptr) {
+        MovementStyleParams style = movementGenerator.generate(emotion, personality, needs);
+        style.speed = 0.2;  // Slow, deliberate
+        servoController->smoothMoveTo(angles.base, angles.nod, angles.tilt, style);
+      }
+      needs.consumeEnergy(0.01);
+      return;
+    }
 
-      servoController->smoothMoveTo(angles.base, angles.nod, angles.tilt, style);
-      // REMOVED: delay(400) - non-blocking design
+    // Phase 2: Waiting for description or timeout (3-8 seconds)
+    if (!investigationDescriptionReceived && elapsed < INVESTIGATION_TIMEOUT_MS) {
+      // Subtle "examining" motion — tiny shifts to show active observation
+      if (!reflexIsHandlingMovement && servoController != nullptr) {
+        float tinyNod = sin((float)elapsed / 1000.0f * 0.5f) * 2.0f;
+        int examNod = constrain(angles.nod + (int)tinyNod, 80, 150);
+        MovementStyleParams style = movementGenerator.generate(emotion, personality, needs);
+        style.speed = 0.1;
+        servoController->smoothMoveTo(angles.base, examNod, angles.tilt, style);
+      }
+      needs.consumeEnergy(0.01);
+      return;
+    }
+
+    // Phase 3: Investigation complete (description received or timeout)
+    isInvestigating = false;
+
+    // Full investigation behavior (expression etc.) if not reflex-controlled
+    if (!reflexIsHandlingMovement && animator != nullptr && servoController != nullptr) {
+      MovementStyleParams style = movementGenerator.generate(emotion, personality, needs);
 
       if (expressiveness.canExpress() && random(100) < 50) {
         if (personality.getCuriosity() > 0.5 && random(100) < 40) {
-          // Buddy signature: full curious inspection sequence
           expressiveness.curiousInspection(*servoController, angles.base, angles.nod,
                                             emotion, personality, needs);
         } else if (personality.getCuriosity() > 0.5) {
@@ -1397,26 +1485,19 @@ public:
         } else {
           expressiveness.expressContemplation(*servoController, emotion, personality, needs);
         }
-        // REMOVED: delay(200) - non-blocking design
       }
 
-      // ═══════════════════════════════════════════════════════════════
-      // PERFORMANCE: Simplified tracking - removed loop with delays
-      // Command one tracking update per call instead of 3 with delays
-      // ═══════════════════════════════════════════════════════════════
       ServoAngles track = bodySchema.trackAttention(0.3);
       servoController->smoothMoveTo(track.base, track.nod, track.tilt, style);
-      // REMOVED: delay(300) in loop - non-blocking design
 
       if (random(100) < 25) {
         expressiveness.applyNaturalCorrection(*servoController);
       }
     }
-    // else: Reflex is active - let it handle ALL servo movements
 
     bodySchema.clearAttention();
     needs.satisfyNovelty(0.2);
-    needs.satisfyStimulation(0.1);
+    needs.satisfyStimulation(0.15);  // Boosted: understanding = rewarding
     needs.consumeEnergy(0.03);
   }
   
@@ -1779,6 +1860,11 @@ public:
 
   // Getter for speech urge system (used by AIBridge)
   SpeechUrgeSystem& getSpeechUrge() { return speechUrge; }
+
+  // Phase B: Investigation description setter (called from AIBridge !VISION)
+  void setInvestigationDescriptionReceived(bool received) {
+    investigationDescriptionReceived = received;
+  }
 
   const char* behaviorToString(Behavior b) {
     switch(b) {

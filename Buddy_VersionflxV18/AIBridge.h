@@ -62,12 +62,29 @@ private:
   // routed back to Serial1, not USB Serial.
   Stream* responseStream;
 
+  // ── Phase B: Vision context storage ──
+  struct VisionTarget {
+    bool hasTarget;
+    float novelty;
+    char description[100];
+    unsigned long timestamp;
+  };
+  VisionTarget lastVisionTarget;
+  char lastSceneDescription[100];
+  unsigned long lastVisionUpdateTime;
+
 public:
   AIBridge()
     : engine(nullptr), servos(nullptr), animator(nullptr), reflex(nullptr),
       streamingEnabled(false), lastStreamTime(0),
       aiAnimMode(AI_ANIM_NONE), aiAnimStartTime(0), lastAiAnimStep(0),
-      responseStream(&Serial) {}
+      responseStream(&Serial), lastVisionUpdateTime(0) {
+    lastVisionTarget.hasTarget = false;
+    lastVisionTarget.novelty = 0.0f;
+    lastVisionTarget.description[0] = '\0';
+    lastVisionTarget.timestamp = 0;
+    lastSceneDescription[0] = '\0';
+  }
 
   void init(BehaviorEngine* eng, ServoController* srv,
             AnimationController* anim, ReflexiveControl* ref) {
@@ -131,8 +148,12 @@ public:
       cmdExpress(cmdLine + 8);
     }
     // Phase 2: Vision feedback command — closes the autonomous observation loop
+    // Supports both !VISION:json (legacy) and !VISION json (SceneContext)
     else if (strncmp(cmdLine, "VISION:", 7) == 0) {
       cmdVision(cmdLine + 7);
+    }
+    else if (strncmp(cmdLine, "VISION ", 7) == 0) {
+      cmdVisionContext(cmdLine + 7);
     }
     else if (strncmp(cmdLine, "STREAM:", 7) == 0) {
       cmdStream(cmdLine + 7);
@@ -327,7 +348,107 @@ public:
     // Saves UART bandwidth and avoids contention.
   }
 
+  // ============================================
+  // !VISION json — Phase B: Rich scene context from SceneContext pipeline
+  // Format: {"faces":1,"expr":"smiling","obj":"mug,monitor",
+  //          "change":"new_object","novelty":0.7,"desc":"person at desk"}
+  // ============================================
+
+  void cmdVisionContext(const char* jsonStr) {
+    if (engine == nullptr) return;
+
+    // Parse long-key fields
+    float sceneNovelty = extractFloat(jsonStr, "novelty", 0.0f);
+    int faceCount = extractInt(jsonStr, "faces", 0);
+
+    char expression[16] = "neutral";
+    extractString(jsonStr, "expr", expression, sizeof(expression));
+
+    char changeType[24] = "none";
+    extractString(jsonStr, "change", changeType, sizeof(changeType));
+
+    char sceneDesc[100] = "";
+    extractString(jsonStr, "desc", sceneDesc, sizeof(sceneDesc));
+
+    // ─── Apply to behavior systems ───
+    Needs& needs = engine->getNeeds();
+    Emotion& emotion = engine->getEmotion();
+    ConsciousnessLayer& consciousness = engine->getConsciousness();
+
+    // 1. Visual novelty → stimulation satisfaction + arousal bump
+    if (sceneNovelty > 0.3f) {
+      needs.addStimulationSatisfaction(sceneNovelty * 0.3f);
+      emotion.nudge(sceneNovelty * 0.05f, 0.0f, 0.0f);  // Arousal bump
+    }
+
+    // 2. Expression → emotional mirroring
+    if (strcmp(expression, "smiling") == 0 || strcmp(expression, "happy") == 0) {
+      emotion.nudge(0.02f, 0.05f, 0.0f);
+    } else if (strcmp(expression, "frowning") == 0 || strcmp(expression, "angry") == 0) {
+      emotion.nudge(0.03f, -0.04f, -0.02f);
+    } else if (strcmp(expression, "surprised") == 0) {
+      emotion.nudge(0.05f, 0.02f, 0.0f);
+    } else if (strcmp(expression, "sad") == 0) {
+      emotion.nudge(-0.01f, -0.03f, 0.0f);
+    }
+
+    // 3. Change events → consciousness + investigation targets
+    if (strcmp(changeType, "new_object") == 0) {
+      consciousness.onEnvironmentChange(sceneNovelty);
+      lastVisionTarget.hasTarget = true;
+      lastVisionTarget.novelty = sceneNovelty;
+      strncpy(lastVisionTarget.description, sceneDesc, sizeof(lastVisionTarget.description) - 1);
+      lastVisionTarget.description[sizeof(lastVisionTarget.description) - 1] = '\0';
+      lastVisionTarget.timestamp = millis();
+    } else if (strcmp(changeType, "person_left") == 0) {
+      consciousness.onEnvironmentChange(0.4f);
+    } else if (strcmp(changeType, "person_appeared") == 0) {
+      consciousness.onEnvironmentChange(0.6f);
+    } else if (strcmp(changeType, "investigation_result") == 0) {
+      // Investigation completed — Buddy now "understands" what it was looking at
+      engine->setInvestigationDescriptionReceived(true);
+      needs.addStimulationSatisfaction(0.2f);
+      emotion.nudge(0.02f, 0.06f, 0.02f);  // Satisfaction boost
+      lastVisionTarget.hasTarget = false;
+    }
+
+    // 4. Store scene description for context
+    strncpy(lastSceneDescription, sceneDesc, sizeof(lastSceneDescription) - 1);
+    lastSceneDescription[sizeof(lastSceneDescription) - 1] = '\0';
+    lastVisionUpdateTime = millis();
+
+    // No response — continuous feed
+  }
+
 private:
+
+  // ── Simple JSON field extractors (no external library) ──
+  float extractFloat(const char* json, const char* key, float defaultVal) {
+    char searchKey[32];
+    snprintf(searchKey, sizeof(searchKey), "\"%s\":", key);
+    const char* pos = strstr(json, searchKey);
+    if (!pos) return defaultVal;
+    pos += strlen(searchKey);
+    while (*pos == ' ') pos++;
+    return atof(pos);
+  }
+
+  int extractInt(const char* json, const char* key, int defaultVal) {
+    return (int)extractFloat(json, key, (float)defaultVal);
+  }
+
+  void extractString(const char* json, const char* key, char* out, int maxLen) {
+    char searchKey[32];
+    snprintf(searchKey, sizeof(searchKey), "\"%s\":\"", key);
+    const char* pos = strstr(json, searchKey);
+    if (!pos) return;
+    pos += strlen(searchKey);
+    int i = 0;
+    while (*pos && *pos != '"' && i < maxLen - 1) {
+      out[i++] = *pos++;
+    }
+    out[i] = '\0';
+  }
 
   // ============================================
   // Helper: clear any active AI animation mode
@@ -393,7 +514,11 @@ private:
     }
 
     // Build entire JSON in buffer, then send as single write
-    char buf[512];
+    // Phase B: added hasVisionTarget and visionAge fields
+    unsigned long visionAge = (lastVisionUpdateTime > 0) ?
+      (millis() - lastVisionUpdateTime) / 1000 : 9999;
+
+    char buf[600];
     int len = snprintf(buf, sizeof(buf),
       "{\"arousal\":%.2f,\"valence\":%.2f,\"dominance\":%.2f,"
       "\"emotion\":\"%s\",\"behavior\":\"%s\","
@@ -404,7 +529,8 @@ private:
       "\"epistemic\":\"%s\",\"tension\":%.2f,"
       "\"wondering\":%s,\"selfAwareness\":%.2f,"
       "\"speechUrge\":%.2f,\"speechTrigger\":\"%s\","
-      "\"wantsToSpeak\":%s}",
+      "\"wantsToSpeak\":%s,"
+      "\"hasVisionTarget\":%s,\"visionAge\":%lu}",
       emo.getArousal(), emo.getValence(), emo.getDominance(),
       emo.getLabelString(), behaviorName(beh),
       needs.getStimulation(), needs.getSocial(), needs.getEnergy(),
@@ -417,7 +543,9 @@ private:
       consciousness.getSelfAwareness(),
       engine->getSpeechUrge().getUrge(),
       engine->getSpeechUrge().triggerToString(),
-      engine->getSpeechUrge().wantsToSpeak() ? "true" : "false"
+      engine->getSpeechUrge().wantsToSpeak() ? "true" : "false",
+      lastVisionTarget.hasTarget ? "true" : "false",
+      visionAge
     );
 
     if (len > 0 && len < (int)sizeof(buf)) {
@@ -425,7 +553,7 @@ private:
         responseStream->println(buf);
       }
     } else {
-      // Buffer overflow fallback — should never happen with 512 bytes
+      // Buffer overflow fallback — should never happen with 600 bytes
       responseStream->println("{\"ok\":false,\"reason\":\"buffer_overflow\"}");
     }
   }
