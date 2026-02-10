@@ -484,7 +484,7 @@ public:
       if (animator != nullptr && !animator->isCurrentlyAnimating()) {
         Personality& pers = engine->getPersonality();
         Needs& needs = engine->getNeeds();
-        animator->expressEmotion(EMOTION_CURIOUS, pers, needs);
+        animator->expressEmotion(CURIOUS, pers, needs);
       }
     }
     else if (strcmp(args, "startled") == 0) {
@@ -492,7 +492,7 @@ public:
       if (animator != nullptr && !animator->isCurrentlyAnimating()) {
         Personality& pers = engine->getPersonality();
         Needs& needs = engine->getNeeds();
-        animator->expressEmotion(EMOTION_STARTLED, pers, needs);
+        animator->expressEmotion(STARTLED, pers, needs);
       }
     }
     else {
