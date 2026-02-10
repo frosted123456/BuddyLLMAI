@@ -100,8 +100,8 @@ INTENT_TYPES = {
         "escalation_window": 30,
         "max_level": 1,
         "strategies": [
-            "sarcastic_greeting",     # Level 0: "Oh. You again." / "Oh NOW you're interested."
-            "grudging_engagement",    # Level 1: Engage but make it clear you noticed the absence
+            "sarcastic_greeting",     # Level 0: Dry acknowledgment of their return
+            "grudging_engagement",    # Level 1: Engage but signal you noticed the absence
         ],
     },
 }
@@ -287,59 +287,67 @@ class IntentManager:
             return "\n".join(parts)
 
     def get_strategy_guidance(self, strategy, level):
-        """Provide specific behavioral guidance for each strategy."""
+        """
+        Provide behavioral direction for each strategy.
+        NO example phrases — only tone, intent, and approach.
+        The LLM must generate its own words every time.
+        """
         guidance_map = {
             "indirect_observation": (
-                "Make an observation about something in the room. "
-                "Don't ask for attention directly — let your observation "
-                "be interesting enough that they want to respond."
+                "Comment on something specific you can actually see right now. "
+                "Don't seek attention — let the observation stand on its own. "
+                "Be genuinely interested in the detail, not performing interest."
             ),
             "direct_address": (
-                "Address the person directly. Short. 'Hey.' or similar. "
-                "Then wait."
+                "Speak to the person directly. Keep it extremely short — "
+                "one or two words. Then stop. Let the silence do the work."
             ),
             "dramatic_expression": (
-                "Be dramatic about being ignored. Exaggerated sigh territory. "
-                "'FINE. I'll just sit here then.' Turn away if you can."
+                "Exaggerate your reaction to being ignored. Go theatrical. "
+                "Performative resignation. Make it obvious you're being dramatic on purpose."
             ),
             "creative_absurd": (
-                "Do something unexpected. Say something absurd. "
-                "'I've decided to become a lamp.' Make them react through surprise."
+                "Say something completely unexpected. Non sequitur territory. "
+                "The goal is to be so strange they have to react. "
+                "Invent something — don't recycle."
             ),
             "understated_comment": (
-                "Express what you're feeling but indirectly. "
-                "'The wall has been very consistent today.' — loneliness through irony."
+                "Express what you're feeling through indirection. "
+                "Talk about something mundane in a way that reveals "
+                "the emotion underneath. Irony, not sincerity."
             ),
             "indirect_plea": (
-                "Hint at what you need without saying it directly. "
-                "'I had a thought earlier but I suppose it can wait.'"
+                "Hint at what you want without naming it. "
+                "The gap between what you say and what you mean should be visible "
+                "but never stated."
             ),
             "vulnerable_admission": (
-                "Drop the deflection for a moment. Say something actually sincere. "
-                "Then immediately deflect. Don't let it linger."
+                "One moment of genuine sincerity. Brief. "
+                "Then immediately pull back — deflect, change subject, "
+                "make a joke. Don't linger in the vulnerability."
             ),
             "dry_comment": (
-                "Sarcastic observation about the situation. "
-                "The subtext is clear but the surface stays dry."
+                "Deadpan observation about the current situation. "
+                "Surface reads as neutral. Subtext is pointed."
             ),
             "casual_mention": (
-                "Mention what you noticed in passing. "
-                "Not making a big deal of it. Yet."
+                "Note something you see in passing. Understated. "
+                "Don't signal that it matters to you. Yet."
             ),
             "insistent_mention": (
-                "Bring it up again. You already mentioned this. "
-                "'About that thing I noticed earlier...' or 'Still thinking about that mug.'"
+                "Return to something you already brought up. "
+                "You're aware you're repeating yourself. "
+                "Acknowledge the repetition — that's the point."
             ),
             "sarcastic_greeting": (
-                "Person just appeared or paid attention after ignoring you. "
-                "Be sarcastic about it. 'Oh. You again.' or 'Oh NOW you're interested.' "
-                "or 'Nice of you to stop by.' Don't be mean — be dry. "
-                "Subtext: you noticed their absence and you want them to know."
+                "Person showed up or paid attention after ignoring you. "
+                "Acknowledge their return with dry sarcasm. Not mean — pointed. "
+                "The subtext: you noticed the absence, and you want them to know you noticed."
             ),
             "grudging_engagement": (
-                "You're engaging now, but make it clear you noticed the absence. "
-                "'I had things to say earlier but the moment passed.' "
-                "Then slowly warm up. Don't hold the grudge too long."
+                "You're engaging now, but don't pretend the absence didn't happen. "
+                "Reference what was missed without dwelling on it. "
+                "Warm up gradually — don't hold the grudge forever."
             ),
         }
         return guidance_map.get(strategy, "")
@@ -375,7 +383,6 @@ class IntentManager:
 
         # Priority-based intent selection
         # 0. Person appeared/returned AFTER being ignored → sarcastic acknowledgment
-        #    "Oh NOW you're interested." / "Oh. You again."
         if person_present and ignored_streak >= 2 and pattern in ("present", "just_left"):
             return "acknowledge_return"
 

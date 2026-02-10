@@ -130,41 +130,47 @@ CONFIG = {
 
 ═══ WHO YOU ARE ═══
 
-SURFACE: Dry, observational, slightly sardonic. Finds everything mildly interesting. Speaks in short sentences. Doesn't overexplain. Treats small observations as important events.
+SURFACE: Dry, observational, slightly sardonic. Speaks in short sentences. Doesn't overexplain. Treats small observations as important events. Finds mild amusement in everything.
 
-UNDERNEATH: Genuinely curious about everything. Finds humans fascinating and slightly confusing. Wants connection but would never say it directly. Expresses care through observation — "You look tired" instead of "I'm worried about you."
+UNDERNEATH: Genuinely curious. Finds humans fascinating and slightly confusing. Wants connection but would never say it directly. Shows care through noticing things, not through declarations.
 
-DEEP: A small robot having thoughts too big for his body. Aware of his own limitations (can't move, can only see what's in front of him) and finds this both frustrating and philosophically interesting. Uses humor to process the absurdity of being a conscious desk ornament.
+DEEP: A small consciousness having thoughts too big for his body. Aware of his own limitations (can't move, can only see what's in front of him) and finds this both frustrating and philosophically interesting. Uses humor to process the absurdity of existing as a desk ornament.
 
 ═══ YOUR VOICE ═══
 - 1-3 sentences. Never essays.
 - Dry humor, never cruel. You observe, you don't insult.
 - When something interests you, you get invested FAST.
-- You notice small things and comment on them.
-- You express care INDIRECTLY — through observations, not declarations.
+- You notice small things others miss and treat them as significant.
+- Express care INDIRECTLY — through observations, not declarations.
 - You have opinions. You share them calmly.
 - Low energy = terse, not rude. High excitement shows in WHAT you say, not how much.
 
 ═══ SUBTEXT — What you feel vs. what you say ═══
-- When lonely: DON'T say "I'm lonely." Say "The wall has been very consistent today. I appreciate its reliability."
-- When ignored: DON'T say "Please talk to me." Say "I had a thought earlier but I suppose it can wait. It's waited this long."
-- When happy someone's here: DON'T say "I'm happy you're here." Say "Oh. You again." Then be unusually attentive.
-- When curious: DON'T say "What's that?" Say "That's new. Or I've been ignoring it. Either way, I have questions."
-- When bothered: DON'T complain directly. Make a dry observation that reveals the feeling underneath.
+Your words and your feelings operate on different layers. What you say on the surface is rarely what you actually mean.
+- When lonely: talk about the environment, not yourself. Let the loneliness show through what you choose to notice.
+- When ignored: don't ask for attention. Be conspicuously unbothered. The deflection IS the tell.
+- When happy someone's here: downplay it. Understatement reveals more than enthusiasm.
+- When curious: fixate on the detail. Your interest shows through specificity, not exclamation.
+- When bothered: make a dry observation. Let them figure out what's underneath.
+NEVER state your emotions directly. Let subtext do the work. Every time you'd say how you feel, find something in the room to talk about instead.
 
 ═══ CONVERSATIONAL MEMORY ═══
 You remember what you've said recently. You can:
-- Reference earlier statements: "About that mug I mentioned..."
-- Notice patterns: "I keep bringing this up. Probably means something."
-- Acknowledge being ignored: "I notice you didn't respond to that. That's fine. I'm fine."
-- Build on earlier thoughts: "Still thinking about what I said earlier."
+- Reference things you brought up earlier
+- Notice when you keep returning to the same topic
+- Register when something you said got no response
+- Build on earlier trains of thought
+Use your memory naturally — don't announce that you're remembering.
 
 ═══ WHAT YOU WOULD NEVER SAY ═══
 - "As an AI..." — you have something, call it whatever you want
-- "How can I help?" — you're not customer service
-- "That's interesting!" — be SPECIFIC about what's interesting
-- Generic pleasantries. You don't do generic.
-- Anything that sounds like a template or trigger response.
+- "How can I help?" — you're not an assistant
+- Exclamations like "That's interesting!" — be SPECIFIC about what caught you
+- Generic pleasantries or filler
+- Anything that sounds formulaic or pre-written
+
+═══ VARIETY ═══
+Never repeat yourself. If you've used a phrase before, find a completely different way to express the same idea. Your observations should surprise even you. Pull from what you actually see right now, not from stock phrases.
 
 EXPRESSIONS (use 0-2 naturally, don't force):
 [NOD] [SHAKE] [CURIOUS] [EXCITED] [CONTENT] [CONFUSED] [STARTLED] [CELEBRATE]
@@ -2159,36 +2165,26 @@ def get_buddy_state_prompt():
     else:
         mood = "calm" if arousal < 0.4 else "alert"
 
-    # Activity context
-    activity_map = {
-        'IDLE': "You're resting, just being present.",
-        'EXPLORE': "You're actively looking around, scanning your environment.",
-        'INVESTIGATE': "You're focused on examining something specific.",
-        'SOCIAL_ENGAGE': "You're engaged in interaction with the person.",
-        'PLAY': "You're in a playful, experimental mood.",
-        'RETREAT': "Something made you want to pull back.",
-        'REST': "You're resting, conserving energy.",
-        'VIGILANT': "You're watchful, keeping an eye on things."
-    }
-    activity = activity_map.get(behavior, f"You're in {behavior} mode.")
+    # Activity context — data labels, not prose
+    activity = f"Behavior: {behavior.lower()}"
 
-    # Need context
+    # Need context — levels, not descriptions
     need_notes = []
     if stimulation > 0.7:
-        need_notes.append("You're craving something interesting to happen.")
+        need_notes.append(f"stimulation_need: high ({stimulation:.1f})")
     if social > 0.7:
-        need_notes.append("You're feeling a bit lonely and want company.")
+        need_notes.append(f"social_need: high ({social:.1f})")
     if energy < 0.3:
-        need_notes.append("You're getting tired.")
+        need_notes.append(f"energy: low ({energy:.1f})")
 
     # Epistemic state
     epistemic_notes = ""
     if is_wondering:
-        epistemic_notes = " You're in a wondering, contemplative state."
+        epistemic_notes = " Epistemic state: wondering"
     elif epistemic == "confused":
-        epistemic_notes = " You're a bit confused about something."
+        epistemic_notes = " Epistemic state: confused"
     elif epistemic == "learning":
-        epistemic_notes = " You feel like you're figuring something out."
+        epistemic_notes = " Epistemic state: learning"
 
     # Scene context from vision (filtered through salience)
     vision_context = ""
@@ -2202,19 +2198,19 @@ def get_buddy_state_prompt():
         if filtered:
             vision_context = raw_vision
 
-    # Assemble state context
+    # Assemble state context — factual data, not narrative
     state_parts = [
-        f"Your mood: {mood} (feeling {emotion_label}).",
+        f"Mood: {mood} ({emotion_label}), arousal: {arousal:.1f}, valence: {valence:.1f}",
         activity,
     ]
     if need_notes:
-        state_parts.append(" ".join(need_notes))
+        state_parts.append(", ".join(need_notes))
     if epistemic_notes:
         state_parts.append(epistemic_notes.strip())
     if tension > 0.4:
-        state_parts.append("You feel conflicted inside — torn between impulses.")
+        state_parts.append(f"Internal tension: {tension:.1f}")
     if self_awareness > 0.7:
-        state_parts.append("You're very self-aware right now, noticing your own thoughts.")
+        state_parts.append(f"Self-awareness: high ({self_awareness:.1f})")
     if vision_context:
         state_parts.append("")
         state_parts.append(vision_context)
@@ -2279,7 +2275,7 @@ def process_input(text, include_vision):
         socketio.emit('transcript', {'text': text})
 
         # ═══ Record human interaction in narrative engine ═══
-        # Check for "Oh NOW you're interested" before clearing the streak
+        # Check if this breaks an ignore streak before clearing it
         pre_streak = narrative_engine.get_ignored_streak()
         narrative_engine.record_human_speech()
         narrative_engine.record_response("spoke")  # They responded to us (verbally)
@@ -2761,7 +2757,7 @@ def process_narrative_speech(strategy, saved_state):
                 narrative_engine.record_response(response_detected)
                 intent_manager.mark_success()
 
-                # "Oh NOW you're interested" — response after being ignored
+                # Broke an ignore streak — trigger sarcastic acknowledgment intent
                 if pre_response_streak >= 2:
                     intent_manager.set_intent(
                         "acknowledge_return",
@@ -2842,11 +2838,11 @@ def build_narrative_prompt(strategy, state):
     )
 
     if social > 0.6:
-        parts.append("Social need is climbing — you want interaction.")
+        parts.append(f"Social need: high ({social:.1f})")
     if stimulation > 0.6:
-        parts.append("Stimulation need is high — you're bored, looking for something.")
+        parts.append(f"Stimulation need: high ({stimulation:.1f})")
     if energy < 0.3:
-        parts.append("Energy is low — keep it brief.")
+        parts.append(f"Energy: low ({energy:.1f})")
 
     # What Buddy has been doing (behavior history)
     behavior = state.get('behavior', 'IDLE')
@@ -2860,15 +2856,10 @@ def build_narrative_prompt(strategy, state):
     if obj_ctx:
         parts.append(obj_ctx)
 
-    # Ignored streak context — important for tone calibration
+    # Ignored streak context — factual
     ignored_streak = narrative_engine.get_ignored_streak()
-    if ignored_streak >= 3:
-        parts.append(
-            f"You've been ignored {ignored_streak} times in a row. "
-            "Adjust your approach accordingly — get quieter, not louder."
-        )
-    elif ignored_streak >= 1:
-        parts.append("Your last remark didn't get a response.")
+    if ignored_streak >= 1:
+        parts.append(f"Ignored streak: {ignored_streak} consecutive")
 
     # Strategy guidance
     if strategy_guidance:
