@@ -622,8 +622,9 @@ spontaneous_speech_enabled = True
 spontaneous_speech_lock = threading.Lock()
 spontaneous_utterance_log = []  # List of timestamps for rate limiting
 SPONTANEOUS_MAX_PER_HOUR = 6
-SPONTANEOUS_MIN_GAP_SECONDS = 120  # 2 minutes between utterances
+SPONTANEOUS_MIN_GAP_SECONDS = 120  # 2 minutes between utterances (idle mode)
 last_spontaneous_utterance = 0
+_last_physical_expression = 0  # Timestamp — prevents servo spam
 
 # Dedicated async event loop for TTS (thread-safe)
 _tts_loop = asyncio.new_event_loop()
@@ -2502,27 +2503,50 @@ def check_spontaneous_speech(state):
                 ).start()
             return  # Don't process new intents while speech is pending
 
-    # ── Let Teensy's speech urge still gate the system ──
-    # BUT: engagement cycle (giving up, self-occupied musing) can bypass urge
+    # ═══════════════════════════════════════════════════════════
+    # GATING — What drives Buddy to act?
+    #
+    # The intent system is the PRIMARY driver. It tracks engagement,
+    # escalation, and the engagement cycle (try → give up → self-occupy).
+    # Teensy urge is a SECONDARY trigger for when no intent is active.
+    #
+    # Old design: Teensy urge gates everything → nothing happens
+    # New design: active intent OR high Teensy urge → proceed
+    # ═══════════════════════════════════════════════════════════
+    engagement_phase = intent_manager.get_engagement_phase()
+    has_active_intent = intent_manager.get_current_intent() is not None
     wants = state.get('wantsToSpeak', False)
     urge = float(state.get('speechUrge', 0))
-    engagement_phase = intent_manager.get_engagement_phase()
-    engagement_override = engagement_phase in ("giving_up", "self_occupied")
 
-    if not engagement_override and (not wants or urge < 0.6):
-        # Below threshold — but still let intent system update
+    # Intent system drives when it has work to do
+    intent_drives = has_active_intent or engagement_phase != "idle"
+    # Teensy urge is a backup trigger
+    teensy_drives = wants and urge >= 0.6
+
+    if not intent_drives and not teensy_drives:
+        # Nothing driving speech — just update intents for next cycle
         intent_type = intent_manager.select_intent(state, narrative_engine)
         if intent_type:
             intent_manager.set_intent(intent_type)
         return
 
-    # ── Rate limiting ──
-    if now - last_spontaneous_utterance < SPONTANEOUS_MIN_GAP_SECONDS:
+    # ── Rate limiting (phase-aware) ──
+    # Engagement has its own pacing (escalation windows, speech delays).
+    # Only apply a short gap to prevent rapid-fire.
+    if engagement_phase != "idle":
+        min_gap = 15  # 15s between engagement actions
+    else:
+        min_gap = SPONTANEOUS_MIN_GAP_SECONDS  # 120s for idle spontaneous speech
+
+    if now - last_spontaneous_utterance < min_gap:
         return
-    one_hour_ago = now - 3600
-    spontaneous_utterance_log = [t for t in spontaneous_utterance_log if t > one_hour_ago]
-    if len(spontaneous_utterance_log) >= SPONTANEOUS_MAX_PER_HOUR:
-        return
+
+    # Hourly cap — safety net (only for idle mode; engagement is self-limiting)
+    if engagement_phase == "idle":
+        one_hour_ago = now - 3600
+        spontaneous_utterance_log = [t for t in spontaneous_utterance_log if t > one_hour_ago]
+        if len(spontaneous_utterance_log) >= SPONTANEOUS_MAX_PER_HOUR:
+            return
 
     # ── Intent selection & escalation ──
     intent_type = intent_manager.select_intent(state, narrative_engine)
@@ -2609,6 +2633,14 @@ def check_spontaneous_speech(state):
 
 def _execute_physical_expression(state, intent_strategy):
     """Execute a physical expression instead of speech."""
+    global _last_physical_expression
+
+    # Cooldown — prevent servo spam from rapid poll cycles
+    now = time.time()
+    if now - _last_physical_expression < 10:
+        return
+    _last_physical_expression = now
+
     # Map intent strategy to emotional context
     emotion_map = {
         "subtle_movement": "curious",
