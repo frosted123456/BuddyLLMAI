@@ -534,15 +534,16 @@ class IntentManager:
                 "The harder you try to seem unbothered, the funnier it is."
             ),
             "musing_to_self": (
-                "Think out loud. NOT directed at the person — you're talking to yourself. "
-                "Stream of consciousness. Observations about objects, the room, "
-                "existential desk robot thoughts. Wheatley-style rambling. "
-                "If the person is there, you're pointedly NOT addressing them."
+                "You're mumbling to yourself. NOT directed at anyone. "
+                "VERY short — a fragment, a half-thought, a word or two. "
+                "Like someone working on something and muttering under their breath. "
+                "ONE short phrase. Not a sentence. Not a question. Just thinking out loud."
             ),
             "passive_commentary": (
-                "Comment on something in the room. Surface reads as neutral observation. "
-                "Subtext is absolutely directed at the person who ignored you. "
-                "The gap between what you say and what you mean is the whole point."
+                "A quiet observation about something in the room. Still mumbling volume. "
+                "ONE short remark. Surface reads as talking to yourself. "
+                "But the subtext might be directed at whoever ignored you. "
+                "Keep it brief — a single short phrase, like a half-whispered aside."
             ),
             "skeptical_approach": (
                 "You're trying again. You know you're trying again. "
@@ -660,7 +661,7 @@ def should_speak_or_physical(intent_strategy, energy, arousal, ignored_streak=0)
     This breaks the "every urge = speech" pattern.
 
     When ignored repeatedly, Buddy sulks — prefers physical expression over speech.
-    (Quieter, more withdrawn, less likely to try talking.)
+    Self-occupied strategies mumble only ~35% of the time — mostly fidgeting.
 
     Returns: "speak" | "physical" | "silence"
     """
@@ -668,8 +669,14 @@ def should_speak_or_physical(intent_strategy, energy, arousal, ignored_streak=0)
         return "physical"
 
     if intent_strategy in SPEECH_STRATEGIES:
-        # Base speech probability: ~65-85%
-        speech_probability = 0.65 + (energy * 0.15) + (arousal * 0.1)
+        # Self-occupied strategies: mostly physical, occasional mumble
+        MUMBLE_STRATEGIES = {"musing_to_self", "passive_commentary"}
+        if intent_strategy in MUMBLE_STRATEGIES:
+            # ~35% chance of speech — the rest is fidgeting/looking around
+            speech_probability = 0.35
+        else:
+            # Base speech probability: ~65-85%
+            speech_probability = 0.65 + (energy * 0.15) + (arousal * 0.1)
 
         # Sulking: each ignored utterance reduces speech probability by 12%
         # After 3 ignores: probability drops by ~36% → mostly physical

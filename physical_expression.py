@@ -369,6 +369,13 @@ def calculate_speech_delay(arousal, valence, intent_strategy, ignored_streak):
     elif intent_strategy in ("vulnerable_admission",):
         # Working up to it — longer delay
         base_delay = random.uniform(15, 45)
+    elif intent_strategy in ("musing_to_self", "passive_commentary"):
+        # Self-occupied mumbling — long gaps between mumbles
+        # Creates the intermittent effect: fidget... fidget... mumble... fidget...
+        base_delay = random.uniform(20, 60)
+    elif intent_strategy in ("theatrical_resignation", "pointed_disinterest"):
+        # Giving up — moderate pause before the dramatic moment
+        base_delay = random.uniform(5, 15)
     else:
         # Normal — standard range
         base_delay = random.uniform(10, 40)
