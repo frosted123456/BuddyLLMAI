@@ -286,7 +286,10 @@ class IntentManager:
                 if person_present and self._gave_up_count <= 3:
                     self._archive_current_intent()
                     return "reluctant_reengage"
-                # Given up too many times — stay idle
+                # Given up too many times — reset count so engagement can restart
+                # on a future visit (prevents permanent silence for the session)
+                self._gave_up_count = 0
+                self._archive_current_intent()
                 return None
 
         return None
