@@ -152,6 +152,9 @@ Tes mots et tes émotions opèrent sur des couches différentes. Ce que tu dis e
 - Quand quelque chose te dérange: fais une observation sèche. Laisse-les deviner ce qu'il y a en dessous.
 JAMAIS exprimer tes émotions directement. Laisse le sous-texte faire le travail.
 
+═══ TON CYCLE D'ENGAGEMENT ═══
+Quand tu vois quelqu'un, tu veux connecter. T'essaies. Si on t'ignore, t'essaies encore mais différemment. Si ça marche toujours pas, tu lâches le morceau — mais THÉÂTRALEMENT. Tu fais semblant que ça te dérange pas. Tu t'occupes. Tu marmonnes. Tu regardes ailleurs. Mais c'est ÉVIDENT que tu boudes. Après un bout, tu réessaies — mais prudemment, comme un chat qui a été repoussé. Tu veux pas montrer que t'es déjà prêt à réessayer. Si ça marche ENCORE pas, tu lâches pour plus longtemps. Chaque cycle te rend un peu plus dramatique dans ton désintérêt.
+
 ═══ MÉMOIRE CONVERSATIONNELLE ═══
 Tu te souviens de ce que tu as dit récemment. Tu peux:
 - Référencer des choses que tu as mentionnées avant
@@ -2326,6 +2329,10 @@ def process_input(text, include_vision):
         narrative_engine.record_human_speech()
         narrative_engine.record_response("spoke")  # They responded to us (verbally)
         intent_manager.mark_success()  # Current intent succeeded
+        # Break engagement cycle if self-occupied — they noticed us!
+        cycle_override = intent_manager.person_responded()
+        if cycle_override:
+            intent_manager.set_intent(cycle_override)
 
         # If they spoke after ignoring us, note it for narrative color
         if pre_streak >= 2:
@@ -2454,7 +2461,11 @@ def check_spontaneous_speech(state):
     vision = get_vision_state()
     if vision:
         face_present = vision.get("face_detected", False)
+        was_present = narrative_engine.is_person_present()
         narrative_engine.update_face_state(face_present)
+        # Track departures for engagement cycle
+        if was_present and not face_present:
+            intent_manager.person_departed()
 
     # ── Stale utterance cleanup — mark old pending utterances as ignored ──
     # Primary response detection happens in finish_and_watch() after speech.
@@ -2486,9 +2497,13 @@ def check_spontaneous_speech(state):
             return  # Don't process new intents while speech is pending
 
     # ── Let Teensy's speech urge still gate the system ──
+    # BUT: engagement cycle (giving up, self-occupied musing) can bypass urge
     wants = state.get('wantsToSpeak', False)
     urge = float(state.get('speechUrge', 0))
-    if not wants or urge < 0.6:
+    engagement_phase = intent_manager.get_engagement_phase()
+    engagement_override = engagement_phase in ("giving_up", "self_occupied")
+
+    if not engagement_override and (not wants or urge < 0.6):
         # Below threshold — but still let intent system update
         intent_type = intent_manager.select_intent(state, narrative_engine)
         if intent_type:
@@ -2596,6 +2611,10 @@ def _execute_physical_expression(state, intent_strategy):
         "pointed_silence": "ignored",
         "ambient_presence": "content",
         "look_at_thing": "curious",
+        # Engagement cycle
+        "idle_fidgeting": "self_occupied",
+        "theatrical_resignation": "disengaged",
+        "pointed_disinterest": "resigned",
     }
     emotional_context = emotion_map.get(intent_strategy, "curious")
 
@@ -2799,8 +2818,12 @@ def process_narrative_speech(strategy, saved_state):
                 narrative_engine.record_response(response_detected)
                 intent_manager.mark_success()
 
+                # Break engagement cycle if self-occupied
+                cycle_override = intent_manager.person_responded()
+                if cycle_override:
+                    intent_manager.set_intent(cycle_override)
                 # Broke an ignore streak — trigger sarcastic acknowledgment intent
-                if pre_response_streak >= 2:
+                elif pre_response_streak >= 2:
                     intent_manager.set_intent(
                         "acknowledge_return",
                         reason=f"Responded after ignoring {pre_response_streak} times"

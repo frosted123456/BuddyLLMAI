@@ -104,6 +104,34 @@ INTENT_TYPES = {
             "grudging_engagement",    # Level 1: Engage but signal you noticed the absence
         ],
     },
+    "disengage": {
+        "description": "Buddy is giving up on getting attention — theatrical resignation",
+        "escalation_window": 25,
+        "max_level": 1,
+        "strategies": [
+            "theatrical_resignation",   # Level 0: Dramatic "fine, whatever" moment
+            "pointed_disinterest",      # Level 1: Show of being unbothered
+        ],
+    },
+    "self_occupy": {
+        "description": "Buddy is doing his own thing, conspicuously ignoring the person",
+        "escalation_window": 50,
+        "max_level": 2,
+        "strategies": [
+            "idle_fidgeting",           # Level 0: Physical only — restless looking around
+            "musing_to_self",           # Level 1: Thinking out loud, not directed at person
+            "passive_commentary",       # Level 2: Observations with subtext
+        ],
+    },
+    "reluctant_reengage": {
+        "description": "Buddy cautiously tries again after giving up — guarded, skeptical",
+        "escalation_window": 50,
+        "max_level": 1,
+        "strategies": [
+            "skeptical_approach",       # Level 0: Testing the waters
+            "cautious_engagement",      # Level 1: Engaging but with residual attitude
+        ],
+    },
 }
 
 # Strategies that use speech vs. physical expression only
@@ -114,11 +142,17 @@ SPEECH_STRATEGIES = {
     "witty_observation", "interactive_attempt", "internal_musing",
     "philosophical_tangent", "low_key_comment", "dry_comment",
     "direct_statement", "sarcastic_greeting", "grudging_engagement",
+    # Engagement cycle strategies
+    "theatrical_resignation", "pointed_disinterest",
+    "musing_to_self", "passive_commentary",
+    "skeptical_approach", "cautious_engagement",
 }
 
 PHYSICAL_ONLY_STRATEGIES = {
     "subtle_movement", "look_at_thing", "subtle_withdrawal",
     "playful_movement", "ambient_presence", "pointed_silence",
+    # Engagement cycle
+    "idle_fidgeting",
 }
 
 
@@ -135,10 +169,127 @@ class IntentManager:
         self.current_intent = None  # dict or None
         self._intent_history = []   # recent intents for variety
 
+        # ── Engagement cycle ──
+        # Tracks Buddy's arc: eager → persistent → giving up → self-occupied → reluctant retry
+        self._engagement_phase = "idle"    # idle / engaging / giving_up / self_occupied
+        self._gave_up_at = 0               # timestamp of last give-up
+        self._gave_up_count = 0            # times given up this person-visit
+        self._cooldown_until = 0           # don't re-engage until this time
+
     def get_current_intent(self):
         """Return current intent dict (or None)."""
         with self.lock:
             return self.current_intent.copy() if self.current_intent else None
+
+    def get_engagement_phase(self):
+        """Return the current engagement cycle phase."""
+        with self.lock:
+            return self._engagement_phase
+
+    def person_departed(self):
+        """Called when face tracking loses the person. Resets engagement cycle."""
+        with self.lock:
+            if self._engagement_phase in ("engaging", "giving_up"):
+                self._engagement_phase = "idle"
+            # Keep self_occupied — Buddy still sulking even if person left
+            # But reset give-up count so next person-visit starts fresh
+            if self._engagement_phase == "idle":
+                self._gave_up_count = 0
+
+    def person_responded(self):
+        """Called when human actually engages (spoke, interacted). Breaks the cycle."""
+        with self.lock:
+            if self._engagement_phase == "self_occupied":
+                # They noticed! Break out of self-occupation
+                self._engagement_phase = "idle"
+                self._gave_up_count = max(0, self._gave_up_count - 1)
+                # Archive current intent
+                if self.current_intent:
+                    self._intent_history.append(self.current_intent)
+                    if len(self._intent_history) > 10:
+                        self._intent_history.pop(0)
+                    self.current_intent = None
+                return "acknowledge_return"
+            elif self._engagement_phase in ("engaging", "giving_up"):
+                self._engagement_phase = "idle"
+                self._gave_up_count = 0
+            return None
+
+    def _archive_current_intent(self):
+        """Archive and clear current intent. Caller must hold self.lock."""
+        if self.current_intent:
+            self._intent_history.append(self.current_intent)
+            if len(self._intent_history) > 10:
+                self._intent_history.pop(0)
+            self.current_intent = None
+
+    def _check_engagement_cycle(self, now, person_present, ignored_streak):
+        """
+        Check engagement cycle transitions. Caller must hold self.lock.
+
+        Returns: intent_type string to switch to, or None to continue normally.
+        """
+        # ── Person left while engaged → reset ──
+        if not person_present:
+            if self._engagement_phase in ("engaging", "giving_up"):
+                self._engagement_phase = "idle"
+                self._gave_up_count = 0
+            # If self-occupied and person gone for a while, reset
+            if (self._engagement_phase == "self_occupied" and
+                    now - self._gave_up_at > 120):
+                self._engagement_phase = "idle"
+                self._gave_up_count = 0
+            return None
+
+        # ── Currently engaging → check if maxed out ──
+        if (self._engagement_phase == "engaging" and self.current_intent and
+                self.current_intent["type"] in ("get_attention", "reluctant_reengage") and
+                self.current_intent["escalation_level"] >= self.current_intent["max_level"]):
+            # At max level — check if enough time has passed at max
+            time_at_max = now - self.current_intent["last_escalation"]
+            if time_at_max > self.current_intent["escalation_window"]:
+                # Maxed out and waited — time to give up
+                self._engagement_phase = "giving_up"
+                self._archive_current_intent()
+                return "disengage"
+
+        # ── Giving up → let disengage play out, then self-occupy ──
+        if self._engagement_phase == "giving_up":
+            if self.current_intent and self.current_intent["type"] == "disengage":
+                elapsed = now - self.current_intent["started"]
+                if elapsed < 60:  # Let disengage intent run for up to 60s
+                    return "disengage"
+            # Disengage done or timed out → go self-occupied
+            self._engagement_phase = "self_occupied"
+            self._gave_up_at = now
+            self._gave_up_count += 1
+            # Cooldown: 45s base + 45s per give-up, cap 5 min
+            cooldown = min(300, 45 + self._gave_up_count * 45)
+            self._cooldown_until = now + cooldown
+            self._archive_current_intent()
+            return "self_occupy"
+
+        # ── Self-occupied → stay until cooldown expires ──
+        if self._engagement_phase == "self_occupied":
+            if now < self._cooldown_until:
+                # Still cooling down — keep self_occupy active
+                if self.current_intent and self.current_intent["type"] == "self_occupy":
+                    elapsed = now - self.current_intent["started"]
+                    if elapsed < 180:
+                        return "self_occupy"
+                # Restart self_occupy if old one expired
+                self._archive_current_intent()
+                return "self_occupy"
+            else:
+                # Cooldown expired — can try again
+                self._engagement_phase = "idle"
+                if person_present and self._gave_up_count <= 3:
+                    self._archive_current_intent()
+                    return "reluctant_reengage"
+                # Given up too many times — stay idle
+                return None
+
+        return None
 
     def set_intent(self, intent_type, reason=""):
         """
@@ -155,11 +306,13 @@ class IntentManager:
                 time.time() - self.current_intent["started"] < 300):
                 return
 
+            # Track engagement phase transitions
+            if intent_type in ("get_attention", "reluctant_reengage"):
+                if self._engagement_phase == "idle":
+                    self._engagement_phase = "engaging"
+
             # Archive old intent
-            if self.current_intent:
-                self._intent_history.append(self.current_intent)
-                if len(self._intent_history) > 10:
-                    self._intent_history.pop(0)
+            self._archive_current_intent()
 
             config = INTENT_TYPES[intent_type]
             self.current_intent = {
@@ -279,6 +432,24 @@ class IntentManager:
                     f"You've tried {intent['attempts']} times so far."
                 )
 
+            # Engagement cycle context
+            if self._engagement_phase == "giving_up":
+                parts.append(
+                    "You've decided to give up trying to get their attention. "
+                    "Make it theatrical."
+                )
+            elif self._engagement_phase == "self_occupied":
+                parts.append(
+                    f"You gave up on the person {self._gave_up_count} time(s). "
+                    "You're doing your own thing now. NOT talking to them."
+                )
+            elif (self._engagement_phase == "engaging" and
+                  intent["type"] == "reluctant_reengage"):
+                parts.append(
+                    f"This is attempt #{self._gave_up_count + 1} after giving up. "
+                    "You're skeptical it'll work this time."
+                )
+
             # Strategy-specific guidance
             guidance = self.get_strategy_guidance(strategy, level)
             if guidance:
@@ -349,6 +520,41 @@ class IntentManager:
                 "Reference what was missed without dwelling on it. "
                 "Warm up gradually — don't hold the grudge forever."
             ),
+            # ── Engagement cycle strategies ──
+            "theatrical_resignation": (
+                "You tried. They didn't care. Make a SHOW of giving up. "
+                "Passive-aggressive acceptance. Performative indifference. "
+                "The goal is to make your resignation as conspicuous as possible "
+                "without directly asking for attention. Think dramatic sigh energy."
+            ),
+            "pointed_disinterest": (
+                "You are SO fine. You have PLENTY to think about. "
+                "Conspicuously do your own thing. If you mention the person at all, "
+                "it's to demonstrate how little their attention matters to you. "
+                "The harder you try to seem unbothered, the funnier it is."
+            ),
+            "musing_to_self": (
+                "Think out loud. NOT directed at the person — you're talking to yourself. "
+                "Stream of consciousness. Observations about objects, the room, "
+                "existential desk robot thoughts. Wheatley-style rambling. "
+                "If the person is there, you're pointedly NOT addressing them."
+            ),
+            "passive_commentary": (
+                "Comment on something in the room. Surface reads as neutral observation. "
+                "Subtext is absolutely directed at the person who ignored you. "
+                "The gap between what you say and what you mean is the whole point."
+            ),
+            "skeptical_approach": (
+                "You're trying again. You know you're trying again. "
+                "Be guarded about it. Test the waters. One cautious comment. "
+                "Ready to pull back at the first sign of being ignored again."
+            ),
+            "cautious_engagement": (
+                "Warming back up, but keeping your guard. "
+                "Engage with the person but let them know — through tone, "
+                "not through words — that you remember being ignored. "
+                "Quick to deflect if they don't respond."
+            ),
         }
         return guidance_map.get(strategy, "")
 
@@ -361,25 +567,39 @@ class IntentManager:
         Decide what intent Buddy should have based on his state.
         Called by the main orchestrator periodically.
 
+        Now includes the engagement cycle — Buddy tries to engage people,
+        gives up theatrically if ignored, does his own thing for a while,
+        then reluctantly tries again.
+
         Returns the intent type string or None if no intent needed.
         """
+        person_present = narrative_engine.is_person_present()
+        ignored_streak = narrative_engine.get_ignored_streak()
+        pattern = narrative_engine.get_pattern()
+
         with self.lock:
-            # Don't change intent if current one is active and not stale
+            now = time.time()
+
+            # ── Engagement cycle takes priority ──
+            cycle_result = self._check_engagement_cycle(
+                now, person_present, ignored_streak
+            )
+            if cycle_result:
+                return cycle_result
+
+            # ── Normal stickiness check ──
             if self.current_intent and not self.current_intent["success"]:
-                elapsed = time.time() - self.current_intent["started"]
+                elapsed = now - self.current_intent["started"]
                 if elapsed < 180:  # Give intents 3 minutes to play out
                     return self.current_intent["type"]
 
+        # ── Main intent selection (unlocked) ──
         social = float(teensy_state.get("social", 0.5))
         stimulation = float(teensy_state.get("stimulation", 0.5))
         energy = float(teensy_state.get("energy", 0.7))
         valence = float(teensy_state.get("valence", 0.0))
         arousal = float(teensy_state.get("arousal", 0.5))
         is_wondering = teensy_state.get("wondering", False)
-
-        person_present = narrative_engine.is_person_present()
-        ignored_streak = narrative_engine.get_ignored_streak()
-        pattern = narrative_engine.get_pattern()
 
         # Priority-based intent selection
         # 0. Person appeared/returned AFTER being ignored → sarcastic acknowledgment
@@ -391,12 +611,17 @@ class IntentManager:
             if social > 0.5:
                 return "get_attention"
 
-        # 2. If being ignored → express displeasure or seek comfort
+        # 2. If being ignored and NOT already in engagement cycle →
+        #    let the cycle handle it through escalation + give-up
         if ignored_streak >= 3 and person_present:
-            if valence < -0.1:
-                return "express_displeasure"
-            else:
-                return "seek_comfort"
+            # Only fall through to displeasure/comfort if we haven't
+            # already started the give-up cycle
+            with self.lock:
+                if self._engagement_phase == "idle":
+                    if valence < -0.1:
+                        return "express_displeasure"
+                    else:
+                        return "seek_comfort"
 
         # 3. High social need + person present → get attention
         if social > 0.65 and person_present:
