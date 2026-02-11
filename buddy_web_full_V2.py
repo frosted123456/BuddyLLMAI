@@ -33,6 +33,7 @@ import wave
 import struct
 import json
 import re
+import traceback
 from pathlib import Path
 
 import collections
@@ -191,6 +192,11 @@ EXPRESSIONS (utilise 0-2 naturellement, force pas):
 
 RAPPEL: Réponds avec SEULEMENT les mots de Buddy. Première personne. 1-3 phrases. En français québécois. Rien d'autre."""
 }
+
+# Configure ollama library to use the same host as CONFIG
+# (the library defaults to OLLAMA_HOST env var or localhost:11434,
+#  but SceneContext uses CONFIG directly — keep them in sync)
+os.environ.setdefault("OLLAMA_HOST", CONFIG["ollama_host"])
 
 # =============================================================================
 # SCENE UNDERSTANDING — Phase C: Vision-aware context for LLM + Teensy
@@ -2285,15 +2291,29 @@ def query_ollama(text, img=None, timeout=60):
 
     result = [None]
     error = [None]
+    error_tb = [None]
+
+    print(f"[SPEECH] Calling Ollama model={model}, prompt_len={sum(len(m['content']) for m in msgs)}")
 
     def _query():
         try:
-            result[0] = ollama.chat(
+            t0 = time.time()
+            response = ollama.chat(
                 model=model,
                 messages=msgs
-            )["message"]["content"]
+            )
+            # Support both old dict API and new object API (ollama >= 0.4)
+            if isinstance(response, dict):
+                result[0] = response["message"]["content"]
+            else:
+                # New API: attribute access
+                result[0] = response.message.content
+            elapsed = time.time() - t0
+            print(f"[SPEECH] Ollama responded: {len(result[0] or '')} chars, {elapsed:.1f}s")
         except Exception as e:
             error[0] = e
+            error_tb[0] = traceback.format_exc()
+            print(f"[SPEECH] Ollama error in _query: {e}\n{error_tb[0]}")
 
     # Signal scene loop to yield, then grab the Ollama lock
     _ollama_speech_priority = True
@@ -2304,9 +2324,12 @@ def query_ollama(text, img=None, timeout=60):
         t.join(timeout=timeout)
 
         if t.is_alive():
-            socketio.emit('log', {'message': f'Ollama timeout after {timeout}s', 'level': 'error'})
-            raise TimeoutError(f"Ollama did not respond within {timeout}s")
+            msg = f'Ollama timeout after {timeout}s (model={model})'
+            print(f"[SPEECH] {msg}")
+            socketio.emit('log', {'message': msg, 'level': 'error'})
+            raise TimeoutError(msg)
         if error[0]:
+            print(f"[SPEECH] Ollama call failed: {error[0]}")
             raise error[0]
         return result[0]
     finally:
@@ -2324,7 +2347,9 @@ async def generate_tts(text, volume=None):
     finally: os.unlink(tp)
 
 def process_input(text, include_vision):
+    print(f'[SPEECH] Received user input: "{text[:80]}" (vision={include_vision})')
     if not processing_lock.acquire(blocking=False):
+        print("[SPEECH] Already processing, skipping")
         socketio.emit('log', {'message': 'Already processing, skipping', 'level': 'warning'})
         return
     try:
@@ -2370,16 +2395,19 @@ def process_input(text, include_vision):
         teensy_send_with_fallback("THINKING", "EXPRESS:curious")  # Fallback to curious expression
         
         # Query LLM (this is the slow part - 10-30 seconds on CPU)
+        print(f"[SPEECH] Querying Ollama (model={CONFIG['ollama_model']})...")
         resp = query_ollama(text, img)
-        
+        print(f'[SPEECH] Ollama response: "{(resp or "")[:100]}"')
+
         # Stop thinking animation
         teensy_send_command("STOP_THINKING")  # OK if not implemented
-        
+
         # ═══════════════════════════════════════════════════════════
         # PHASE 4: PROCESS RESPONSE - Execute any action commands
         # ═══════════════════════════════════════════════════════════
         clean = execute_buddy_actions(resp)
         socketio.emit('response', {'text': clean})
+        print(f'[SPEECH] Response sent to browser: "{clean[:100]}"')
         
         # Satisfy needs after interaction
         teensy_send_command("SATISFY:social,0.15")
@@ -2393,9 +2421,12 @@ def process_input(text, include_vision):
         
         # Generate and send audio
         try:
+            print(f"[SPEECH] TTS generating audio for: \"{clean[:60]}\" (voice={CONFIG['tts_voice']})")
             audio = run_tts_sync(clean)
             socketio.emit('audio', {'base64': audio})
+            print(f"[SPEECH] Audio ready, sent to browser ({len(audio)} base64 chars)")
         except Exception as tts_err:
+            print(f"[SPEECH] TTS failed: {tts_err}\n{traceback.format_exc()}")
             socketio.emit('log', {'message': f'TTS failed: {tts_err}', 'level': 'error'})
             # Response text was already sent — user sees it, just no audio
         
@@ -2423,11 +2454,17 @@ def process_input(text, include_vision):
         socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
         
     except Exception as e:
-        # Cleanup on error
-        teensy_send_command("STOP_THINKING")
-        teensy_send_command("STOP_SPEAKING")
-        teensy_send_command("IDLE")
-        socketio.emit('error', {'message': str(e)})
+        # Cleanup on error — log full traceback for diagnosis
+        tb = traceback.format_exc()
+        print(f"[SPEECH] process_input FAILED: {e}\n{tb}")
+        try:
+            teensy_send_command("STOP_THINKING")
+            teensy_send_command("STOP_SPEAKING")
+            teensy_send_command("IDLE")
+        except Exception:
+            pass  # Don't let cleanup failure mask the original error
+        socketio.emit('error', {'message': f'{e}'})
+        socketio.emit('log', {'message': f'Speech pipeline error: {e}\n{tb}', 'level': 'error'})
         socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
     finally:
         processing_lock.release()
@@ -2528,7 +2565,14 @@ def check_spontaneous_speech(state):
         intent_type = intent_manager.select_intent(state, narrative_engine)
         if intent_type:
             intent_manager.set_intent(intent_type)
+            print(f"[SPEECH] Spontaneous: selected intent '{intent_type}' (will act next cycle)")
         return
+
+    # Log when we pass the gate (not every cycle — only when actively driven)
+    current_intent = intent_manager.get_current_intent()
+    print(f"[SPEECH] Spontaneous check: intent_drives={intent_drives}, teensy_drives={teensy_drives}, "
+          f"phase={engagement_phase}, intent={current_intent['type'] if current_intent else None}, "
+          f"urge={urge:.2f}, social={float(state.get('social', 0)):.2f}")
 
     # ── Rate limiting (phase-aware) ──
     # Engagement has its own pacing (escalation windows, speech delays).
@@ -2710,6 +2754,7 @@ def process_narrative_speech(strategy, saved_state):
     4. Post-speech arc (watching phase)
     5. Response detection (resolution phase)
     """
+    print(f"[SPEECH] Spontaneous speech firing: strategy={strategy}")
     global last_spontaneous_utterance, spontaneous_utterance_log
 
     if not processing_lock.acquire(blocking=False):
@@ -2756,7 +2801,9 @@ def process_narrative_speech(strategy, saved_state):
         # fast text model (3-5s). The scene loop handles vision independently.
 
         teensy_send_with_fallback("THINKING", "EXPRESS:curious")
+        print(f"[SPEECH] Spontaneous: querying Ollama for strategy={strategy}")
         resp = query_ollama(prompt_text)
+        print(f'[SPEECH] Spontaneous Ollama response: "{(resp or "")[:100]}"')
         teensy_send_command("STOP_THINKING")
 
         # ═══ PHASE 3: DELIVERY (speaking + movement) ═══
@@ -2786,9 +2833,12 @@ def process_narrative_speech(strategy, saved_state):
         tts_volume = "-40%" if strategy in QUIET_STRATEGIES else None
 
         try:
+            print(f"[SPEECH] Spontaneous TTS: \"{clean[:60]}\" (vol={tts_volume})")
             audio = run_tts_sync(clean, volume=tts_volume)
             socketio.emit('audio', {'base64': audio})
+            print(f"[SPEECH] Spontaneous audio sent to browser ({len(audio)} base64 chars)")
         except Exception as tts_err:
+            print(f"[SPEECH] Spontaneous TTS failed: {tts_err}\n{traceback.format_exc()}")
             socketio.emit('log', {'message': f'TTS failed: {tts_err}', 'level': 'error'})
 
         speech_duration = max(1.0, min(len(clean) * 0.08, 30.0))
@@ -2903,11 +2953,16 @@ def process_narrative_speech(strategy, saved_state):
         socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
 
     except Exception as e:
-        teensy_send_command("STOP_THINKING")
-        teensy_send_command("STOP_SPEAKING")
-        teensy_send_command("IDLE")
-        teensy_send_command("SPOKE")
-        socketio.emit('log', {'message': f'Narrative speech error: {e}', 'level': 'error'})
+        tb = traceback.format_exc()
+        print(f"[SPEECH] process_narrative_speech FAILED: {e}\n{tb}")
+        try:
+            teensy_send_command("STOP_THINKING")
+            teensy_send_command("STOP_SPEAKING")
+            teensy_send_command("IDLE")
+            teensy_send_command("SPOKE")
+        except Exception:
+            pass  # Don't let cleanup failure mask the original error
+        socketio.emit('log', {'message': f'Narrative speech error: {e}\n{tb}', 'level': 'error'})
         socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
     finally:
         processing_lock.release()
@@ -3512,6 +3567,7 @@ if __name__ == '__main__':
     init_whisper()
 
     # Phase 1H: OPT-3 — Validate Ollama model availability
+    print(f"  Ollama host: {CONFIG['ollama_host']}")
     try:
         result = ollama.list()
         # Handle both old dict API and new object API (ollama >= 0.4)
@@ -3521,13 +3577,22 @@ if __name__ == '__main__':
             name = m.get('name', '') if isinstance(m, dict) else getattr(m, 'model', getattr(m, 'name', ''))
             if name:
                 names.append(name)
-        if not any(CONFIG['ollama_model'] in n for n in names):
-            print(f"  WARNING: Model '{CONFIG['ollama_model']}' not found!")
-            print(f"  Available: {', '.join(names[:5])}")
+        # Check text model (used for speech)
+        text_model = CONFIG['ollama_model']
+        if not any(text_model in n for n in names):
+            print(f"  *** SPEECH MODEL '{text_model}' NOT FOUND — speech will fail! ***")
+            print(f"  Available: {', '.join(names[:10])}")
+            print(f"  Fix: run 'ollama pull {text_model}'")
         else:
-            print(f"  Ollama model: {CONFIG['ollama_model']} OK")
+            print(f"  Speech model: {text_model} OK")
+        # Check vision model (used for scene descriptions)
+        vision_model = CONFIG.get('ollama_vision_model', 'llava')
+        if not any(vision_model in n for n in names):
+            print(f"  WARNING: Vision model '{vision_model}' not found")
+        else:
+            print(f"  Vision model: {vision_model} OK")
     except Exception as e:
-        print(f"  WARNING: Cannot reach Ollama: {e}")
+        print(f"  *** CANNOT REACH OLLAMA: {e} — ALL speech will fail! ***")
 
     print("Connecting to Teensy...")
     connect_teensy()
