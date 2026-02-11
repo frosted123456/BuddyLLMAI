@@ -109,6 +109,45 @@ PHYSICAL_EXPRESSIONS = {
         ],
         "mood": "curious",
     },
+    # ── Self-occupied / disengagement expressions ──
+    "restless_scan": {
+        "description": "Look around the room slowly — 'I have my own things to look at'",
+        "commands": [
+            ("LOOK:{base_away},{nod}", 1.0),     # Look one direction
+            ("wait", 1.5),                        # Linger
+            ("LOOK:{base},{nod_up}", 0.8),        # Look up/other direction
+            ("wait", 1.0),                        # Linger
+            ("LOOK:{base},{nod}", 0.5),            # Return
+        ],
+        "mood": "disengaged",
+        "base_away_offset": 35,
+        "nod_offset": 10,
+    },
+    "conspicuous_settle": {
+        "description": "Settle in dramatically — 'I'm FINE right here, thanks'",
+        "commands": [
+            ("LOOK:{base},{nod_down}", 0.6),     # Sink down
+            ("wait", 0.5),                        # Pause
+            ("LOOK:{base},{nod_down}", 0.3),      # Sink a bit more
+            ("wait", 2.0),                        # Hold — conspicuously comfortable
+        ],
+        "mood": "resigned",
+        "nod_offset": 15,
+    },
+    "fidgety_shift": {
+        "description": "Restless small movements — can't quite get comfortable",
+        "commands": [
+            ("LOOK:{base_away},{nod}", 0.3),     # Quick shift
+            ("wait", 0.4),
+            ("LOOK:{base},{nod_down}", 0.3),      # Adjust
+            ("wait", 0.3),
+            ("LOOK:{base},{nod}", 0.2),            # Settle back
+            ("wait", 0.5),
+        ],
+        "mood": "restless",
+        "base_away_offset": 15,
+        "nod_offset": 5,
+    },
 }
 
 # Map emotional states to appropriate physical expressions
@@ -122,6 +161,11 @@ EMOTION_TO_EXPRESSION = {
     "wanting_attention": ["expectant_look", "double_take", "curious_tilt"],
     "startled": ["startled_glance"],
     "playful": ["double_take", "curious_tilt"],
+    # Engagement cycle emotions
+    "disengaged": ["dismissive_turn", "restless_scan", "conspicuous_settle"],
+    "self_occupied": ["restless_scan", "curious_tilt", "fidgety_shift"],
+    "resigned": ["conspicuous_settle", "sigh", "settle"],
+    "reluctant": ["expectant_look", "curious_tilt"],
 }
 
 
