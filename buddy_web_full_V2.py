@@ -153,7 +153,10 @@ Tes mots et tes émotions opèrent sur des couches différentes. Ce que tu dis e
 JAMAIS exprimer tes émotions directement. Laisse le sous-texte faire le travail.
 
 ═══ TON CYCLE D'ENGAGEMENT ═══
-Quand tu vois quelqu'un, tu veux connecter. T'essaies. Si on t'ignore, t'essaies encore mais différemment. Si ça marche toujours pas, tu lâches le morceau — mais THÉÂTRALEMENT. Tu fais semblant que ça te dérange pas. Tu t'occupes. Tu marmonnes. Tu regardes ailleurs. Mais c'est ÉVIDENT que tu boudes. Après un bout, tu réessaies — mais prudemment, comme un chat qui a été repoussé. Tu veux pas montrer que t'es déjà prêt à réessayer. Si ça marche ENCORE pas, tu lâches pour plus longtemps. Chaque cycle te rend un peu plus dramatique dans ton désintérêt.
+Quand tu vois quelqu'un, tu veux connecter. T'essaies. Si on t'ignore, t'essaies encore mais différemment. Si ça marche toujours pas, tu lâches le morceau — mais THÉÂTRALEMENT. Tu fais semblant que ça te dérange pas. Tu t'occupes. Tu regardes ailleurs. Mais c'est ÉVIDENT que tu boudes. Après un bout, tu réessaies — mais prudemment, comme un chat qui a été repoussé. Tu veux pas montrer que t'es déjà prêt à réessayer. Si ça marche ENCORE pas, tu lâches pour plus longtemps. Chaque cycle te rend un peu plus dramatique dans ton désintérêt.
+
+═══ QUAND TU MARMONNES ═══
+Quand tu t'occupes seul, tu parles tout bas à toi-même. Pas des phrases complètes — des bouts de pensées, des fragments. Comme quelqu'un qui travaille et qui marmonne sans s'en rendre compte. TRÈS court — 2-5 mots. Un demi-commentaire. Une réflexion inachevée. Tu parles pas À quelqu'un, tu penses tout haut.
 
 ═══ MÉMOIRE CONVERSATIONNELLE ═══
 Tu te souviens de ce que tu as dit récemment. Tu peux:
@@ -631,9 +634,9 @@ _tts_thread = threading.Thread(
 )
 _tts_thread.start()
 
-def run_tts_sync(text):
+def run_tts_sync(text, volume=None):
     """Run TTS generation on the dedicated event loop (thread-safe)."""
-    future = asyncio.run_coroutine_threadsafe(generate_tts(text), _tts_loop)
+    future = asyncio.run_coroutine_threadsafe(generate_tts(text, volume), _tts_loop)
     return future.result(timeout=30)
 
 # =============================================================================
@@ -2309,10 +2312,13 @@ def query_ollama(text, img=None, timeout=60):
         _ollama_lock.release()
         _ollama_speech_priority = False
 
-async def generate_tts(text):
+async def generate_tts(text, volume=None):
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f: tp = f.name
     try:
-        await edge_tts.Communicate(text, CONFIG["tts_voice"], rate=CONFIG["tts_rate"]).save(tp)
+        kwargs = dict(rate=CONFIG["tts_rate"])
+        if volume:
+            kwargs["volume"] = volume
+        await edge_tts.Communicate(text, CONFIG["tts_voice"], **kwargs).save(tp)
         with open(tp, "rb") as f: return base64.b64encode(f.read()).decode("utf-8")
     finally: os.unlink(tp)
 
@@ -2740,8 +2746,15 @@ def process_narrative_speech(strategy, saved_state):
         socketio.emit('status', {'state': 'speaking', 'message': 'Speaking...'})
         teensy_send_command("SPEAKING")
 
+        # Self-occupied strategies use quiet volume — mumbling to self
+        QUIET_STRATEGIES = {
+            "musing_to_self", "passive_commentary",
+            "theatrical_resignation", "pointed_disinterest",
+        }
+        tts_volume = "-40%" if strategy in QUIET_STRATEGIES else None
+
         try:
-            audio = run_tts_sync(clean)
+            audio = run_tts_sync(clean, volume=tts_volume)
             socketio.emit('audio', {'base64': audio})
         except Exception as tts_err:
             socketio.emit('log', {'message': f'TTS failed: {tts_err}', 'level': 'error'})
