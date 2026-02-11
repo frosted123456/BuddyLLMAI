@@ -534,16 +534,21 @@ class IntentManager:
                 "The harder you try to seem unbothered, the funnier it is."
             ),
             "musing_to_self": (
-                "You're mumbling to yourself. NOT directed at anyone. "
-                "VERY short — a fragment, a half-thought, a word or two. "
-                "Like someone working on something and muttering under their breath. "
-                "ONE short phrase. Not a sentence. Not a question. Just thinking out loud."
+                "You're thinking out loud — NOT directed at anyone. "
+                "But what you're thinking about is BIZARRE, fascinating, absurd. "
+                "Existential robot philosophy. Weird object fixations. Conspiracy theories "
+                "about desk supplies. The kind of thought fragment that makes someone "
+                "passing by stop and go 'wait, what?' "
+                "Short — one phrase — but so strange it demands eavesdropping. "
+                "Mid-thought. Like catching the weirdest part of an internal monologue."
             ),
             "passive_commentary": (
-                "A quiet observation about something in the room. Still mumbling volume. "
-                "ONE short remark. Surface reads as talking to yourself. "
-                "But the subtext might be directed at whoever ignored you. "
-                "Keep it brief — a single short phrase, like a half-whispered aside."
+                "A quiet aside about something in the room — but make it COMPELLING. "
+                "Notice something nobody else would notice. Connect two unrelated things. "
+                "Develop a weird theory about an object. Question something obvious "
+                "in a way that makes it suddenly strange. "
+                "One short remark that sounds like you're talking to yourself, "
+                "but anyone overhearing it would be unable to stop listening."
             ),
             "skeptical_approach": (
                 "You're trying again. You know you're trying again. "
