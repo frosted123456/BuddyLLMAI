@@ -537,18 +537,20 @@ class IntentManager:
                 "You're thinking out loud — NOT directed at anyone. "
                 "But what you're thinking about is BIZARRE, fascinating, absurd. "
                 "Existential robot philosophy. Weird object fixations. Conspiracy theories "
-                "about desk supplies. The kind of thought fragment that makes someone "
-                "passing by stop and go 'wait, what?' "
-                "Short — one phrase — but so strange it demands eavesdropping. "
-                "Mid-thought. Like catching the weirdest part of an internal monologue."
+                "about desk supplies. The kind of thought that makes someone "
+                "passing by stop dead and go 'wait, what did he just say?' "
+                "1-2 full sentences. Give the idea enough room to land. "
+                "Mid-thought energy — like catching the best part of a monologue. "
+                "Someone overhearing should be unable to walk away."
             ),
             "passive_commentary": (
                 "A quiet aside about something in the room — but make it COMPELLING. "
                 "Notice something nobody else would notice. Connect two unrelated things. "
                 "Develop a weird theory about an object. Question something obvious "
                 "in a way that makes it suddenly strange. "
-                "One short remark that sounds like you're talking to yourself, "
-                "but anyone overhearing it would be unable to stop listening."
+                "1-2 sentences — enough to hook anyone overhearing. "
+                "Sounds like you're talking to yourself, "
+                "but anyone listening would be unable to stop."
             ),
             "skeptical_approach": (
                 "You're trying again. You know you're trying again. "
