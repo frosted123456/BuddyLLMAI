@@ -39,7 +39,7 @@ from pathlib import Path
 import collections
 import random
 
-from flask import Flask, render_template_string, request, jsonify, send_file
+from flask import Flask, render_template_string, request, jsonify, send_file, redirect
 from flask_socketio import SocketIO, emit
 import requests
 from PIL import Image
@@ -659,7 +659,7 @@ last_udp_msg = ""
 last_udp_msg_lock = threading.Lock()
 
 # =============================================================================
-# HTML TEMPLATE
+# HTML TEMPLATE (Merged Main UI + Debug Dashboard + Inner Thoughts)
 # =============================================================================
 
 HTML_TEMPLATE = """
@@ -673,6 +673,7 @@ HTML_TEMPLATE = """
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; padding: 20px; }
+        body.test-mode-active { border: 4px solid #ff3366; }
         .container { max-width: 1400px; margin: 0 auto; }
         h1 { text-align: center; margin-bottom: 20px; color: #00d9ff; }
         .top-bar { display: flex; gap: 15px; margin-bottom: 20px; }
@@ -685,9 +686,9 @@ HTML_TEMPLATE = """
         .status-indicator.error { background: #ff3366; }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
         .status-text { flex: 1; font-size: 14px; }
-        .toggle-settings { background: #16213e; border: none; color: #888; padding: 15px 20px; border-radius: 10px; cursor: pointer; font-size: 14px; }
-        .toggle-settings:hover { background: #1e3a5f; color: #eee; }
-        .toggle-settings.active { background: #1e3a5f; color: #00d9ff; }
+        .toggle-settings, .toggle-debug { background: #16213e; border: none; color: #888; padding: 15px 20px; border-radius: 10px; cursor: pointer; font-size: 14px; }
+        .toggle-settings:hover, .toggle-debug:hover { background: #1e3a5f; color: #eee; }
+        .toggle-settings.active, .toggle-debug.active { background: #1e3a5f; color: #00d9ff; }
         .main-layout { display: flex; gap: 20px; }
         .main-content { flex: 1; }
         .settings-panel { width: 350px; background: #16213e; border-radius: 10px; padding: 20px; display: none; max-height: calc(100vh - 150px); overflow-y: auto; }
@@ -765,31 +766,123 @@ HTML_TEMPLATE = """
         .wake-word-indicator { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #0a0a15; border-radius: 6px; margin-top: 10px; font-size: 12px; }
         .wake-word-indicator .dot { width: 8px; height: 8px; border-radius: 50%; background: #444; }
         .wake-word-indicator .dot.active { background: #9d4edd; animation: pulse 1.5s infinite; }
+
+        /* ═══ Inner Thoughts Panel ═══ */
+        .inner-thoughts-panel { margin-bottom: 20px; }
+        .inner-thoughts-panel h2 { color: #9d4edd; }
+        .thought-section { background: #0a0a15; border-radius: 6px; padding: 12px; margin-bottom: 10px; border-left: 3px solid #9d4edd; }
+        .thought-section h3 { font-size: 11px; text-transform: uppercase; color: #9d4edd; margin-bottom: 8px; letter-spacing: 1px; }
+        .thought-content { font-family: 'Consolas', monospace; font-size: 12px; color: #ccc; white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow-y: auto; line-height: 1.5; }
+        .thought-content:empty::after { content: 'Waiting for data...'; color: #444; font-style: italic; }
+
+        /* ═══ Debug Section (collapsible) ═══ */
+        .debug-section { display: none; margin-top: 20px; }
+        .debug-section.visible { display: block; }
+        .debug-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+        @media (max-width: 900px) { .debug-grid { grid-template-columns: 1fr; } }
+        .debug-section .panel h2 { font-size: 11px; color: #00d9ff; border-bottom: 1px solid #333; padding-bottom: 6px; }
+        .panel-full { grid-column: span 2; }
+        @media (max-width: 900px) { .panel-full { grid-column: span 1; } }
+
+        /* Debug: video */
+        .video-container { position: relative; width: 400px; max-width: 100%; }
+        .video-container img { width: 100%; border-radius: 6px; background: #0a0a15; display: block; }
+        .video-overlay { position: absolute; bottom: 6px; left: 6px; background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 4px; font-family: 'Consolas', monospace; font-size: 11px; color: #00ff88; }
+
+        /* Debug: data items */
+        .data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .data-item { background: #0a0a15; padding: 8px 10px; border-radius: 5px; }
+        .data-label { font-size: 10px; text-transform: uppercase; color: #666; margin-bottom: 3px; }
+        .data-value { font-size: 15px; color: #eee; font-family: 'Consolas', monospace; }
+        .data-item.full { grid-column: span 2; }
+
+        /* Debug: face indicator */
+        .face-indicator { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: #0a0a15; border-radius: 6px; margin-bottom: 10px; }
+        .face-dot { width: 40px; height: 40px; border-radius: 50%; background: #ff3366; transition: background 0.3s; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: bold; color: #fff; }
+        .face-dot.detected { background: #00ff88; color: #1a1a2e; }
+        .face-text { font-size: 18px; font-weight: 600; }
+
+        /* Debug: crosshair & confidence */
+        .crosshair-container { display: flex; justify-content: center; margin: 8px 0; }
+        canvas.crosshair { background: #0a0a15; border-radius: 6px; border: 1px solid #333; }
+        .confidence-bar-bg { height: 10px; background: #333; border-radius: 5px; overflow: hidden; margin-top: 4px; }
+        .confidence-bar-fill { height: 100%; border-radius: 5px; background: linear-gradient(90deg, #ff3366, #ffcc00, #00ff88); transition: width 0.2s; }
+        .udp-terminal { background: #0a0a15; padding: 8px 12px; border-radius: 5px; font-family: 'Consolas', monospace; font-size: 13px; color: #00ff88; border-left: 3px solid #00ff88; margin-top: 8px; word-break: break-all; min-height: 24px; }
+
+        /* Debug: servo gauges */
+        .servo-gauges { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+        .servo-gauge { background: #0a0a15; padding: 10px; border-radius: 6px; text-align: center; flex: 1; min-width: 90px; }
+        .servo-gauge .gauge-label { font-size: 10px; color: #666; text-transform: uppercase; margin-bottom: 4px; }
+        .servo-gauge .gauge-value { font-size: 22px; font-weight: bold; color: #00d9ff; font-family: 'Consolas', monospace; }
+        .servo-gauge .gauge-bar { height: 6px; background: #333; border-radius: 3px; overflow: hidden; margin-top: 6px; }
+        .servo-gauge .gauge-bar-fill { height: 100%; background: #00d9ff; border-radius: 3px; transition: width 0.2s; }
+
+        /* Debug: status rows */
+        .status-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+        .status-dot { width: 10px; height: 10px; border-radius: 50%; background: #666; flex-shrink: 0; }
+        .status-dot.active { background: #00ff88; }
+        .status-dot.inactive { background: #ff3366; }
+
+        /* Debug: coord history */
+        canvas.coord-history { width: 100%; height: 200px; background: #0a0a15; border-radius: 6px; display: block; }
+
+        /* Debug: test mode */
+        .test-btn { padding: 14px 28px; border: none; border-radius: 8px; font-size: 15px; font-weight: 700; cursor: pointer; transition: all 0.2s; margin-right: 10px; }
+        .test-btn.activate { background: #ff3366; color: #fff; }
+        .test-btn.activate:hover { background: #e0294f; }
+        .test-btn.deactivate { background: #00ff88; color: #1a1a2e; }
+        .test-btn.deactivate:hover { background: #00dd77; }
+        .slider-row { margin-bottom: 12px; }
+        .slider-row label { display: block; font-size: 12px; color: #888; margin-bottom: 4px; }
+        .slider-row input[type="range"] { width: 100%; }
+        .slider-row .slider-value { font-size: 12px; color: #00d9ff; text-align: right; font-family: 'Consolas', monospace; }
+        .toggle-btn { padding: 8px 16px; border: 1px solid #444; border-radius: 6px; background: #0a0a15; color: #888; cursor: pointer; font-size: 12px; margin-right: 8px; margin-bottom: 8px; transition: all 0.2s; }
+        .toggle-btn.active { border-color: #00ff88; color: #00ff88; background: #0a2a15; }
+        .action-btn { padding: 8px 16px; border: none; border-radius: 6px; background: #333; color: #eee; cursor: pointer; font-size: 12px; margin-right: 8px; margin-bottom: 8px; transition: all 0.2s; }
+        .action-btn:hover { background: #444; }
+        .action-btn.primary { background: #00d9ff; color: #1a1a2e; }
+        .action-btn.primary:hover { background: #00b8d9; }
+        .controls-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+        .sliders-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-top: 10px; }
+        @media (max-width: 900px) { .sliders-grid { grid-template-columns: 1fr; } }
+
+        /* Debug: diagnostics */
+        .diag-result { background: #0a0a15; padding: 6px 10px; border-radius: 4px; font-family: 'Consolas', monospace; font-size: 12px; color: #888; margin-top: 4px; min-height: 22px; }
+        .diag-result.success { color: #00ff88; }
+        .diag-result.error { color: #ff3366; }
+        .diag-section { margin-bottom: 14px; }
+        .diag-label { font-size: 11px; color: #666; margin-bottom: 4px; }
+        .stream-health { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 10px; }
+        .health-item { background: #0a0a15; padding: 6px 8px; border-radius: 4px; text-align: center; }
+        .health-item .h-label { font-size: 9px; color: #666; text-transform: uppercase; }
+        .health-item .h-value { font-size: 14px; color: #eee; font-family: 'Consolas', monospace; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🤖 Buddy Voice Assistant</h1>
+        <h1>Buddy Voice Assistant</h1>
         <div class="top-bar">
             <div class="status-bar">
                 <div class="status-indicator" id="statusIndicator"></div>
                 <div class="status-text" id="statusText">Initializing...</div>
             </div>
-            <button class="toggle-settings" id="toggleSettings">⚙️ Settings</button>
+            <button class="toggle-debug" id="toggleDebug">Debug Tools</button>
+            <button class="toggle-settings" id="toggleSettings">Settings</button>
         </div>
         <div class="main-layout">
             <div class="main-content">
+                <!-- ═══ Main UI Grid ═══ -->
                 <div class="main-grid">
                     <div class="panel">
-                        <h2>📷 Camera View</h2>
+                        <h2>Camera View</h2>
                         <div class="camera-view" id="cameraView"><span class="camera-placeholder">No image captured</span></div>
                     </div>
                     <div class="panel">
-                        <h2>💬 Conversation</h2>
+                        <h2>Conversation</h2>
                         <div class="conversation" id="conversation"></div>
                     </div>
                     <div class="panel">
-                        <h2>🤖 Buddy State</h2>
+                        <h2>Buddy State</h2>
                         <div class="teensy-status">
                             <div class="teensy-dot" id="teensyDot"></div>
                             <span id="teensyStatus">Teensy: connecting...</span>
@@ -811,9 +904,28 @@ HTML_TEMPLATE = """
                         </div>
                     </div>
                 </div>
+
+                <!-- ═══ Inner Thoughts Panel ═══ -->
+                <div class="panel inner-thoughts-panel">
+                    <h2>Inner Thoughts</h2>
+                    <div class="thought-section">
+                        <h3>Emotional State</h3>
+                        <div class="thought-content" id="thoughtState"></div>
+                    </div>
+                    <div class="thought-section">
+                        <h3>Narrative Context (Memory)</h3>
+                        <div class="thought-content" id="thoughtNarrative"></div>
+                    </div>
+                    <div class="thought-section">
+                        <h3>Intent (Social Goal)</h3>
+                        <div class="thought-content" id="thoughtIntent"></div>
+                    </div>
+                </div>
+
+                <!-- ═══ Controls ═══ -->
                 <div class="controls">
-                    <button class="btn btn-talk" id="btnTalk" disabled>🎤 Hold to Talk</button>
-                    <button class="btn btn-camera" id="btnCamera" disabled>📸</button>
+                    <button class="btn btn-talk" id="btnTalk" disabled>Hold to Talk</button>
+                    <button class="btn btn-camera" id="btnCamera" disabled>Camera</button>
                 </div>
                 <div class="panel" style="margin-bottom:20px;">
                     <div class="wake-word-indicator"><div class="dot" id="wakeWordDot"></div><span id="wakeWordStatus">Wake word: loading...</span></div>
@@ -826,23 +938,136 @@ HTML_TEMPLATE = """
                     </div>
                     <div class="checkbox-row"><input type="checkbox" id="includeVision" checked><label for="includeVision">Include camera image with message</label></div>
                 </div>
-                <div class="panel"><h2>📋 Log</h2><div class="log" id="log"></div></div>
+                <div class="panel"><h2>Log</h2><div class="log" id="log"></div></div>
+
+                <!-- ═══════════════════════════════════════════════════ -->
+                <!-- DEBUG SECTION (toggled by Debug Tools button)      -->
+                <!-- ═══════════════════════════════════════════════════ -->
+                <div class="debug-section" id="debugSection">
+                    <div class="debug-grid">
+                        <!-- Debug: Live Video -->
+                        <div class="panel">
+                            <h2>Live Video Stream</h2>
+                            <div class="video-container">
+                                <img id="videoStream" src="" alt="Stream offline" onerror="this.alt='Stream offline'">
+                                <div class="video-overlay">
+                                    <span id="streamFpsOverlay">Stream: --fps</span> |
+                                    <span id="detectFpsOverlay">Detect: --fps</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Debug: Tracking Data -->
+                        <div class="panel">
+                            <h2>Real-Time Tracking Data</h2>
+                            <div class="face-indicator">
+                                <div class="face-dot" id="faceDot">NO</div>
+                                <div class="face-text" id="faceText">No Face Detected</div>
+                            </div>
+                            <div class="data-grid">
+                                <div class="data-item"><div class="data-label">Position X</div><div class="data-value" id="faceX">--</div></div>
+                                <div class="data-item"><div class="data-label">Position Y</div><div class="data-value" id="faceY">--</div></div>
+                                <div class="data-item"><div class="data-label">Velocity X</div><div class="data-value" id="faceVX">--</div></div>
+                                <div class="data-item"><div class="data-label">Velocity Y</div><div class="data-value" id="faceVY">--</div></div>
+                                <div class="data-item"><div class="data-label">Face Size</div><div class="data-value" id="faceSize">-- x --</div></div>
+                                <div class="data-item"><div class="data-label">Person Count</div><div class="data-value" id="personCount">--</div></div>
+                                <div class="data-item full"><div class="data-label">Confidence</div><div class="confidence-bar-bg"><div class="confidence-bar-fill" id="confidenceBar" style="width:0%"></div></div><div class="data-value" style="font-size:12px;margin-top:2px;" id="confidenceVal">--</div></div>
+                                <div class="data-item"><div class="data-label">Sequence #</div><div class="data-value" id="seqNum">--</div></div>
+                                <div class="data-item"><div class="data-label">Detect FPS / Stream FPS</div><div class="data-value"><span id="detectFps">--</span> / <span id="streamFps">--</span></div></div>
+                            </div>
+                            <div class="crosshair-container"><canvas class="crosshair" id="crosshairCanvas" width="200" height="200"></canvas></div>
+                            <div class="udp-terminal" id="udpMsg">Waiting for UDP data...</div>
+                        </div>
+
+                        <!-- Debug: Teensy Response -->
+                        <div class="panel">
+                            <h2>Teensy Response</h2>
+                            <div class="servo-gauges">
+                                <div class="servo-gauge"><div class="gauge-label">Base (Pan)</div><div class="gauge-value" id="servoBaseVal">90</div><div class="gauge-bar"><div class="gauge-bar-fill" id="servoBaseBar" style="width:50%"></div></div></div>
+                                <div class="servo-gauge"><div class="gauge-label">Nod (Tilt)</div><div class="gauge-value" id="servoNodVal">115</div><div class="gauge-bar"><div class="gauge-bar-fill" id="servoNodBar" style="width:50%"></div></div></div>
+                                <div class="servo-gauge"><div class="gauge-label">Tilt (Roll)</div><div class="gauge-value" id="servoTiltVal">85</div><div class="gauge-bar"><div class="gauge-bar-fill" id="servoTiltBar" style="width:50%"></div></div></div>
+                            </div>
+                            <div class="data-grid">
+                                <div class="data-item"><div class="data-label">Behavior</div><span class="behavior-badge" id="dbgBehavior">IDLE</span></div>
+                                <div class="data-item"><div class="data-label">Expression</div><div class="data-value" id="dbgExpression">neutral</div></div>
+                                <div class="data-item"><div class="data-label">Tracking Active</div><div class="status-row"><div class="status-dot" id="trackingDot"></div><span id="trackingLabel">Inactive</span></div></div>
+                                <div class="data-item"><div class="data-label">Tracking Error</div><div class="data-value" id="trackingError">--</div></div>
+                                <div class="data-item"><div class="data-label">PID Output Pan</div><div class="data-value" id="pidPan">--</div></div>
+                                <div class="data-item"><div class="data-label">PID Output Tilt</div><div class="data-value" id="pidTilt">--</div></div>
+                            </div>
+                        </div>
+
+                        <!-- Debug: Coordinate History -->
+                        <div class="panel">
+                            <h2>Coordinate History (Last 5s)</h2>
+                            <canvas class="coord-history" id="coordCanvas" width="600" height="200"></canvas>
+                            <div style="display:flex;gap:16px;margin-top:6px;font-size:11px;">
+                                <span style="color:#00ff88;">&#9644; face_x</span>
+                                <span style="color:#3b82f6;">&#9644; face_y</span>
+                                <span style="color:#00ff88;opacity:0.5;">- - servo_base</span>
+                                <span style="color:#3b82f6;opacity:0.5;">- - servo_nod</span>
+                            </div>
+                        </div>
+
+                        <!-- Debug: Test Mode (full width) -->
+                        <div class="panel panel-full">
+                            <h2>Face Tracking Test Mode</h2>
+                            <div style="display:flex;align-items:center;gap:16px;margin-bottom:12px;">
+                                <button class="test-btn activate" id="testModeBtn" onclick="toggleTestMode()">ACTIVATE TEST MODE</button>
+                                <span id="testModeStatus" style="color:#888;font-size:13px;">Test mode inactive</span>
+                            </div>
+                            <div class="sliders-grid">
+                                <div class="slider-row"><label>Base Servo (10-170): <span class="slider-value" id="sliderBaseVal">90</span></label><input type="range" id="sliderBase" min="10" max="170" value="90" oninput="sendManualServo()"></div>
+                                <div class="slider-row"><label>Nod Servo (80-150): <span class="slider-value" id="sliderNodVal">115</span></label><input type="range" id="sliderNod" min="80" max="150" value="115" oninput="sendManualServo()"></div>
+                                <div class="slider-row"><label>Tilt Servo (20-150): <span class="slider-value" id="sliderTiltVal">85</span></label><input type="range" id="sliderTilt" min="20" max="150" value="85" oninput="sendManualServo()"></div>
+                            </div>
+                            <div class="controls-row">
+                                <button class="toggle-btn" id="bodySchemaBtn" onclick="toggleBodySchema()">Body Schema: ON</button>
+                                <button class="action-btn" onclick="resetPID()">Reset PID</button>
+                                <button class="action-btn primary" onclick="downloadCSV()">Download CSV</button>
+                            </div>
+                        </div>
+
+                        <!-- Debug: Diagnostics (full width) -->
+                        <div class="panel panel-full">
+                            <h2>Diagnostic Tools</h2>
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+                                <div>
+                                    <div class="diag-section"><button class="action-btn" onclick="pingESP32()">Ping ESP32</button><div class="diag-result" id="pingResult">--</div></div>
+                                    <div class="diag-section"><button class="action-btn" onclick="testUDP()">Test UDP Packet</button><div class="diag-result" id="udpResult">--</div></div>
+                                    <div class="diag-section"><button class="action-btn" onclick="showRawFrame()">Show Raw Frame</button><div class="diag-result" id="rawFrameResult">--</div></div>
+                                </div>
+                                <div>
+                                    <div class="diag-label">Stream Health</div>
+                                    <div class="stream-health">
+                                        <div class="health-item"><div class="h-label">Frames Recv</div><div class="h-value" id="framesRecv">0</div></div>
+                                        <div class="health-item"><div class="h-label">Dropped</div><div class="h-value" id="framesDropped">0</div></div>
+                                        <div class="health-item"><div class="h-label">Reconnects</div><div class="h-value" id="reconnections">0</div></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <!-- ═══ END DEBUG SECTION ═══ -->
+
             </div>
+            <!-- Settings Panel (right sidebar) -->
             <div class="settings-panel" id="settingsPanel">
                 <div class="settings-section">
-                    <h3>🔌 Connection</h3>
+                    <h3>Connection</h3>
                     <div class="setting-row"><label>ESP32 Bridge IP</label><input type="text" id="settingEsp32Ip" value="192.168.1.100"></div>
                     <div class="setting-row"><label>Comm Mode</label><select id="settingCommMode"><option value="websocket" selected>WebSocket (WiFi)</option><option value="serial">USB Serial</option></select></div>
                     <div class="setting-row-inline"><input type="checkbox" id="settingTeensyAutoDetect" checked><label for="settingTeensyAutoDetect">Auto-detect Teensy port (serial mode)</label></div>
                     <div class="setting-row"><label>Manual Port (serial mode)</label><input type="text" id="settingTeensyPort" value="COM12"></div>
-                    <button class="btn-export" id="btnReconnectTeensy">🔄 Reconnect Teensy</button>
+                    <button class="btn-export" id="btnReconnectTeensy">Reconnect Teensy</button>
                 </div>
                 <div class="settings-section">
-                    <h3>🧠 Behavior</h3>
+                    <h3>Behavior</h3>
                     <div class="setting-row-inline"><input type="checkbox" id="settingSpontaneous"><label for="settingSpontaneous">Spontaneous Speech</label></div>
                 </div>
                 <div class="settings-section">
-                    <h3>🎤 Wake Word</h3>
+                    <h3>Wake Word</h3>
                     <div class="setting-row-inline"><input type="checkbox" id="settingWakeWordEnabled" checked><label for="settingWakeWordEnabled">Enable wake word detection</label></div>
                     <div class="setting-row"><label>Wake Word</label><select id="settingWakeWord"><option value="jarvis" selected>Jarvis</option><option value="computer">Computer</option><option value="alexa">Alexa</option><option value="hey google">Hey Google</option><option value="terminator">Terminator</option></select></div>
                     <div class="setting-row"><label>Custom .ppn file (optional)</label><input type="text" id="settingWakeWordPath" value="" placeholder="C:/path/to/wake_word.ppn"></div>
@@ -850,35 +1075,38 @@ HTML_TEMPLATE = """
                     <div class="setting-row"><label>Sensitivity (0.0-1.0)</label><input type="range" id="settingWakeWordSensitivity" min="0" max="1" step="0.05" value="0.7"><div class="range-value" id="sensitivityValue">0.7</div></div>
                 </div>
                 <div class="settings-section">
-                    <h3>🔊 Recording</h3>
+                    <h3>Recording</h3>
                     <div class="setting-row"><label>Silence Threshold</label><input type="range" id="settingSilenceThreshold" min="0" max="2000" step="50" value="500"><div class="range-value" id="silenceThresholdValue">500</div></div>
                     <div class="setting-row"><label>Silence Duration (s)</label><input type="range" id="settingSilenceDuration" min="0.5" max="5" step="0.25" value="1.5"><div class="range-value" id="silenceDurationValue">1.5s</div></div>
                     <div class="setting-row"><label>Max Recording (s)</label><input type="range" id="settingMaxRecordingTime" min="3" max="30" step="1" value="10"><div class="range-value" id="maxRecordingTimeValue">10s</div></div>
                     <div class="setting-row"><label>Pre-speech Timeout (s)</label><input type="range" id="settingPreSpeechTimeout" min="1" max="10" step="0.5" value="3"><div class="range-value" id="preSpeechTimeoutValue">3s</div></div>
                 </div>
                 <div class="settings-section">
-                    <h3>📷 Camera</h3>
+                    <h3>Camera</h3>
                     <div class="setting-row"><label>ESP32-CAM URL</label><input type="text" id="settingCamUrl" value="http://192.168.2.65/capture"></div>
-                    <div class="setting-row"><label>Image Rotation</label><select id="settingImageRotation"><option value="0">0°</option><option value="90" selected>90°</option><option value="180">180°</option><option value="270">270°</option></select></div>
+                    <div class="setting-row"><label>Image Rotation</label><select id="settingImageRotation"><option value="0">0</option><option value="90" selected>90</option><option value="180">180</option><option value="270">270</option></select></div>
                 </div>
                 <div class="settings-section">
-                    <h3>🧠 AI Models</h3>
+                    <h3>AI Models</h3>
                     <div class="setting-row"><label>Whisper Model</label><select id="settingWhisperModel"><option value="tiny">Tiny</option><option value="base" selected>Base</option><option value="small">Small</option><option value="medium">Medium</option></select></div>
                     <div class="setting-row"><label>Language</label><select id="settingWhisperLanguage"><option value="auto" selected>Auto</option><option value="en">English</option><option value="fr">French</option></select></div>
                     <div class="setting-row"><label>Ollama Model</label><input type="text" id="settingOllamaModel" value="llava"></div>
                 </div>
                 <div class="settings-section">
-                    <h3>🔈 TTS</h3>
+                    <h3>TTS</h3>
                     <div class="setting-row"><label>Voice</label><select id="settingTtsVoice"><option value="en-US-GuyNeural" selected>Guy (US)</option><option value="en-US-JennyNeural">Jenny (US)</option><option value="en-GB-RyanNeural">Ryan (UK)</option><option value="fr-CA-AntoineNeural">Antoine (QC)</option><option value="fr-CA-SylvieNeural">Sylvie (QC)</option></select></div>
                     <div class="setting-row"><label>Rate</label><select id="settingTtsRate"><option value="-15%">Slow</option><option value="+0%">Normal</option><option value="+10%" selected>Slightly Fast</option><option value="+20%">Fast</option></select></div>
                 </div>
-                <button class="btn-export" id="btnApplySettings">✓ Apply Settings</button>
-                <button class="btn-export" id="btnExportConfig">📋 Export Config</button>
+                <button class="btn-export" id="btnApplySettings">Apply Settings</button>
+                <button class="btn-export" id="btnExportConfig">Export Config</button>
             </div>
         </div>
     </div>
     <audio id="audioPlayer"></audio>
     <script>
+        // ═══════════════════════════════════════════════════════════
+        // MAIN UI — Socket.IO + Controls
+        // ═══════════════════════════════════════════════════════════
         const socket = io();
         const statusIndicator = document.getElementById('statusIndicator');
         const statusText = document.getElementById('statusText');
@@ -897,11 +1125,11 @@ HTML_TEMPLATE = """
         const teensyDot = document.getElementById('teensyDot');
         const teensyStatus = document.getElementById('teensyStatus');
         let mediaRecorder, audioChunks = [], isRecording = false;
-        
+
         socket.on('connect', () => { log('Connected', 'success'); setStatus('ready', 'Ready - Say "Jarvis" or Hold to Talk'); enableControls(true); });
         socket.on('disconnect', () => { log('Disconnected', 'error'); setStatus('error', 'Disconnected'); enableControls(false); });
         socket.on('status', (d) => { setStatus(d.state, d.message); log(d.message, 'info'); });
-        socket.on('image', (d) => { cameraView.innerHTML = `<img src="data:image/jpeg;base64,${d.base64}">`; });
+        socket.on('image', (d) => { cameraView.innerHTML = '<img src="data:image/jpeg;base64,' + d.base64 + '">'; });
         socket.on('transcript', (d) => { addMessage('user', d.text); });
         socket.on('response', (d) => { addMessage('buddy', d.text); });
         socket.on('audio', (d) => { audioPlayer.src = 'data:audio/mp3;base64,' + d.base64; audioPlayer.play(); });
@@ -909,8 +1137,8 @@ HTML_TEMPLATE = """
         socket.on('log', (d) => { log(d.message, d.level || 'info'); });
         socket.on('audio_level', (d) => { const l = Math.min(100, (d.level / 2000) * 100); audioMeterFill.style.width = l + '%'; audioMeterFill.classList.toggle('loud', d.level > 500); });
         socket.on('wake_word_detected', () => { log('Wake word!', 'wakeword'); wakeWordDot.classList.add('active'); setTimeout(() => wakeWordDot.classList.remove('active'), 2000); });
-        socket.on('wake_word_status', (d) => { wakeWordDot.classList.toggle('active', d.enabled); wakeWordStatus.textContent = d.enabled ? `"${d.word}" listening` : 'disabled'; });
-        socket.on('teensy_status', (d) => { teensyDot.classList.toggle('connected', d.connected); teensyDot.classList.toggle('disconnected', !d.connected); teensyStatus.textContent = d.connected ? `Teensy: ${d.port}` : 'Teensy: disconnected'; });
+        socket.on('wake_word_status', (d) => { wakeWordDot.classList.toggle('active', d.enabled); wakeWordStatus.textContent = d.enabled ? '"' + d.word + '" listening' : 'disabled'; });
+        socket.on('teensy_status', (d) => { teensyDot.classList.toggle('connected', d.connected); teensyDot.classList.toggle('disconnected', !d.connected); teensyStatus.textContent = d.connected ? 'Teensy: ' + d.port : 'Teensy: disconnected'; });
         socket.on('buddy_state', (d) => {
             document.getElementById('emotionBadge').textContent = d.emotion || 'NEUTRAL';
             document.getElementById('emotionBadge').className = 'emotion-badge ' + (d.emotion || 'NEUTRAL');
@@ -947,18 +1175,25 @@ HTML_TEMPLATE = """
             document.getElementById('settingTtsRate').value = d.tts_rate || '+10%';
             updateRanges();
         });
-        
+
+        // ═══ Inner Thoughts ═══
+        socket.on('inner_thought', (d) => {
+            document.getElementById('thoughtState').textContent = d.buddy_state || '';
+            document.getElementById('thoughtNarrative').textContent = d.narrative_context || '';
+            document.getElementById('thoughtIntent').textContent = d.intent_context || '';
+        });
+
         function setStatus(s, m) { statusIndicator.className = 'status-indicator ' + s; statusText.textContent = m; }
-        function log(m, l='info') { const e = document.createElement('div'); e.className = 'log-entry ' + l; e.textContent = `[${new Date().toLocaleTimeString()}] ${m}`; logDiv.appendChild(e); logDiv.scrollTop = logDiv.scrollHeight; }
-        function addMessage(t, txt) { const m = document.createElement('div'); m.className = 'message ' + t; m.innerHTML = `<div class="message-label">${t === 'user' ? 'You' : 'Buddy'}</div><div class="message-text">${txt}</div>`; conversation.appendChild(m); conversation.scrollTop = conversation.scrollHeight; }
+        function log(m, l) { l = l || 'info'; const e = document.createElement('div'); e.className = 'log-entry ' + l; e.textContent = '[' + new Date().toLocaleTimeString() + '] ' + m; logDiv.appendChild(e); logDiv.scrollTop = logDiv.scrollHeight; }
+        function addMessage(t, txt) { const m = document.createElement('div'); m.className = 'message ' + t; m.innerHTML = '<div class="message-label">' + (t === 'user' ? 'You' : 'Buddy') + '</div><div class="message-text">' + txt + '</div>'; conversation.appendChild(m); conversation.scrollTop = conversation.scrollHeight; }
         function enableControls(e) { btnTalk.disabled = !e; btnCamera.disabled = !e; textInput.disabled = !e; btnSend.disabled = !e; }
         function updateRanges() { document.getElementById('sensitivityValue').textContent = document.getElementById('settingWakeWordSensitivity').value; document.getElementById('silenceThresholdValue').textContent = document.getElementById('settingSilenceThreshold').value; document.getElementById('silenceDurationValue').textContent = document.getElementById('settingSilenceDuration').value + 's'; document.getElementById('maxRecordingTimeValue').textContent = document.getElementById('settingMaxRecordingTime').value + 's'; document.getElementById('preSpeechTimeoutValue').textContent = document.getElementById('settingPreSpeechTimeout').value + 's'; }
-        
+
         async function initAudio() { try { const s = await navigator.mediaDevices.getUserMedia({audio:true}); mediaRecorder = new MediaRecorder(s); mediaRecorder.ondataavailable = e => audioChunks.push(e.data); mediaRecorder.onstop = async () => { const b = new Blob(audioChunks, {type:'audio/webm'}); audioChunks = []; const r = new FileReader(); r.onloadend = () => socket.emit('audio_input', {audio: r.result.split(',')[1], include_vision: includeVision.checked}); r.readAsDataURL(b); }; log('Mic ready', 'success'); } catch(e) { log('Mic error: ' + e.message, 'error'); } }
-        
-        btnTalk.addEventListener('mousedown', () => { if(mediaRecorder && !isRecording) { isRecording = true; audioChunks = []; mediaRecorder.start(); btnTalk.classList.add('recording'); btnTalk.textContent = '🔴 Recording...'; setStatus('listening', 'Listening...'); socket.emit('pause_wake_word'); } });
-        btnTalk.addEventListener('mouseup', () => { if(isRecording) { isRecording = false; mediaRecorder.stop(); btnTalk.classList.remove('recording'); btnTalk.textContent = '🎤 Hold to Talk'; socket.emit('resume_wake_word'); } });
-        btnTalk.addEventListener('mouseleave', () => { if(isRecording) { isRecording = false; mediaRecorder.stop(); btnTalk.classList.remove('recording'); btnTalk.textContent = '🎤 Hold to Talk'; socket.emit('resume_wake_word'); } });
+
+        btnTalk.addEventListener('mousedown', () => { if(mediaRecorder && !isRecording) { isRecording = true; audioChunks = []; mediaRecorder.start(); btnTalk.classList.add('recording'); btnTalk.textContent = 'Recording...'; setStatus('listening', 'Listening...'); socket.emit('pause_wake_word'); } });
+        btnTalk.addEventListener('mouseup', () => { if(isRecording) { isRecording = false; mediaRecorder.stop(); btnTalk.classList.remove('recording'); btnTalk.textContent = 'Hold to Talk'; socket.emit('resume_wake_word'); } });
+        btnTalk.addEventListener('mouseleave', () => { if(isRecording) { isRecording = false; mediaRecorder.stop(); btnTalk.classList.remove('recording'); btnTalk.textContent = 'Hold to Talk'; socket.emit('resume_wake_word'); } });
         btnCamera.addEventListener('click', () => { socket.emit('capture_image'); log('Capturing...', 'info'); });
         btnSend.addEventListener('click', () => { const t = textInput.value.trim(); if(t) { socket.emit('text_input', {text: t, include_vision: includeVision.checked}); textInput.value = ''; } });
         textInput.addEventListener('keypress', e => { if(e.key === 'Enter') btnSend.click(); });
@@ -981,7 +1216,7 @@ HTML_TEMPLATE = """
             log('Settings applied', 'success');
         });
         document.getElementById('btnExportConfig').addEventListener('click', () => { navigator.clipboard.writeText(JSON.stringify({wake_word: document.getElementById('settingWakeWord').value, wake_word_sensitivity: parseFloat(document.getElementById('settingWakeWordSensitivity').value)}, null, 2)); log('Config copied', 'success'); });
-        
+
         // Vision pipeline health check
         setInterval(async () => {
             try {
@@ -990,12 +1225,10 @@ HTML_TEMPLATE = """
                 const dot = document.getElementById('visionDot');
                 const txt = document.getElementById('visionStatus');
                 if (d.ok) {
-                    dot.classList.add('connected');
-                    dot.classList.remove('disconnected');
+                    dot.classList.add('connected'); dot.classList.remove('disconnected');
                     txt.textContent = 'Vision: ' + (d.tracking_fps || 0).toFixed(0) + 'fps, ' + (d.latency_ms || 0).toFixed(0) + 'ms';
                 } else {
-                    dot.classList.add('disconnected');
-                    dot.classList.remove('connected');
+                    dot.classList.add('disconnected'); dot.classList.remove('connected');
                     txt.textContent = 'Vision: offline';
                 }
             } catch(e) {
@@ -1009,433 +1242,65 @@ HTML_TEMPLATE = """
             socket.emit('toggle_spontaneous', { enabled: e.target.checked });
         });
 
-        initAudio(); updateRanges(); socket.emit('get_config');
-    </script>
-</body>
-</html>
-"""
+        // ═══════════════════════════════════════════════════════════
+        // DEBUG SECTION — Toggle + All Debug Functionality
+        // ═══════════════════════════════════════════════════════════
+        let debugVisible = false;
+        document.getElementById('toggleDebug').addEventListener('click', () => {
+            debugVisible = !debugVisible;
+            document.getElementById('debugSection').classList.toggle('visible', debugVisible);
+            document.getElementById('toggleDebug').classList.toggle('active', debugVisible);
+            if (debugVisible && !debugInitialized) { initDebug(); }
+        });
 
-# =============================================================================
-# FACE TRACKING DEBUG DASHBOARD HTML
-# =============================================================================
-
-DEBUG_DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Buddy Face Tracking Debug Dashboard</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #1a1a2e; color: #eee; min-height: 100vh; padding: 12px;
-        }
-        body.test-mode-active { border: 4px solid #ff3366; }
-        h1 { text-align: center; color: #00d9ff; margin-bottom: 10px; font-size: 20px; }
-        .subtitle { text-align: center; color: #666; font-size: 12px; margin-bottom: 14px; }
-        .dashboard {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            grid-template-rows: auto auto auto;
-            gap: 12px;
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-        .panel {
-            background: #16213e;
-            border-radius: 8px;
-            padding: 14px;
-        }
-        .panel h2 {
-            font-size: 11px;
-            text-transform: uppercase;
-            color: #00d9ff;
-            margin-bottom: 10px;
-            letter-spacing: 1px;
-            border-bottom: 1px solid #333;
-            padding-bottom: 6px;
-        }
-        .panel-full { grid-column: span 2; }
-
-        /* Live Video */
-        .video-container { position: relative; width: 400px; max-width: 100%; }
-        .video-container img { width: 100%; border-radius: 6px; background: #0a0a15; display: block; }
-        .video-overlay {
-            position: absolute; bottom: 6px; left: 6px;
-            background: rgba(0,0,0,0.7); padding: 3px 8px; border-radius: 4px;
-            font-family: 'Consolas', 'Courier New', monospace; font-size: 11px; color: #00ff88;
+        // Auto-open debug if URL has ?debug
+        if (window.location.search.indexOf('debug') !== -1) {
+            debugVisible = true;
+            document.getElementById('debugSection').classList.add('visible');
+            document.getElementById('toggleDebug').classList.add('active');
         }
 
-        /* Data rows */
-        .data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-        .data-item { background: #0a0a15; padding: 8px 10px; border-radius: 5px; }
-        .data-label { font-size: 10px; text-transform: uppercase; color: #666; margin-bottom: 3px; }
-        .data-value { font-size: 15px; color: #eee; font-family: 'Consolas', 'Courier New', monospace; }
-        .data-item.full { grid-column: span 2; }
-
-        /* Face detected indicator */
-        .face-indicator {
-            display: flex; align-items: center; gap: 10px;
-            padding: 8px 12px; background: #0a0a15; border-radius: 6px; margin-bottom: 10px;
-        }
-        .face-dot {
-            width: 40px; height: 40px; border-radius: 50%;
-            background: #ff3366; transition: background 0.3s;
-            display: flex; align-items: center; justify-content: center;
-            font-size: 14px; font-weight: bold; color: #fff;
-        }
-        .face-dot.detected { background: #00ff88; color: #1a1a2e; }
-        .face-text { font-size: 18px; font-weight: 600; }
-
-        /* Crosshair canvas */
-        .crosshair-container { display: flex; justify-content: center; margin: 8px 0; }
-        canvas.crosshair { background: #0a0a15; border-radius: 6px; border: 1px solid #333; }
-
-        /* Confidence bar */
-        .confidence-bar-bg {
-            height: 10px; background: #333; border-radius: 5px; overflow: hidden; margin-top: 4px;
-        }
-        .confidence-bar-fill {
-            height: 100%; border-radius: 5px; background: linear-gradient(90deg, #ff3366, #ffcc00, #00ff88);
-            transition: width 0.2s;
-        }
-
-        /* UDP message terminal */
-        .udp-terminal {
-            background: #0a0a15; padding: 8px 12px; border-radius: 5px;
-            font-family: 'Consolas', 'Courier New', monospace; font-size: 13px;
-            color: #00ff88; border-left: 3px solid #00ff88; margin-top: 8px;
-            word-break: break-all; min-height: 24px;
-        }
-
-        /* Servo gauge */
-        .servo-gauges { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
-        .servo-gauge {
-            background: #0a0a15; padding: 10px; border-radius: 6px; text-align: center; flex: 1; min-width: 90px;
-        }
-        .servo-gauge .gauge-label { font-size: 10px; color: #666; text-transform: uppercase; margin-bottom: 4px; }
-        .servo-gauge .gauge-value { font-size: 22px; font-weight: bold; color: #00d9ff; font-family: 'Consolas', monospace; }
-        .servo-gauge .gauge-bar {
-            height: 6px; background: #333; border-radius: 3px; overflow: hidden; margin-top: 6px;
-        }
-        .servo-gauge .gauge-bar-fill { height: 100%; background: #00d9ff; border-radius: 3px; transition: width 0.2s; }
-
-        /* Behavior badge */
-        .behavior-badge {
-            display: inline-block; padding: 4px 12px; border-radius: 12px;
-            font-size: 12px; font-weight: 600; text-transform: uppercase;
-            background: #1e3a5f; color: #00d9ff;
-        }
-        .status-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-        .status-dot {
-            width: 10px; height: 10px; border-radius: 50%; background: #666; flex-shrink: 0;
-        }
-        .status-dot.active { background: #00ff88; }
-        .status-dot.inactive { background: #ff3366; }
-
-        /* Coordinate history canvas */
-        canvas.coord-history { width: 100%; height: 200px; background: #0a0a15; border-radius: 6px; display: block; }
-
-        /* Test mode panel */
-        .test-btn {
-            padding: 14px 28px; border: none; border-radius: 8px; font-size: 15px;
-            font-weight: 700; cursor: pointer; transition: all 0.2s; margin-right: 10px;
-        }
-        .test-btn.activate { background: #ff3366; color: #fff; }
-        .test-btn.activate:hover { background: #e0294f; }
-        .test-btn.deactivate { background: #00ff88; color: #1a1a2e; }
-        .test-btn.deactivate:hover { background: #00dd77; }
-
-        .slider-row { margin-bottom: 12px; }
-        .slider-row label { display: block; font-size: 12px; color: #888; margin-bottom: 4px; }
-        .slider-row input[type="range"] { width: 100%; }
-        .slider-row .slider-value { font-size: 12px; color: #00d9ff; text-align: right; font-family: 'Consolas', monospace; }
-
-        .toggle-btn {
-            padding: 8px 16px; border: 1px solid #444; border-radius: 6px;
-            background: #0a0a15; color: #888; cursor: pointer; font-size: 12px;
-            margin-right: 8px; margin-bottom: 8px; transition: all 0.2s;
-        }
-        .toggle-btn.active { border-color: #00ff88; color: #00ff88; background: #0a2a15; }
-        .action-btn {
-            padding: 8px 16px; border: none; border-radius: 6px;
-            background: #333; color: #eee; cursor: pointer; font-size: 12px;
-            margin-right: 8px; margin-bottom: 8px; transition: all 0.2s;
-        }
-        .action-btn:hover { background: #444; }
-        .action-btn.primary { background: #00d9ff; color: #1a1a2e; }
-        .action-btn.primary:hover { background: #00b8d9; }
-
-        /* Diagnostic panel */
-        .diag-result {
-            background: #0a0a15; padding: 6px 10px; border-radius: 4px;
-            font-family: 'Consolas', monospace; font-size: 12px; color: #888;
-            margin-top: 4px; min-height: 22px;
-        }
-        .diag-result.success { color: #00ff88; }
-        .diag-result.error { color: #ff3366; }
-        .diag-section { margin-bottom: 14px; }
-        .diag-label { font-size: 11px; color: #666; margin-bottom: 4px; }
-
-        .stream-health { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 10px; }
-        .health-item { background: #0a0a15; padding: 6px 8px; border-radius: 4px; text-align: center; }
-        .health-item .h-label { font-size: 9px; color: #666; text-transform: uppercase; }
-        .health-item .h-value { font-size: 14px; color: #eee; font-family: 'Consolas', monospace; }
-
-        .controls-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
-        .sliders-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-top: 10px; }
-        @media (max-width: 900px) {
-            .dashboard { grid-template-columns: 1fr; }
-            .panel-full { grid-column: span 1; }
-            .sliders-grid { grid-template-columns: 1fr; }
-        }
-    </style>
-</head>
-<body>
-    <h1>Face Tracking Debug Dashboard</h1>
-    <div class="subtitle">Buddy Vision + Teensy Integration Debugger &mdash; <a href="/" style="color:#00d9ff;">Back to Main UI</a></div>
-
-    <div class="dashboard">
-        <!-- Panel 1: Live Video (top-left) -->
-        <div class="panel">
-            <h2>Live Video Stream</h2>
-            <div class="video-container">
-                <img id="videoStream" src="" alt="Stream offline" onerror="this.alt='Stream offline'">
-                <div class="video-overlay">
-                    <span id="streamFpsOverlay">Stream: --fps</span> |
-                    <span id="detectFpsOverlay">Detect: --fps</span>
-                </div>
-            </div>
-        </div>
-
-        <!-- Panel 2: Real-Time Tracking Data (top-right) -->
-        <div class="panel">
-            <h2>Real-Time Tracking Data</h2>
-            <div class="face-indicator">
-                <div class="face-dot" id="faceDot">NO</div>
-                <div class="face-text" id="faceText">No Face Detected</div>
-            </div>
-            <div class="data-grid">
-                <div class="data-item">
-                    <div class="data-label">Position X</div>
-                    <div class="data-value" id="faceX">--</div>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">Position Y</div>
-                    <div class="data-value" id="faceY">--</div>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">Velocity X</div>
-                    <div class="data-value" id="faceVX">--</div>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">Velocity Y</div>
-                    <div class="data-value" id="faceVY">--</div>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">Face Size</div>
-                    <div class="data-value" id="faceSize">-- x --</div>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">Person Count</div>
-                    <div class="data-value" id="personCount">--</div>
-                </div>
-                <div class="data-item full">
-                    <div class="data-label">Confidence</div>
-                    <div class="confidence-bar-bg"><div class="confidence-bar-fill" id="confidenceBar" style="width:0%"></div></div>
-                    <div class="data-value" style="font-size:12px;margin-top:2px;" id="confidenceVal">--</div>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">Sequence #</div>
-                    <div class="data-value" id="seqNum">--</div>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">Detect FPS / Stream FPS</div>
-                    <div class="data-value"><span id="detectFps">--</span> / <span id="streamFps">--</span></div>
-                </div>
-            </div>
-            <div class="crosshair-container">
-                <canvas class="crosshair" id="crosshairCanvas" width="200" height="200"></canvas>
-            </div>
-            <div class="udp-terminal" id="udpMsg">Waiting for UDP data...</div>
-        </div>
-
-        <!-- Panel 3: Teensy Response (middle-left) -->
-        <div class="panel">
-            <h2>Teensy Response</h2>
-            <div class="servo-gauges">
-                <div class="servo-gauge">
-                    <div class="gauge-label">Base (Pan)</div>
-                    <div class="gauge-value" id="servoBaseVal">90</div>
-                    <div class="gauge-bar"><div class="gauge-bar-fill" id="servoBaseBar" style="width:50%"></div></div>
-                </div>
-                <div class="servo-gauge">
-                    <div class="gauge-label">Nod (Tilt)</div>
-                    <div class="gauge-value" id="servoNodVal">115</div>
-                    <div class="gauge-bar"><div class="gauge-bar-fill" id="servoNodBar" style="width:50%"></div></div>
-                </div>
-                <div class="servo-gauge">
-                    <div class="gauge-label">Tilt (Roll)</div>
-                    <div class="gauge-value" id="servoTiltVal">85</div>
-                    <div class="gauge-bar"><div class="gauge-bar-fill" id="servoTiltBar" style="width:50%"></div></div>
-                </div>
-            </div>
-            <div class="data-grid">
-                <div class="data-item">
-                    <div class="data-label">Behavior</div>
-                    <span class="behavior-badge" id="dbgBehavior">IDLE</span>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">Expression</div>
-                    <div class="data-value" id="dbgExpression">neutral</div>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">Tracking Active</div>
-                    <div class="status-row">
-                        <div class="status-dot" id="trackingDot"></div>
-                        <span id="trackingLabel">Inactive</span>
-                    </div>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">Tracking Error</div>
-                    <div class="data-value" id="trackingError">--</div>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">PID Output Pan</div>
-                    <div class="data-value" id="pidPan">--</div>
-                </div>
-                <div class="data-item">
-                    <div class="data-label">PID Output Tilt</div>
-                    <div class="data-value" id="pidTilt">--</div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Panel 4: Coordinate History Graph (middle-right) -->
-        <div class="panel">
-            <h2>Coordinate History (Last 5s)</h2>
-            <canvas class="coord-history" id="coordCanvas" width="600" height="200"></canvas>
-            <div style="display:flex;gap:16px;margin-top:6px;font-size:11px;">
-                <span style="color:#00ff88;">&#9644; face_x</span>
-                <span style="color:#3b82f6;">&#9644; face_y</span>
-                <span style="color:#00ff88;opacity:0.5;">- - servo_base</span>
-                <span style="color:#3b82f6;opacity:0.5;">- - servo_nod</span>
-            </div>
-        </div>
-
-        <!-- Panel 5: Test Mode (bottom, full width) -->
-        <div class="panel panel-full">
-            <h2>Face Tracking Test Mode</h2>
-            <div style="display:flex;align-items:center;gap:16px;margin-bottom:12px;">
-                <button class="test-btn activate" id="testModeBtn" onclick="toggleTestMode()">ACTIVATE TEST MODE</button>
-                <span id="testModeStatus" style="color:#888;font-size:13px;">Test mode inactive</span>
-            </div>
-            <div class="sliders-grid">
-                <div class="slider-row">
-                    <label>Base Servo (10-170): <span class="slider-value" id="sliderBaseVal">90</span></label>
-                    <input type="range" id="sliderBase" min="10" max="170" value="90" oninput="sendManualServo()">
-                </div>
-                <div class="slider-row">
-                    <label>Nod Servo (80-150): <span class="slider-value" id="sliderNodVal">115</span></label>
-                    <input type="range" id="sliderNod" min="80" max="150" value="115" oninput="sendManualServo()">
-                </div>
-                <div class="slider-row">
-                    <label>Tilt Servo (20-150): <span class="slider-value" id="sliderTiltVal">85</span></label>
-                    <input type="range" id="sliderTilt" min="20" max="150" value="85" oninput="sendManualServo()">
-                </div>
-            </div>
-            <div class="controls-row">
-                <button class="toggle-btn" id="bodySchemaBtn" onclick="toggleBodySchema()">Body Schema: ON</button>
-                <button class="action-btn" onclick="resetPID()">Reset PID</button>
-                <button class="action-btn primary" onclick="downloadCSV()">Download CSV</button>
-            </div>
-        </div>
-
-        <!-- Panel 6: Diagnostic Tools (bottom, full width) -->
-        <div class="panel panel-full">
-            <h2>Diagnostic Tools</h2>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
-                <div>
-                    <div class="diag-section">
-                        <button class="action-btn" onclick="pingESP32()">Ping ESP32</button>
-                        <div class="diag-result" id="pingResult">--</div>
-                    </div>
-                    <div class="diag-section">
-                        <button class="action-btn" onclick="testUDP()">Test UDP Packet</button>
-                        <div class="diag-result" id="udpResult">--</div>
-                    </div>
-                    <div class="diag-section">
-                        <button class="action-btn" onclick="showRawFrame()">Show Raw Frame</button>
-                        <div class="diag-result" id="rawFrameResult">--</div>
-                    </div>
-                </div>
-                <div>
-                    <div class="diag-label">Stream Health</div>
-                    <div class="stream-health">
-                        <div class="health-item">
-                            <div class="h-label">Frames Recv</div>
-                            <div class="h-value" id="framesRecv">0</div>
-                        </div>
-                        <div class="health-item">
-                            <div class="h-label">Dropped</div>
-                            <div class="h-value" id="framesDropped">0</div>
-                        </div>
-                        <div class="health-item">
-                            <div class="h-label">Reconnects</div>
-                            <div class="h-value" id="reconnections">0</div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        const socket = io();
+        let debugInitialized = false;
         let testModeActive = false;
         let bodySchemaOn = true;
-        let coordHistory = [];  // {t, fx, fy, sb, sn}
+        let coordHistory = [];
         const MAX_HISTORY = 300;
         let framesReceived = 0;
         let framesDropped = 0;
         let reconnectCount = 0;
-        let streamImg = document.getElementById('videoStream');
-        let streamConnected = false;
 
-        // Set video stream source
-        const visionHost = window.location.hostname;
-        streamImg.src = 'http://' + visionHost + ':5555/stream';
-        streamImg.onerror = function() {
-            if (streamConnected) { reconnectCount++; document.getElementById('reconnections').textContent = reconnectCount; }
-            streamConnected = false;
-            setTimeout(() => { streamImg.src = 'http://' + visionHost + ':5555/stream?' + Date.now(); }, 3000);
-        };
-        streamImg.onload = function() { streamConnected = true; framesReceived++; };
+        function initDebug() {
+            debugInitialized = true;
+            // Start video stream
+            const streamImg = document.getElementById('videoStream');
+            const visionHost = window.location.hostname;
+            streamImg.src = 'http://' + visionHost + ':5555/stream';
+            streamImg.onerror = function() {
+                if (streamImg._connected) { reconnectCount++; document.getElementById('reconnections').textContent = reconnectCount; }
+                streamImg._connected = false;
+                setTimeout(() => { streamImg.src = 'http://' + visionHost + ':5555/stream?' + Date.now(); }, 3000);
+            };
+            streamImg.onload = function() { streamImg._connected = true; framesReceived++; };
+            // Start coordinate history drawing
+            requestAnimationFrame(drawCoordHistory);
+        }
 
-        // Real-time tracking data via SocketIO
+        // Tracking data (always listen, updates debug panels when visible)
         socket.on('tracking_data', function(d) {
+            if (!debugVisible) return;
             framesReceived++;
             document.getElementById('framesRecv').textContent = framesReceived;
 
-            // Face detected indicator
             const faceDot = document.getElementById('faceDot');
             const faceText = document.getElementById('faceText');
             if (d.face_detected) {
-                faceDot.classList.add('detected');
-                faceDot.textContent = 'YES';
-                faceText.textContent = 'Face Detected';
-                faceText.style.color = '#00ff88';
+                faceDot.classList.add('detected'); faceDot.textContent = 'YES';
+                faceText.textContent = 'Face Detected'; faceText.style.color = '#00ff88';
             } else {
-                faceDot.classList.remove('detected');
-                faceDot.textContent = 'NO';
-                faceText.textContent = 'No Face Detected';
-                faceText.style.color = '#ff3366';
+                faceDot.classList.remove('detected'); faceDot.textContent = 'NO';
+                faceText.textContent = 'No Face Detected'; faceText.style.color = '#ff3366';
             }
 
-            // Data values
             document.getElementById('faceX').textContent = d.face_x !== undefined ? d.face_x : '--';
             document.getElementById('faceY').textContent = d.face_y !== undefined ? d.face_y : '--';
             document.getElementById('faceVX').textContent = d.face_vx !== undefined ? d.face_vx.toFixed(1) : '--';
@@ -1443,24 +1308,18 @@ DEBUG_DASHBOARD_HTML = """
             document.getElementById('faceSize').textContent = (d.face_w || '--') + ' x ' + (d.face_h || '--');
             document.getElementById('personCount').textContent = d.person_count !== undefined ? d.person_count : '--';
 
-            // Confidence
             const conf = d.confidence || 0;
             document.getElementById('confidenceBar').style.width = conf + '%';
             document.getElementById('confidenceVal').textContent = conf + '%';
 
-            // Sequence & FPS
             document.getElementById('seqNum').textContent = d.sequence !== undefined ? d.sequence : '--';
             document.getElementById('detectFps').textContent = d.detection_fps !== undefined ? d.detection_fps.toFixed(1) : '--';
             document.getElementById('streamFps').textContent = d.stream_fps !== undefined ? d.stream_fps.toFixed(1) : '--';
             document.getElementById('streamFpsOverlay').textContent = 'Stream: ' + (d.stream_fps !== undefined ? d.stream_fps.toFixed(1) : '--') + 'fps';
             document.getElementById('detectFpsOverlay').textContent = 'Detect: ' + (d.detection_fps !== undefined ? d.detection_fps.toFixed(1) : '--') + 'fps';
 
-            // UDP message
-            if (d.last_udp_msg) {
-                document.getElementById('udpMsg').textContent = d.last_udp_msg;
-            }
+            if (d.last_udp_msg) { document.getElementById('udpMsg').textContent = d.last_udp_msg; }
 
-            // Servo gauges
             const sb = d.servo_base !== undefined ? d.servo_base : 90;
             const sn = d.servo_nod !== undefined ? d.servo_nod : 115;
             const st = d.servo_tilt !== undefined ? d.servo_tilt : 85;
@@ -1471,19 +1330,16 @@ DEBUG_DASHBOARD_HTML = """
             document.getElementById('servoNodBar').style.width = ((sn - 80) / 70 * 100) + '%';
             document.getElementById('servoTiltBar').style.width = ((st - 20) / 130 * 100) + '%';
 
-            // Behavior, expression, tracking
             document.getElementById('dbgBehavior').textContent = d.behavior || 'IDLE';
             document.getElementById('dbgExpression').textContent = d.expression || 'neutral';
 
             const trackingDot = document.getElementById('trackingDot');
             const trackingLabel = document.getElementById('trackingLabel');
             if (d.tracking_active) {
-                trackingDot.classList.add('active');
-                trackingDot.classList.remove('inactive');
+                trackingDot.classList.add('active'); trackingDot.classList.remove('inactive');
                 trackingLabel.textContent = 'Active';
             } else {
-                trackingDot.classList.remove('active');
-                trackingDot.classList.add('inactive');
+                trackingDot.classList.remove('active'); trackingDot.classList.add('inactive');
                 trackingLabel.textContent = 'Inactive';
             }
 
@@ -1491,17 +1347,9 @@ DEBUG_DASHBOARD_HTML = """
             document.getElementById('pidPan').textContent = d.pid_output_pan !== undefined ? d.pid_output_pan.toFixed(3) : '--';
             document.getElementById('pidTilt').textContent = d.pid_output_tilt !== undefined ? d.pid_output_tilt.toFixed(3) : '--';
 
-            // Crosshair canvas
             drawCrosshair(d.face_x, d.face_y, d.face_detected);
 
-            // Coordinate history
-            coordHistory.push({
-                t: Date.now(),
-                fx: d.face_x || 0,
-                fy: d.face_y || 0,
-                sb: sb,
-                sn: sn
-            });
+            coordHistory.push({ t: Date.now(), fx: d.face_x || 0, fy: d.face_y || 0, sb: sb, sn: sn });
             if (coordHistory.length > MAX_HISTORY) coordHistory.shift();
         });
 
@@ -1516,125 +1364,77 @@ DEBUG_DASHBOARD_HTML = """
             const ctx = canvas.getContext('2d');
             const w = canvas.width, h = canvas.height;
             ctx.clearRect(0, 0, w, h);
-
-            // Grid
-            ctx.strokeStyle = '#333';
-            ctx.lineWidth = 0.5;
+            ctx.strokeStyle = '#333'; ctx.lineWidth = 0.5;
             for (let i = 0; i <= 4; i++) {
                 ctx.beginPath(); ctx.moveTo(i * w / 4, 0); ctx.lineTo(i * w / 4, h); ctx.stroke();
                 ctx.beginPath(); ctx.moveTo(0, i * h / 4); ctx.lineTo(w, i * h / 4); ctx.stroke();
             }
-
-            // Center crosshair
-            ctx.strokeStyle = '#444';
-            ctx.lineWidth = 1;
-            ctx.setLineDash([4, 4]);
+            ctx.strokeStyle = '#444'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
             ctx.beginPath(); ctx.moveTo(w / 2, 0); ctx.lineTo(w / 2, h); ctx.stroke();
             ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
             ctx.setLineDash([]);
-
             if (detected && fx !== undefined && fy !== undefined) {
-                // Map face coords (0-240) to canvas
-                const cx = (fx / 240) * w;
-                const cy = (fy / 240) * h;
-
-                // Face position dot
-                ctx.fillStyle = '#00ff88';
-                ctx.beginPath(); ctx.arc(cx, cy, 6, 0, Math.PI * 2); ctx.fill();
-
-                // Crosshair lines
-                ctx.strokeStyle = '#00ff88';
-                ctx.lineWidth = 1;
+                const cx = (fx / 240) * w, cy = (fy / 240) * h;
+                ctx.fillStyle = '#00ff88'; ctx.beginPath(); ctx.arc(cx, cy, 6, 0, Math.PI * 2); ctx.fill();
+                ctx.strokeStyle = '#00ff88'; ctx.lineWidth = 1;
                 ctx.beginPath(); ctx.moveTo(cx - 15, cy); ctx.lineTo(cx + 15, cy); ctx.stroke();
                 ctx.beginPath(); ctx.moveTo(cx, cy - 15); ctx.lineTo(cx, cy + 15); ctx.stroke();
-
-                // Coordinate text
-                ctx.fillStyle = '#00ff88';
-                ctx.font = '11px Consolas, monospace';
-                ctx.fillText(fx + ', ' + fy, cx + 10, cy - 10);
+                ctx.fillStyle = '#00ff88'; ctx.font = '11px Consolas, monospace'; ctx.fillText(fx + ', ' + fy, cx + 10, cy - 10);
             }
         }
 
-        // Coordinate history graph (requestAnimationFrame)
+        // Coordinate history graph
         function drawCoordHistory() {
+            if (!debugVisible) { requestAnimationFrame(drawCoordHistory); return; }
             const canvas = document.getElementById('coordCanvas');
             const ctx = canvas.getContext('2d');
             const w = canvas.width, h = canvas.height;
             ctx.clearRect(0, 0, w, h);
-
-            // Background grid
-            ctx.strokeStyle = '#222';
-            ctx.lineWidth = 0.5;
+            ctx.strokeStyle = '#222'; ctx.lineWidth = 0.5;
             for (let y = 0; y <= 240; y += 60) {
                 const py = h - (y / 240) * h;
                 ctx.beginPath(); ctx.moveTo(0, py); ctx.lineTo(w, py); ctx.stroke();
-                ctx.fillStyle = '#444';
-                ctx.font = '9px Consolas';
-                ctx.fillText(y, 2, py - 2);
+                ctx.fillStyle = '#444'; ctx.font = '9px Consolas'; ctx.fillText(y, 2, py - 2);
             }
-
             if (coordHistory.length < 2) { requestAnimationFrame(drawCoordHistory); return; }
-
-            const now = Date.now();
-            const windowMs = 5000;
+            const now = Date.now(), windowMs = 5000;
             const recent = coordHistory.filter(p => now - p.t < windowMs);
             if (recent.length < 2) { requestAnimationFrame(drawCoordHistory); return; }
-
             function drawLine(data, key, color, dashed) {
-                ctx.strokeStyle = color;
-                ctx.lineWidth = dashed ? 1 : 2;
-                ctx.setLineDash(dashed ? [4, 4] : []);
+                ctx.strokeStyle = color; ctx.lineWidth = dashed ? 1 : 2; ctx.setLineDash(dashed ? [4, 4] : []);
                 ctx.beginPath();
                 for (let i = 0; i < data.length; i++) {
                     const x = ((data[i].t - (now - windowMs)) / windowMs) * w;
                     const y = h - (Math.min(240, Math.max(0, data[i][key])) / 240) * h;
                     if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
                 }
-                ctx.stroke();
-                ctx.setLineDash([]);
+                ctx.stroke(); ctx.setLineDash([]);
             }
-
             drawLine(recent, 'fx', '#00ff88', false);
             drawLine(recent, 'fy', '#3b82f6', false);
             drawLine(recent, 'sb', 'rgba(0,255,136,0.4)', true);
             drawLine(recent, 'sn', 'rgba(59,130,246,0.4)', true);
-
             requestAnimationFrame(drawCoordHistory);
         }
-        requestAnimationFrame(drawCoordHistory);
 
-        // Test mode toggle
+        // Test mode
         function toggleTestMode() {
-            const newState = !testModeActive;
-            fetch('/api/test_mode', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({active: newState})
-            }).then(r => r.json()).then(d => {
-                testModeActive = d.active;
-                updateTestModeUI();
-            });
+            fetch('/api/test_mode', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({active: !testModeActive}) })
+            .then(r => r.json()).then(d => { testModeActive = d.active; updateTestModeUI(); });
         }
-
         function updateTestModeUI() {
             const btn = document.getElementById('testModeBtn');
             const status = document.getElementById('testModeStatus');
             if (testModeActive) {
-                btn.textContent = 'DEACTIVATE TEST MODE';
-                btn.className = 'test-btn deactivate';
-                status.textContent = 'Test mode ACTIVE - Teensy set to IDLE';
-                status.style.color = '#ff3366';
+                btn.textContent = 'DEACTIVATE TEST MODE'; btn.className = 'test-btn deactivate';
+                status.textContent = 'Test mode ACTIVE - Teensy set to IDLE'; status.style.color = '#ff3366';
                 document.body.classList.add('test-mode-active');
             } else {
-                btn.textContent = 'ACTIVATE TEST MODE';
-                btn.className = 'test-btn activate';
-                status.textContent = 'Test mode inactive';
-                status.style.color = '#888';
+                btn.textContent = 'ACTIVATE TEST MODE'; btn.className = 'test-btn activate';
+                status.textContent = 'Test mode inactive'; status.style.color = '#888';
                 document.body.classList.remove('test-mode-active');
             }
         }
-
-        // Manual servo
         function sendManualServo() {
             const base = parseInt(document.getElementById('sliderBase').value);
             const nod = parseInt(document.getElementById('sliderNod').value);
@@ -1642,85 +1442,51 @@ DEBUG_DASHBOARD_HTML = """
             document.getElementById('sliderBaseVal').textContent = base;
             document.getElementById('sliderNodVal').textContent = nod;
             document.getElementById('sliderTiltVal').textContent = tilt;
-            fetch('/api/manual_servo', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({base: base, nod: nod, tilt: tilt})
-            });
+            fetch('/api/manual_servo', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({base: base, nod: nod, tilt: tilt}) });
         }
-
-        // Body schema toggle
         function toggleBodySchema() {
             bodySchemaOn = !bodySchemaOn;
             const btn = document.getElementById('bodySchemaBtn');
             btn.textContent = 'Body Schema: ' + (bodySchemaOn ? 'ON' : 'OFF');
             btn.classList.toggle('active', bodySchemaOn);
-            fetch('/api/toggle_body_schema', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({enabled: bodySchemaOn})
-            });
+            fetch('/api/toggle_body_schema', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled: bodySchemaOn}) });
         }
-
-        // Reset PID
         function resetPID() {
             fetch('/api/reset_pid', {method: 'POST'}).then(r => r.json()).then(d => {
                 alert(d.ok ? 'PID reset sent' : 'PID reset failed: ' + (d.error || 'unknown'));
             });
         }
-
-        // Download CSV
-        function downloadCSV() {
-            window.location.href = '/api/tracking_csv';
-        }
-
-        // Ping ESP32
+        function downloadCSV() { window.location.href = '/api/tracking_csv'; }
         function pingESP32() {
-            const el = document.getElementById('pingResult');
-            el.textContent = 'Pinging...';
-            el.className = 'diag-result';
+            const el = document.getElementById('pingResult'); el.textContent = 'Pinging...'; el.className = 'diag-result';
             const t0 = Date.now();
             fetch('/api/ping_esp32', {method: 'POST'}).then(r => r.json()).then(d => {
                 const latency = Date.now() - t0;
-                if (d.ok) {
-                    el.textContent = 'OK - ' + latency + 'ms round-trip';
-                    el.className = 'diag-result success';
-                } else {
-                    el.textContent = 'FAILED: ' + (d.error || 'unreachable');
-                    el.className = 'diag-result error';
-                }
+                if (d.ok) { el.textContent = 'OK - ' + latency + 'ms round-trip'; el.className = 'diag-result success'; }
+                else { el.textContent = 'FAILED: ' + (d.error || 'unreachable'); el.className = 'diag-result error'; }
             }).catch(e => { el.textContent = 'ERROR: ' + e; el.className = 'diag-result error'; });
         }
-
-        // Test UDP
         function testUDP() {
-            const el = document.getElementById('udpResult');
-            el.textContent = 'Sending...';
-            el.className = 'diag-result';
+            const el = document.getElementById('udpResult'); el.textContent = 'Sending...'; el.className = 'diag-result';
             fetch('/api/test_udp', {method: 'POST'}).then(r => r.json()).then(d => {
-                if (d.ok) {
-                    el.textContent = 'Sent: ' + (d.message || 'FACE:120,120,0,0,55,60,85,0');
-                    el.className = 'diag-result success';
-                } else {
-                    el.textContent = 'FAILED: ' + (d.error || 'unknown');
-                    el.className = 'diag-result error';
-                }
+                if (d.ok) { el.textContent = 'Sent: ' + (d.message || 'FACE:120,120,0,0,55,60,85,0'); el.className = 'diag-result success'; }
+                else { el.textContent = 'FAILED: ' + (d.error || 'unknown'); el.className = 'diag-result error'; }
             }).catch(e => { el.textContent = 'ERROR: ' + e; el.className = 'diag-result error'; });
         }
-
-        // Show raw frame
         function showRawFrame() {
-            const el = document.getElementById('rawFrameResult');
-            el.textContent = 'Fetching...';
+            const el = document.getElementById('rawFrameResult'); el.textContent = 'Fetching...';
             fetch('/api/tracking_state').then(r => r.json()).then(d => {
-                el.textContent = JSON.stringify(d, null, 1).substring(0, 200);
-                el.className = 'diag-result success';
+                el.textContent = JSON.stringify(d, null, 1).substring(0, 200); el.className = 'diag-result success';
             }).catch(e => { el.textContent = 'ERROR: ' + e; el.className = 'diag-result error'; });
         }
 
+        // ═══ Init ═══
+        initAudio(); updateRanges(); socket.emit('get_config');
+        if (debugVisible) { initDebug(); }
     </script>
 </body>
 </html>
+
 """
 
 # =============================================================================
@@ -3059,6 +2825,19 @@ def api_vision_health():
     except:
         return jsonify({"ok": False})
 
+@app.route('/api/inner_thought')
+def api_inner_thought():
+    """Return current inner-thought context (buddy state, narrative, intent)."""
+    try:
+        buddy_state_str, narrative_ctx, intent_ctx = get_buddy_state_prompt()
+        return jsonify({
+            "buddy_state": buddy_state_str,
+            "narrative_context": narrative_ctx,
+            "intent_context": intent_ctx,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 @socketio.on('connect')
 def handle_connect():
     emit('log', {'message': 'Connected', 'level': 'success'})
@@ -3133,8 +2912,8 @@ def handle_toggle_spontaneous(data):
 
 @app.route('/debug')
 def debug_dashboard():
-    """Serve the Face Tracking Debug Dashboard."""
-    return render_template_string(DEBUG_DASHBOARD_HTML)
+    """Redirect to merged UI with debug panel open."""
+    return redirect('/?debug=1')
 
 
 @app.route('/api/tracking_state')
@@ -3358,11 +3137,26 @@ def tracking_dashboard_thread():
     Background thread that runs at ~5Hz, emitting real-time tracking data
     to all connected debug dashboard clients via SocketIO.
     Also collects CSV data when test mode is active.
+    Also emits inner-thought context every ~2 seconds.
     """
     global last_udp_msg
+    inner_thought_counter = 0
 
     while True:
         try:
+            # Emit inner thoughts every ~2 seconds (every 10th tick at 5Hz)
+            inner_thought_counter += 1
+            if inner_thought_counter >= 10:
+                inner_thought_counter = 0
+                try:
+                    buddy_state_str, narrative_ctx, intent_ctx = get_buddy_state_prompt()
+                    socketio.emit('inner_thought', {
+                        'buddy_state': buddy_state_str,
+                        'narrative_context': narrative_ctx,
+                        'intent_context': intent_ctx,
+                    })
+                except Exception:
+                    pass
             data = {}
 
             # Fetch vision state from buddy_vision.py
@@ -3622,7 +3416,7 @@ if __name__ == '__main__':
 
     # Face Tracking Debug Dashboard background thread
     threading.Thread(target=tracking_dashboard_thread, daemon=True, name="tracking-dashboard").start()
-    print("  Debug Dashboard: http://0.0.0.0:5000/debug")
+    print("  Debug Dashboard: merged into main UI (toggle 'Debug Tools' button)")
 
     print()
     print(f"Open http://0.0.0.0:5000 from any browser on the network")
