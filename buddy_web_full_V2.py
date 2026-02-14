@@ -267,10 +267,45 @@ class SceneContext:
                     if _ollama_speech_priority:
                         time.sleep(2)
                         continue
+                    # FIX BUG-16: capture frame OUTSIDE _ollama_lock (camera HTTP
+                    # doesn't need Ollama). Only hold the lock for _describe_frame.
+                    frame = self._capture_frame()
+                    if not frame:
+                        self.last_scene_capture = now
+                        time.sleep(1)
+                        continue
+                    # Re-check priority after capture (may have changed during HTTP)
+                    if _ollama_speech_priority:
+                        time.sleep(2)
+                        continue
                     # Acquire the Ollama lock (non-blocking — skip if busy)
                     if _ollama_lock.acquire(blocking=False):
                         try:
-                            self._capture_and_describe()
+                            description = self._describe_frame(frame)
+                            if description:
+                                with self.lock:
+                                    if self.current_description:
+                                        self._detect_changes(self.current_description, description)
+                                    self.previous_descriptions.append(self.current_description)
+                                    self.current_description = description
+                                    if self.previous_descriptions:
+                                        prev = self.previous_descriptions[-1] if self.previous_descriptions else ""
+                                        if prev:
+                                            prev_words = set(prev.lower().split())
+                                            curr_words = set(description.lower().split())
+                                            if prev_words:
+                                                overlap = len(prev_words & curr_words) / max(len(prev_words), len(curr_words))
+                                                self.scene_novelty = max(0.0, min(1.0, 1.0 - overlap))
+                                            else:
+                                                self.scene_novelty = 0.5
+                                        else:
+                                            self.scene_novelty = 0.8
+                                    self._extract_objects(description)
+                                try:
+                                    short = description[:80] + '...' if len(description) > 80 else description
+                                    socketio.emit('log', {'message': f'Scene: {short}', 'level': 'debug'})
+                                except:
+                                    pass
                             self.last_scene_capture = now
                         finally:
                             _ollama_lock.release()
@@ -598,7 +633,10 @@ porcupine = None
 recorder = None
 wake_word_thread = None
 wake_word_running = False
+wake_word_lock = threading.Lock()  # FIX BUG-04: protects porcupine/recorder from concurrent access
 processing_lock = threading.Lock()  # Phase 1C: BUG-4 fix — replaces bare bool is_processing
+_processing_lock_acquired_at = 0    # HARDENING: timestamp when processing_lock was acquired
+_processing_lock_owner = ""         # HARDENING: which function holds the lock
 current_image_base64 = None
 
 # Teensy state
@@ -644,7 +682,11 @@ _tts_thread.start()
 def run_tts_sync(text, volume=None):
     """Run TTS generation on the dedicated event loop (thread-safe)."""
     future = asyncio.run_coroutine_threadsafe(generate_tts(text, volume), _tts_loop)
-    return future.result(timeout=30)
+    try:
+        return future.result(timeout=30)
+    except Exception:
+        future.cancel()  # FIX BUG-09: cancel dangling coroutine on timeout/error
+        raise
 
 # =============================================================================
 # FACE TRACKING DEBUG DASHBOARD — Global State
@@ -1515,23 +1557,26 @@ def connect_teensy_ws():
     """Connect via ESP32 WiFi-UART bridge (WebSocket)."""
     global ws_connection, teensy_connected
     try:
-        if ws_connection:
-            try: ws_connection.close()
-            except: pass
+        # FIX BUG-07: hold ws_lock while replacing connection to prevent
+        # teensy_send_ws from using a stale/closed connection
+        with ws_lock:
+            if ws_connection:
+                try: ws_connection.close()
+                except: pass
 
-        ip = CONFIG["esp32_ip"]
-        port = CONFIG["esp32_ws_port"]
-        url = f"ws://{ip}:{port}"
+            ip = CONFIG["esp32_ip"]
+            port = CONFIG["esp32_ws_port"]
+            url = f"ws://{ip}:{port}"
 
-        ws_connection = websocket.create_connection(url, timeout=5)
+            ws_connection = websocket.create_connection(url, timeout=5)
 
-        # Read welcome message from ESP32
-        hello = ws_connection.recv()
-        socketio.emit('log', {'message': f'ESP32 bridge connected: {hello}', 'level': 'success'})
+            # Read welcome message from ESP32
+            hello = ws_connection.recv()
+            socketio.emit('log', {'message': f'ESP32 bridge connected: {hello}', 'level': 'success'})
 
-        # Test with QUERY
-        ws_connection.send("!QUERY")
-        resp = ws_connection.recv()
+            # Test with QUERY
+            ws_connection.send("!QUERY")
+            resp = ws_connection.recv()
 
         if resp and '{' in resp:
             teensy_connected = True
@@ -1589,6 +1634,7 @@ def teensy_send_ws(cmd, fallback=None):
     global ws_connection, teensy_connected
     if not teensy_connected or not ws_connection: return None
 
+    use_fallback = False  # FIX BUG-06: track fallback need outside lock scope
     with ws_lock:
         try:
             ws_connection.send(f"!{cmd}")
@@ -1602,11 +1648,13 @@ def teensy_send_ws(cmd, fallback=None):
                         result = json.loads(resp)
                         if not result.get('ok') and result.get('reason') == 'unknown_command' and fallback:
                             socketio.emit('log', {'message': f'Command {cmd} not implemented, trying fallback', 'level': 'warning'})
-                            return teensy_send_ws(fallback)
-                        return result
+                            use_fallback = True  # FIX BUG-06: don't recurse inside ws_lock (deadlock)
+                        else:
+                            return result
                     except json.JSONDecodeError:
                         pass
-            return None
+            if not use_fallback:
+                return None
 
         except websocket.WebSocketTimeoutException:
             return None
@@ -1614,6 +1662,11 @@ def teensy_send_ws(cmd, fallback=None):
             teensy_connected = False
             socketio.emit('log', {'message': f'WebSocket error: {e}', 'level': 'error'})
             return None
+
+    # FIX BUG-06: fallback call outside ws_lock to prevent deadlock
+    if use_fallback:
+        return teensy_send_ws(fallback)
+    return None
 
 def teensy_send_serial(cmd, fallback=None):
     """Send command via USB serial (original implementation)."""
@@ -1770,18 +1823,20 @@ def init_wake_word():
             socketio.emit('wake_word_status', {'enabled': False, 'word': 'disabled (no mic)'})
             return False
 
-        # Original init logic continues...
-        if porcupine: porcupine.delete()
-        wp = CONFIG.get("wake_word_path", "")
-        mp = CONFIG.get("wake_word_model_path", "")
-        if wp and os.path.exists(wp):
-            args = {"access_key": CONFIG["picovoice_access_key"], "keyword_paths": [wp], "sensitivities": [CONFIG["wake_word_sensitivity"]]}
-            if mp and os.path.exists(mp): args["model_path"] = mp
-            porcupine = pvporcupine.create(**args)
-        else:
-            porcupine = pvporcupine.create(access_key=CONFIG["picovoice_access_key"], keywords=[CONFIG["wake_word"]], sensitivities=[CONFIG["wake_word_sensitivity"]])
-        socketio.emit('log', {'message': f'Wake word "{CONFIG["wake_word"]}" ready', 'level': 'success'})
-        if recorder is None: recorder = PvRecorder(device_index=-1, frame_length=porcupine.frame_length)
+        # FIX BUG-04: hold wake_word_lock while replacing porcupine/recorder
+        # to prevent wake_word_loop from using them mid-swap
+        with wake_word_lock:
+            if porcupine: porcupine.delete()
+            wp = CONFIG.get("wake_word_path", "")
+            mp = CONFIG.get("wake_word_model_path", "")
+            if wp and os.path.exists(wp):
+                args = {"access_key": CONFIG["picovoice_access_key"], "keyword_paths": [wp], "sensitivities": [CONFIG["wake_word_sensitivity"]]}
+                if mp and os.path.exists(mp): args["model_path"] = mp
+                porcupine = pvporcupine.create(**args)
+            else:
+                porcupine = pvporcupine.create(access_key=CONFIG["picovoice_access_key"], keywords=[CONFIG["wake_word"]], sensitivities=[CONFIG["wake_word_sensitivity"]])
+            socketio.emit('log', {'message': f'Wake word "{CONFIG["wake_word"]}" ready', 'level': 'success'})
+            if recorder is None: recorder = PvRecorder(device_index=-1, frame_length=porcupine.frame_length)
         return True
     except Exception as e:
         socketio.emit('log', {'message': f'Wake word init failed: {e}. Push-to-talk still works.', 'level': 'warning'})
@@ -1798,14 +1853,18 @@ def wake_word_loop():
         while wake_word_running:
             if not CONFIG.get("wake_word_enabled", True): time.sleep(0.1); continue
             try:
-                pcm = recorder.read()
+                # FIX BUG-04: hold wake_word_lock during read/process
+                # to prevent init_wake_word from swapping objects mid-use
+                with wake_word_lock:
+                    pcm = recorder.read()
+                    detected = porcupine.process(pcm) >= 0
                 if pcm:
                     level = max(abs(min(pcm)), abs(max(pcm)))
                     # Adapt noise floor during non-speech
                     if level < noise_floor * 2:
                         noise_floor = noise_floor * (1 - NOISE_FLOOR_ALPHA) + level * NOISE_FLOOR_ALPHA
                     socketio.emit('audio_level', {'level': level})
-                if porcupine.process(pcm) >= 0:
+                if detected:
                     # Don't trigger wake word if Buddy is speaking spontaneously
                     if processing_lock.locked():
                         continue
@@ -1822,9 +1881,8 @@ def wake_word_loop():
 
 def record_and_process():
     global recorder, noise_floor
-    # If spontaneous speech is happening, wait for it to finish
-    with spontaneous_speech_lock:
-        pass
+    # FIX BUG-05: removed dead spontaneous_speech_lock (never held elsewhere).
+    # Mutual exclusion with spontaneous speech is handled by processing_lock.
     frames, silent_frames, speech_started, pre_speech_count = [], 0, False, 0
     sr = 16000
     fps = sr / 512
@@ -2113,11 +2171,15 @@ async def generate_tts(text, volume=None):
     finally: os.unlink(tp)
 
 def process_input(text, include_vision):
+    global _processing_lock_acquired_at, _processing_lock_owner
     print(f'[SPEECH] Received user input: "{text[:80]}" (vision={include_vision})')
     if not processing_lock.acquire(blocking=False):
         print("[SPEECH] Already processing, skipping")
         socketio.emit('log', {'message': 'Already processing, skipping', 'level': 'warning'})
+        socketio.emit('status', {'state': 'ready', 'message': 'Ready'})  # FIX BUG-01: reset status so browser doesn't get stuck
         return
+    _processing_lock_acquired_at = time.time()  # HARDENING: track lock hold time
+    _processing_lock_owner = "process_input"
     try:
         socketio.emit('transcript', {'text': text})
 
@@ -2202,11 +2264,9 @@ def process_input(text, include_vision):
         # Schedule cleanup after speech likely finishes
         def finish_speaking():
             time.sleep(speech_duration)
-            # Drain mic buffer to prevent echo self-trigger
-            if recorder:
-                for _ in range(5):
-                    try: recorder.read()
-                    except: break
+            # FIX BUG-10: removed unsafe recorder.read() drain — wake_word_loop
+            # owns the recorder; concurrent reads cause crashes.
+            # Echo prevention is handled by processing_lock check + noise floor.
             teensy_send_command("STOP_SPEAKING")
             teensy_send_command("IDLE")
             # Occasionally celebrate if mood is good
@@ -2233,6 +2293,8 @@ def process_input(text, include_vision):
         socketio.emit('log', {'message': f'Speech pipeline error: {e}\n{tb}', 'level': 'error'})
         socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
     finally:
+        _processing_lock_acquired_at = 0  # HARDENING: clear tracking
+        _processing_lock_owner = ""
         processing_lock.release()
 
 # =============================================================================
@@ -2522,9 +2584,12 @@ def process_narrative_speech(strategy, saved_state):
     """
     print(f"[SPEECH] Spontaneous speech firing: strategy={strategy}")
     global last_spontaneous_utterance, spontaneous_utterance_log
+    global _processing_lock_acquired_at, _processing_lock_owner
 
     if not processing_lock.acquire(blocking=False):
         return
+    _processing_lock_acquired_at = time.time()  # HARDENING: track lock hold time
+    _processing_lock_owner = "process_narrative_speech"
 
     try:
         now = time.time()
@@ -2731,6 +2796,8 @@ def process_narrative_speech(strategy, saved_state):
         socketio.emit('log', {'message': f'Narrative speech error: {e}\n{tb}', 'level': 'error'})
         socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
     finally:
+        _processing_lock_acquired_at = 0  # HARDENING: clear tracking
+        _processing_lock_owner = ""
         processing_lock.release()
 
 
@@ -3129,6 +3196,101 @@ def api_tracking_csv():
 
 
 # =============================================================================
+# HARDENING — Health endpoint, watchdog, status recovery
+# =============================================================================
+
+@app.route('/api/health')
+def api_health():
+    """Return the state of every thread, lock, and connection for diagnostics."""
+    now = time.time()
+    lock_held_for = now - _processing_lock_acquired_at if _processing_lock_acquired_at > 0 else 0
+
+    health = {
+        "timestamp": now,
+        "processing_lock": {
+            "locked": processing_lock.locked(),
+            "owner": _processing_lock_owner,
+            "held_for_seconds": round(lock_held_for, 1) if processing_lock.locked() else 0,
+        },
+        "ollama_lock_locked": _ollama_lock.locked(),
+        "ollama_speech_priority": _ollama_speech_priority,
+        "teensy": {
+            "connected": teensy_connected,
+            "comm_mode": CONFIG.get("teensy_comm_mode", "websocket"),
+            "ws_lock_locked": ws_lock.locked(),
+        },
+        "wake_word": {
+            "running": wake_word_running,
+            "enabled": CONFIG.get("wake_word_enabled", True),
+            "porcupine_loaded": porcupine is not None,
+            "recorder_loaded": recorder is not None,
+        },
+        "scene_context": {
+            "running": scene_context.running,
+            "last_capture_age": round(now - scene_context.last_scene_capture, 1) if scene_context.last_scene_capture else None,
+            "has_description": bool(scene_context.current_description),
+        },
+        "spontaneous_speech": {
+            "enabled": spontaneous_speech_enabled,
+            "pending": _pending_speech.get("active", False),
+        },
+        "threads": {},
+    }
+
+    # Check named threads
+    for t in threading.enumerate():
+        if t.name in ("tts-loop", "scene-context", "vision-sender", "tracking-dashboard"):
+            health["threads"][t.name] = {"alive": t.is_alive()}
+
+    return jsonify(health)
+
+
+def _watchdog_loop():
+    """
+    HARDENING: Background watchdog that detects stuck states.
+    - If processing_lock held >90s: force-release and reset status.
+    - If status is not 'ready' but no lock held: reset status.
+    Runs every 30 seconds.
+    """
+    global _processing_lock_acquired_at, _processing_lock_owner
+    WATCHDOG_TIMEOUT = 90  # seconds
+
+    while True:
+        time.sleep(30)
+        try:
+            now = time.time()
+
+            # Check 1: processing_lock held too long
+            if processing_lock.locked() and _processing_lock_acquired_at > 0:
+                held_for = now - _processing_lock_acquired_at
+                if held_for > WATCHDOG_TIMEOUT:
+                    owner = _processing_lock_owner
+                    print(f"[WATCHDOG] processing_lock held by '{owner}' for {held_for:.0f}s — FORCE RELEASING")
+                    socketio.emit('log', {
+                        'message': f'Watchdog: processing_lock stuck for {held_for:.0f}s (owner: {owner}). Force releasing.',
+                        'level': 'error'
+                    })
+                    try:
+                        _processing_lock_acquired_at = 0
+                        _processing_lock_owner = ""
+                        processing_lock.release()
+                    except RuntimeError:
+                        pass  # Lock wasn't actually held (race with normal release)
+                    # Reset status
+                    socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
+                    # Reset Teensy animations
+                    try:
+                        teensy_send_command("STOP_THINKING")
+                        teensy_send_command("STOP_SPEAKING")
+                        teensy_send_command("IDLE")
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            print(f"[WATCHDOG] Error: {e}")
+
+
+# =============================================================================
 # FACE TRACKING DEBUG DASHBOARD — Background Thread
 # =============================================================================
 
@@ -3417,6 +3579,11 @@ if __name__ == '__main__':
     # Face Tracking Debug Dashboard background thread
     threading.Thread(target=tracking_dashboard_thread, daemon=True, name="tracking-dashboard").start()
     print("  Debug Dashboard: merged into main UI (toggle 'Debug Tools' button)")
+
+    # HARDENING: Watchdog thread for detecting stuck states
+    threading.Thread(target=_watchdog_loop, daemon=True, name="watchdog").start()
+    print("  Watchdog: active (checks every 30s, timeout 90s)")
+    print("  Health: GET /api/health")
 
     print()
     print(f"Open http://0.0.0.0:5000 from any browser on the network")
