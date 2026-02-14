@@ -282,9 +282,14 @@ class SceneContext:
 
     def _get_adaptive_interval(self):
         """Capture more often when interesting, less when boring."""
-        if self.face_present or self.last_salience >= 3:
+        # FIX: acquire lock — these fields are written by other threads
+        with self.lock:
+            face = self.face_present
+            sal = self.last_salience
+            nov = self.scene_novelty
+        if face or sal >= 3:
             return 4   # interesting: look every 4s
-        elif self.last_salience <= 1 and self.scene_novelty < 0.2:
+        elif sal <= 1 and nov < 0.2:
             return 12  # boring (walls, nothing new): slow down
         return 8       # default
 
@@ -2620,6 +2625,11 @@ def _execute_physical_expression(state, intent_strategy):
         return
     _last_physical_expression = now
 
+    # Check scene interest — don't explore toward boring stuff (walls, empty space)
+    with scene_context.lock:
+        scene_interest = scene_context.last_salience
+        has_objects = bool(scene_context.detected_objects)
+
     # Map intent strategy to emotional context
     emotion_map = {
         "subtle_movement": "curious",
@@ -2634,6 +2644,16 @@ def _execute_physical_expression(state, intent_strategy):
         "pointed_disinterest": "resigned",
     }
     emotional_context = emotion_map.get(intent_strategy, "curious")
+
+    # Scene-aware remapping: don't scan/explore toward walls and boring scenes
+    if scene_interest <= 1 and not has_objects:
+        # Nothing interesting — stay still, don't look around at nothing
+        boring_remap = {
+            "curious": "content",        # don't explore, just settle
+            "self_occupied": "resigned",  # fidget in place, don't scan
+            "playful": "content",
+        }
+        emotional_context = boring_remap.get(emotional_context, emotional_context)
 
     expr_name = physical_expression_mgr.select_expression(emotional_context)
     if not expr_name:
@@ -3596,17 +3616,22 @@ def send_vision_to_teensy():
                 )
 
                 if should_send:
-                    vision_cmd = scene_context.get_vision_command()
-                    teensy_send_command(vision_cmd)
+                    # Don't send boring heartbeats — they trigger Teensy curiosity
+                    # toward walls and empty space. Only send if actually interesting.
+                    if event_type == "heartbeat" and salience <= 1:
+                        pass  # suppress: nothing worth Teensy's attention
+                    else:
+                        vision_cmd = scene_context.get_vision_command()
+                        teensy_send_command(vision_cmd)
 
-                    # Log significant events
-                    if event_type and "person" in event_type:
-                        socketio.emit('log', {
-                            'message': f'Vision event: {event_type} (salience: {salience})',
-                            'level': 'info'
-                        })
+                        # Log significant events
+                        if event_type and "person" in event_type:
+                            socketio.emit('log', {
+                                'message': f'Vision event: {event_type} (salience: {salience})',
+                                'level': 'info'
+                            })
 
-                    # Feed event into narrative engine
+                    # Feed event into narrative engine (even suppressed ones)
                     if event_type:
                         narrative_engine.record_event(event_type)
 
