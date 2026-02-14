@@ -1,49 +1,34 @@
 # Buddy Voice Assistant
 
-## What This Is
-Flask/SocketIO server controlling a physical desk robot. Multi-threaded real-time system with wake word detection, STT (Whisper), LLM (Ollama), TTS (edge-tts), vision (ESP32-CAM), and serial/WebSocket communication to Teensy 4.0 microcontroller.
+Flask/SocketIO server for a physical desk robot. Python 3, multi-threaded.
 
-## Architecture
-- Main server: `buddy_web_full_V2.py`
-- Narrative engine: `narrative_engine.py` (personality, salience, scene awareness)
-- Intent manager: `intent_manager.py` (intent classification)
-- Salience filter: `salience_filter.py` (relevance scoring)
-- Physical expression: `physical_expression.py` (Teensy animation mapping)
+## Files
+- `buddy_web_full_V2.py` — main server (~2000 lines)
+- `narrative_engine.py` — personality, salience, scene context
+- `intent_manager.py` — intent classification
+- `salience_filter.py` — relevance scoring
+- `physical_expression.py` — Teensy animation mapping
 
-## Threading Model (CRITICAL)
-6+ concurrent threads sharing mutable globals. Key locks:
-- `processing_lock` — gates ALL speech generation
+## Critical Threading Info
+Key locks (ALL must use try/finally):
+- `processing_lock` — gates all speech generation
 - `_ollama_lock` — prevents LLM contention
-- `ws_lock` — WebSocket to ESP32 bridge
-- `teensy_state_lock` — Teensy state tracking
-- `porcupine_lock` — (MISSING, needs to be added) wake word access
+- `ws_lock` — WebSocket to ESP32
+- `teensy_state_lock` — Teensy state
+- `_pending_speech_lock` — delayed speech
 
-**Rule**: Never hold locks across blocking I/O. Never nest locks without consistent ordering. Always release in finally blocks.
+Rule: never hold locks across blocking I/O. Never nest locks.
 
-## External Dependencies
-- Ollama (localhost:11434) — can be slow 10-60s on CPU
-- Whisper base model — local STT
-- edge-tts — needs internet, can timeout
-- ESP32 WebSocket bridge — can disconnect randomly
-- buddy_vision.py (localhost:5555) — face tracking, may be offline
+## External Services
+- Ollama localhost:11434 (slow, 10-60s)
+- Whisper base (local STT)
+- edge-tts (needs internet)
+- ESP32 WebSocket (unreliable)
 
-## Build & Run
-```bash
-python buddy_web_full_V2.py
-```
-No test suite exists. Test manually by:
-1. Opening browser to localhost:5000
-2. Triggering wake word "Jarvis" or using push-to-talk button
-3. Verifying Buddy responds and returns to Ready state
+## Run
+`python buddy_web_full_V2.py` → browser localhost:5000
 
-## Known Bug Patterns
-- System can get stuck in "Transcribing..." requiring restart
-- Wake word crashes: "access violation reading 0x0000000000000008"
-- Threading races on porcupine/recorder objects (no lock)
-- Lock leaks on exception paths in process_input()
-
-## Code Style
-- Python 3.x, Flask/SocketIO
-- Globals for shared state (legacy pattern, don't refactor to classes)
-- SocketIO event handlers run on background threads
-- TTS uses dedicated asyncio event loop (`_tts_loop`)
+## Known Bugs
+- Gets stuck in "Transcribing..." requiring restart
+- Wake word crash: access violation on porcupine (race condition, no lock)
+- Lock leaks suspected on exception paths
