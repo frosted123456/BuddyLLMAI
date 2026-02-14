@@ -198,6 +198,14 @@ RAPPEL: Réponds avec SEULEMENT les mots de Buddy. Première personne. 1-3 phras
 #  but SceneContext uses CONFIG directly — keep them in sync)
 os.environ.setdefault("OLLAMA_HOST", CONFIG["ollama_host"])
 
+# FIX BUG-20: create Ollama client with HTTP-level timeout so that
+# leaked _query threads (after join timeout) don't run forever.
+# Falls back to module-level API if Client() is unavailable.
+try:
+    _ollama_client = ollama.Client(timeout=65.0)
+except Exception:
+    _ollama_client = None
+
 # =============================================================================
 # SCENE UNDERSTANDING — Phase C: Vision-aware context for LLM + Teensy
 # =============================================================================
@@ -634,6 +642,7 @@ recorder = None
 wake_word_thread = None
 wake_word_running = False
 wake_word_lock = threading.Lock()  # FIX BUG-04: protects porcupine/recorder from concurrent access
+_config_lock = threading.Lock()    # FIX BUG-19: protects CONFIG during bulk updates from SocketIO handlers
 processing_lock = threading.Lock()  # Phase 1C: BUG-4 fix — replaces bare bool is_processing
 _processing_lock_acquired_at = 0    # HARDENING: timestamp when processing_lock was acquired
 _processing_lock_owner = ""         # HARDENING: which function holds the lock
@@ -1563,26 +1572,28 @@ def connect_teensy_ws():
     """Connect via ESP32 WiFi-UART bridge (WebSocket)."""
     global ws_connection, teensy_connected
     try:
-        # FIX BUG-07: hold ws_lock while replacing connection to prevent
-        # teensy_send_ws from using a stale/closed connection
+        ip = CONFIG["esp32_ip"]
+        port = CONFIG["esp32_ws_port"]
+        url = f"ws://{ip}:{port}"
+
+        # FIX BUG-16: do blocking network I/O OUTSIDE ws_lock so
+        # teensy_send_ws isn't blocked for 5+ seconds during reconnection.
+        # Old connection stays usable until the atomic swap below.
+        new_conn = websocket.create_connection(url, timeout=5)
+        hello = new_conn.recv()
+        socketio.emit('log', {'message': f'ESP32 bridge connected: {hello}', 'level': 'success'})
+        new_conn.send("!QUERY")
+        resp = new_conn.recv()
+
+        # FIX BUG-07 (preserved): hold ws_lock ONLY for the pointer swap
         with ws_lock:
-            if ws_connection:
-                try: ws_connection.close()
-                except: pass
+            old_conn = ws_connection
+            ws_connection = new_conn
 
-            ip = CONFIG["esp32_ip"]
-            port = CONFIG["esp32_ws_port"]
-            url = f"ws://{ip}:{port}"
-
-            ws_connection = websocket.create_connection(url, timeout=5)
-
-            # Read welcome message from ESP32
-            hello = ws_connection.recv()
-            socketio.emit('log', {'message': f'ESP32 bridge connected: {hello}', 'level': 'success'})
-
-            # Test with QUERY
-            ws_connection.send("!QUERY")
-            resp = ws_connection.recv()
+        # Close old connection outside lock (safe — no thread references it now)
+        if old_conn:
+            try: old_conn.close()
+            except: pass
 
         if resp and '{' in resp:
             teensy_connected = True
@@ -1638,10 +1649,12 @@ def teensy_send_command(cmd, fallback=None):
 def teensy_send_ws(cmd, fallback=None):
     """Send command via ESP32 WebSocket bridge."""
     global ws_connection, teensy_connected
-    if not teensy_connected or not ws_connection: return None
 
     use_fallback = False  # FIX BUG-06: track fallback need outside lock scope
     with ws_lock:
+        # FIX BUG-18: check connection state INSIDE lock to prevent TOCTOU race
+        # (connection could be swapped between check and use without lock)
+        if not teensy_connected or not ws_connection: return None
         try:
             ws_connection.send(f"!{cmd}")
             ws_connection.settimeout(0.5)  # 500ms timeout
@@ -1886,7 +1899,13 @@ def wake_word_loop():
         if recorder: recorder.stop()
 
 def record_and_process():
-    global recorder, noise_floor
+    global noise_floor
+    # FIX BUG-17: capture local reference to recorder so init_wake_word()
+    # (called from config update thread) can't swap it out mid-recording
+    _rec = recorder
+    if not _rec:
+        socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
+        return
     # FIX BUG-05: removed dead spontaneous_speech_lock (never held elsewhere).
     # Mutual exclusion with spontaneous speech is handled by processing_lock.
     frames, silent_frames, speech_started, pre_speech_count = [], 0, False, 0
@@ -1899,7 +1918,7 @@ def record_and_process():
     adaptive_threshold = max(noise_floor * 3, 300)
     try:
         while True:
-            frame = recorder.read()
+            frame = _rec.read()  # FIX BUG-17: use local ref
             frames.extend(frame)
             amp = max(abs(min(frame)), abs(max(frame)))
             socketio.emit('audio_level', {'level': amp})
@@ -2166,7 +2185,10 @@ def query_ollama(text, img=None, timeout=60):
     def _query():
         try:
             t0 = time.time()
-            response = ollama.chat(
+            # FIX BUG-20: use _ollama_client (has HTTP timeout) so this thread
+            # dies after 65s even if join() times out and abandons it
+            _client = _ollama_client or ollama
+            response = _client.chat(
                 model=model,
                 messages=msgs
             )
@@ -2210,7 +2232,12 @@ async def generate_tts(text, volume=None):
         kwargs = dict(rate=CONFIG["tts_rate"])
         if volume:
             kwargs["volume"] = volume
-        await edge_tts.Communicate(text, CONFIG["tts_voice"], **kwargs).save(tp)
+        # FIX BUG-21: add timeout to edge-tts to prevent hangs and temp file leaks.
+        # If edge-tts hangs, wait_for cancels the coroutine and finally cleans up.
+        await asyncio.wait_for(
+            edge_tts.Communicate(text, CONFIG["tts_voice"], **kwargs).save(tp),
+            timeout=25
+        )
         with open(tp, "rb") as f: return base64.b64encode(f.read()).decode("utf-8")
     finally: os.unlink(tp)
 
@@ -2960,15 +2987,19 @@ def handle_get_config(): emit('config_loaded', CONFIG)
 
 @socketio.on('update_config')
 def handle_update_config(data):
-    ww_changed = data.get('wake_word') != CONFIG.get('wake_word') or data.get('wake_word_sensitivity') != CONFIG.get('wake_word_sensitivity')
-    for k, v in data.items(): CONFIG[k] = v
+    # FIX BUG-19: hold _config_lock during bulk update so other threads
+    # don't see a partially-updated CONFIG (e.g. new wake_word but old sensitivity)
+    with _config_lock:
+        ww_changed = data.get('wake_word') != CONFIG.get('wake_word') or data.get('wake_word_sensitivity') != CONFIG.get('wake_word_sensitivity')
+        for k, v in data.items(): CONFIG[k] = v
     emit('log', {'message': 'Config updated', 'level': 'success'})
     if ww_changed and CONFIG.get('wake_word_enabled'): init_wake_word(); emit('wake_word_status', {'enabled': True, 'word': CONFIG['wake_word']})
 
 @socketio.on('reconnect_teensy')
 def handle_reconnect_teensy(data):
-    CONFIG['teensy_auto_detect'] = data.get('auto_detect', True)
-    CONFIG['teensy_port'] = data.get('port', 'COM12')
+    with _config_lock:  # FIX BUG-19: atomic config update
+        CONFIG['teensy_auto_detect'] = data.get('auto_detect', True)
+        CONFIG['teensy_port'] = data.get('port', 'COM12')
     connect_teensy()
 
 @socketio.on('capture_image')
@@ -3599,7 +3630,7 @@ if __name__ == '__main__':
     # Phase 1H: OPT-3 — Validate Ollama model availability
     print(f"  Ollama host: {CONFIG['ollama_host']}")
     try:
-        result = ollama.list()
+        result = (_ollama_client or ollama).list()  # FIX BUG-20: use timeout client
         # Handle both old dict API and new object API (ollama >= 0.4)
         model_list = result.get('models', []) if isinstance(result, dict) else getattr(result, 'models', [])
         names = []
