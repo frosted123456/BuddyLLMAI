@@ -198,6 +198,14 @@ RAPPEL: Réponds avec SEULEMENT les mots de Buddy. Première personne. 1-3 phras
 #  but SceneContext uses CONFIG directly — keep them in sync)
 os.environ.setdefault("OLLAMA_HOST", CONFIG["ollama_host"])
 
+# FIX BUG-20: create Ollama client with HTTP-level timeout so that
+# leaked _query threads (after join timeout) don't run forever.
+# Falls back to module-level API if Client() is unavailable.
+try:
+    _ollama_client = ollama.Client(timeout=65.0)
+except Exception:
+    _ollama_client = None
+
 # =============================================================================
 # SCENE UNDERSTANDING — Phase C: Vision-aware context for LLM + Teensy
 # =============================================================================
@@ -634,9 +642,17 @@ recorder = None
 wake_word_thread = None
 wake_word_running = False
 wake_word_lock = threading.Lock()  # FIX BUG-04: protects porcupine/recorder from concurrent access
+_config_lock = threading.Lock()    # FIX BUG-19: protects CONFIG during bulk updates from SocketIO handlers
 processing_lock = threading.Lock()  # Phase 1C: BUG-4 fix — replaces bare bool is_processing
 _processing_lock_acquired_at = 0    # HARDENING: timestamp when processing_lock was acquired
 _processing_lock_owner = ""         # HARDENING: which function holds the lock
+_transcribing_since = 0             # FIX BUG-13: timestamp when transcription started (for watchdog)
+
+def _transcribing_since_set(t):
+    """Set transcription start time (0 to clear). Thread-safe under GIL."""
+    global _transcribing_since
+    _transcribing_since = t
+
 current_image_base64 = None
 
 # Teensy state
@@ -663,8 +679,7 @@ NOISE_FLOOR_ALPHA = 0.01
 
 # Spontaneous speech engine
 spontaneous_speech_enabled = True
-spontaneous_speech_lock = threading.Lock()
-spontaneous_utterance_log = []  # List of timestamps for rate limiting
+spontaneous_utterance_log = []  # List of timestamps for rate limiting  # FIX BUG-15: removed dead spontaneous_speech_lock (never acquired)
 SPONTANEOUS_MAX_PER_HOUR = 6
 SPONTANEOUS_MIN_GAP_SECONDS = 120  # 2 minutes between utterances (idle mode)
 last_spontaneous_utterance = 0
@@ -1557,26 +1572,28 @@ def connect_teensy_ws():
     """Connect via ESP32 WiFi-UART bridge (WebSocket)."""
     global ws_connection, teensy_connected
     try:
-        # FIX BUG-07: hold ws_lock while replacing connection to prevent
-        # teensy_send_ws from using a stale/closed connection
+        ip = CONFIG["esp32_ip"]
+        port = CONFIG["esp32_ws_port"]
+        url = f"ws://{ip}:{port}"
+
+        # FIX BUG-16: do blocking network I/O OUTSIDE ws_lock so
+        # teensy_send_ws isn't blocked for 5+ seconds during reconnection.
+        # Old connection stays usable until the atomic swap below.
+        new_conn = websocket.create_connection(url, timeout=5)
+        hello = new_conn.recv()
+        socketio.emit('log', {'message': f'ESP32 bridge connected: {hello}', 'level': 'success'})
+        new_conn.send("!QUERY")
+        resp = new_conn.recv()
+
+        # FIX BUG-07 (preserved): hold ws_lock ONLY for the pointer swap
         with ws_lock:
-            if ws_connection:
-                try: ws_connection.close()
-                except: pass
+            old_conn = ws_connection
+            ws_connection = new_conn
 
-            ip = CONFIG["esp32_ip"]
-            port = CONFIG["esp32_ws_port"]
-            url = f"ws://{ip}:{port}"
-
-            ws_connection = websocket.create_connection(url, timeout=5)
-
-            # Read welcome message from ESP32
-            hello = ws_connection.recv()
-            socketio.emit('log', {'message': f'ESP32 bridge connected: {hello}', 'level': 'success'})
-
-            # Test with QUERY
-            ws_connection.send("!QUERY")
-            resp = ws_connection.recv()
+        # Close old connection outside lock (safe — no thread references it now)
+        if old_conn:
+            try: old_conn.close()
+            except: pass
 
         if resp and '{' in resp:
             teensy_connected = True
@@ -1632,10 +1649,12 @@ def teensy_send_command(cmd, fallback=None):
 def teensy_send_ws(cmd, fallback=None):
     """Send command via ESP32 WebSocket bridge."""
     global ws_connection, teensy_connected
-    if not teensy_connected or not ws_connection: return None
 
     use_fallback = False  # FIX BUG-06: track fallback need outside lock scope
     with ws_lock:
+        # FIX BUG-18: check connection state INSIDE lock to prevent TOCTOU race
+        # (connection could be swapped between check and use without lock)
+        if not teensy_connected or not ws_connection: return None
         try:
             ws_connection.send(f"!{cmd}")
             ws_connection.settimeout(0.5)  # 500ms timeout
@@ -1880,7 +1899,13 @@ def wake_word_loop():
         if recorder: recorder.stop()
 
 def record_and_process():
-    global recorder, noise_floor
+    global noise_floor
+    # FIX BUG-17: capture local reference to recorder so init_wake_word()
+    # (called from config update thread) can't swap it out mid-recording
+    _rec = recorder
+    if not _rec:
+        socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
+        return
     # FIX BUG-05: removed dead spontaneous_speech_lock (never held elsewhere).
     # Mutual exclusion with spontaneous speech is handled by processing_lock.
     frames, silent_frames, speech_started, pre_speech_count = [], 0, False, 0
@@ -1893,7 +1918,7 @@ def record_and_process():
     adaptive_threshold = max(noise_floor * 3, 300)
     try:
         while True:
-            frame = recorder.read()
+            frame = _rec.read()  # FIX BUG-17: use local ref
             frames.extend(frame)
             amp = max(abs(min(frame)), abs(max(frame)))
             socketio.emit('audio_level', {'level': amp})
@@ -1913,8 +1938,29 @@ def record_and_process():
             wp = f.name
         try:
             socketio.emit('status', {'state': 'thinking', 'message': 'Transcribing...'})
+            _transcribing_since_set(time.time())  # FIX BUG-13: track for watchdog
             lang = CONFIG["whisper_language"]
-            r = whisper_model.transcribe(wp, fp16=False) if lang == "auto" else whisper_model.transcribe(wp, fp16=False, language=lang)
+            # FIX BUG-11: run whisper in a thread with timeout to prevent
+            # stuck "Transcribing..." if whisper hangs (blocks wake_word_loop)
+            _wh_result = [None]
+            _wh_error = [None]
+            def _do_transcribe_ww():
+                try:
+                    _wh_result[0] = whisper_model.transcribe(wp, fp16=False) if lang == "auto" else whisper_model.transcribe(wp, fp16=False, language=lang)
+                except Exception as e:
+                    _wh_error[0] = e
+            _wh_t = threading.Thread(target=_do_transcribe_ww, daemon=True)
+            _wh_t.start()
+            _wh_t.join(timeout=30)
+            _transcribing_since_set(0)  # FIX BUG-13: clear tracking
+            if _wh_t.is_alive():
+                print("[SPEECH] Whisper transcription timed out after 30s")
+                socketio.emit('log', {'message': 'Whisper transcription timed out', 'level': 'error'})
+                socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
+                return
+            if _wh_error[0]:
+                raise _wh_error[0]
+            r = _wh_result[0]
             text = r["text"].strip()
             if text and len(text) > 2:
                 # Hand off to thread so wake word loop resumes immediately
@@ -1923,6 +1969,7 @@ def record_and_process():
                 socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
         finally: os.unlink(wp)
     except Exception as e:
+        _transcribing_since_set(0)  # FIX BUG-13: ensure cleared on any error
         socketio.emit('log', {'message': f'Record error: {e}', 'level': 'error'})
         socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
 
@@ -1984,8 +2031,24 @@ def transcribe_audio(data):
     with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f: f.write(data); tp = f.name
     try:
         lang = CONFIG["whisper_language"]
-        r = whisper_model.transcribe(tp, fp16=False) if lang == "auto" else whisper_model.transcribe(tp, fp16=False, language=lang)
-        return r["text"].strip()
+        # FIX BUG-12: run whisper in a thread with timeout to prevent
+        # stuck "Transcribing..." on browser audio input path
+        _ta_result = [None]
+        _ta_error = [None]
+        def _do_transcribe_browser():
+            try:
+                _ta_result[0] = whisper_model.transcribe(tp, fp16=False) if lang == "auto" else whisper_model.transcribe(tp, fp16=False, language=lang)
+            except Exception as e:
+                _ta_error[0] = e
+        _ta_t = threading.Thread(target=_do_transcribe_browser, daemon=True)
+        _ta_t.start()
+        _ta_t.join(timeout=30)
+        _transcribing_since_set(0)  # FIX BUG-13: clear tracking
+        if _ta_t.is_alive():
+            raise TimeoutError("Whisper transcription timed out after 30s")
+        if _ta_error[0]:
+            raise _ta_error[0]
+        return _ta_result[0]["text"].strip()
     finally: os.unlink(tp)
 
 def get_vision_state():
@@ -2122,7 +2185,10 @@ def query_ollama(text, img=None, timeout=60):
     def _query():
         try:
             t0 = time.time()
-            response = ollama.chat(
+            # FIX BUG-20: use _ollama_client (has HTTP timeout) so this thread
+            # dies after 65s even if join() times out and abandons it
+            _client = _ollama_client or ollama
+            response = _client.chat(
                 model=model,
                 messages=msgs
             )
@@ -2166,7 +2232,12 @@ async def generate_tts(text, volume=None):
         kwargs = dict(rate=CONFIG["tts_rate"])
         if volume:
             kwargs["volume"] = volume
-        await edge_tts.Communicate(text, CONFIG["tts_voice"], **kwargs).save(tp)
+        # FIX BUG-21: add timeout to edge-tts to prevent hangs and temp file leaks.
+        # If edge-tts hangs, wait_for cancels the coroutine and finally cleans up.
+        await asyncio.wait_for(
+            edge_tts.Communicate(text, CONFIG["tts_voice"], **kwargs).save(tp),
+            timeout=25
+        )
         with open(tp, "rb") as f: return base64.b64encode(f.read()).decode("utf-8")
     finally: os.unlink(tp)
 
@@ -2916,15 +2987,19 @@ def handle_get_config(): emit('config_loaded', CONFIG)
 
 @socketio.on('update_config')
 def handle_update_config(data):
-    ww_changed = data.get('wake_word') != CONFIG.get('wake_word') or data.get('wake_word_sensitivity') != CONFIG.get('wake_word_sensitivity')
-    for k, v in data.items(): CONFIG[k] = v
+    # FIX BUG-19: hold _config_lock during bulk update so other threads
+    # don't see a partially-updated CONFIG (e.g. new wake_word but old sensitivity)
+    with _config_lock:
+        ww_changed = data.get('wake_word') != CONFIG.get('wake_word') or data.get('wake_word_sensitivity') != CONFIG.get('wake_word_sensitivity')
+        for k, v in data.items(): CONFIG[k] = v
     emit('log', {'message': 'Config updated', 'level': 'success'})
     if ww_changed and CONFIG.get('wake_word_enabled'): init_wake_word(); emit('wake_word_status', {'enabled': True, 'word': CONFIG['wake_word']})
 
 @socketio.on('reconnect_teensy')
 def handle_reconnect_teensy(data):
-    CONFIG['teensy_auto_detect'] = data.get('auto_detect', True)
-    CONFIG['teensy_port'] = data.get('port', 'COM12')
+    with _config_lock:  # FIX BUG-19: atomic config update
+        CONFIG['teensy_auto_detect'] = data.get('auto_detect', True)
+        CONFIG['teensy_port'] = data.get('port', 'COM12')
     connect_teensy()
 
 @socketio.on('capture_image')
@@ -2937,25 +3012,28 @@ def handle_capture_image():
 @socketio.on('text_input')
 def handle_text_input(data):
     text = data.get('text', '').strip()
-    if text: threading.Thread(target=process_input, args=(text, data.get('include_vision', False))).start()
+    if text: threading.Thread(target=process_input, args=(text, data.get('include_vision', False)), daemon=True).start()  # FIX BUG-14: daemon=True
 
 @socketio.on('audio_input')
 def handle_audio_input(data):
     emit('status', {'state': 'thinking', 'message': 'Transcribing...'})
+    _transcribing_since_set(time.time())  # FIX BUG-13: track for watchdog
     teensy_send_with_fallback("LISTENING", "LOOK:90,110")  # Attentive pose
     try:
         text = transcribe_audio(base64.b64decode(data.get('audio', '')))
-        if text and len(text) > 2: 
+        if text and len(text) > 2:
             emit('log', {'message': f'Heard: "{text}"', 'level': 'success'})
-            threading.Thread(target=process_input, args=(text, data.get('include_vision', False))).start()
-        else: 
+            threading.Thread(target=process_input, args=(text, data.get('include_vision', False)), daemon=True).start()  # FIX BUG-14: daemon=True
+        else:
             teensy_send_command("IDLE")
             emit('log', {'message': "Didn't catch that", 'level': 'warning'})
             emit('status', {'state': 'ready', 'message': 'Ready'})
-    except Exception as e: 
+    except Exception as e:
         teensy_send_command("IDLE")
         emit('error', {'message': str(e)})
         emit('status', {'state': 'ready', 'message': 'Ready'})
+    finally:
+        _transcribing_since_set(0)  # FIX BUG-13: clear tracking
 
 @socketio.on('pause_wake_word')
 def handle_pause(): CONFIG['wake_word_enabled'] = False
@@ -3212,6 +3290,10 @@ def api_health():
             "owner": _processing_lock_owner,
             "held_for_seconds": round(lock_held_for, 1) if processing_lock.locked() else 0,
         },
+        "transcribing": {  # FIX BUG-13: expose transcription state
+            "active": _transcribing_since > 0,
+            "since_seconds": round(now - _transcribing_since, 1) if _transcribing_since > 0 else 0,
+        },
         "ollama_lock_locked": _ollama_lock.locked(),
         "ollama_speech_priority": _ollama_speech_priority,
         "teensy": {
@@ -3239,7 +3321,7 @@ def api_health():
 
     # Check named threads
     for t in threading.enumerate():
-        if t.name in ("tts-loop", "scene-context", "vision-sender", "tracking-dashboard"):
+        if t.name in ("tts-loop", "scene-context", "vision-sender", "tracking-dashboard", "watchdog"):
             health["threads"][t.name] = {"alive": t.is_alive()}
 
     return jsonify(health)
@@ -3249,11 +3331,13 @@ def _watchdog_loop():
     """
     HARDENING: Background watchdog that detects stuck states.
     - If processing_lock held >90s: force-release and reset status.
-    - If status is not 'ready' but no lock held: reset status.
+    - If transcription stuck >45s: reset status (FIX BUG-13).
+    - Status recovery: if no lock/transcription active, emit Ready (hardening).
     Runs every 30 seconds.
     """
     global _processing_lock_acquired_at, _processing_lock_owner
-    WATCHDOG_TIMEOUT = 90  # seconds
+    WATCHDOG_TIMEOUT = 90   # seconds — processing lock
+    TRANSCRIBE_TIMEOUT = 45  # seconds — transcription (FIX BUG-13)
 
     while True:
         time.sleep(30)
@@ -3285,6 +3369,27 @@ def _watchdog_loop():
                         teensy_send_command("IDLE")
                     except Exception:
                         pass
+
+            # FIX BUG-13: Check 2 — transcription stuck too long
+            # Whisper now has a 30s thread timeout, but if that somehow fails
+            # (or an older code path is hit), this is the safety net.
+            ts = _transcribing_since
+            if ts > 0 and (now - ts) > TRANSCRIBE_TIMEOUT:
+                print(f"[WATCHDOG] Transcription stuck for {now - ts:.0f}s — resetting status")
+                socketio.emit('log', {
+                    'message': f'Watchdog: transcription stuck for {now - ts:.0f}s. Resetting.',
+                    'level': 'error'
+                })
+                _transcribing_since_set(0)
+                socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
+
+            # HARDENING: Status recovery — if nothing is active, ensure Ready
+            # Catches any edge case where status got stuck without lock/transcription
+            if (not processing_lock.locked()
+                    and _transcribing_since == 0
+                    and _processing_lock_acquired_at == 0):
+                # Emit Ready as a heartbeat — harmless if already Ready
+                socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
 
         except Exception as e:
             print(f"[WATCHDOG] Error: {e}")
@@ -3525,7 +3630,7 @@ if __name__ == '__main__':
     # Phase 1H: OPT-3 — Validate Ollama model availability
     print(f"  Ollama host: {CONFIG['ollama_host']}")
     try:
-        result = ollama.list()
+        result = (_ollama_client or ollama).list()  # FIX BUG-20: use timeout client
         # Handle both old dict API and new object API (ollama >= 0.4)
         model_list = result.get('models', []) if isinstance(result, dict) else getattr(result, 'models', [])
         names = []
