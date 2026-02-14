@@ -254,6 +254,12 @@ class SceneContext:
         self.face_expression = "neutral"
         self.last_face_count = 0
 
+        # Spatial attention: approximate world positions for interesting things
+        # When face is tracked, servo angles ≈ face's world position (PID centers it)
+        self.last_face_servo = None     # (base, nod) servo angles when face last seen
+        # When objects are first detected, associate with servo angle at capture time
+        self.object_servo_positions = {}  # name → {"base": x, "nod": y, "time": t}
+
         # Scene novelty (computed from description changes)
         self.scene_novelty = 0.0
 
@@ -320,6 +326,10 @@ class SceneContext:
                         try:
                             description = self._describe_frame(frame)
                             if description:
+                                # Snapshot servo BEFORE self.lock (no lock nesting)
+                                with teensy_state_lock:
+                                    cap_base = teensy_state.get("servoBase", 90)
+                                    cap_nod = teensy_state.get("servoNod", 115)
                                 with self.lock:
                                     if self.current_description:
                                         self._detect_changes(self.current_description, description)
@@ -337,7 +347,16 @@ class SceneContext:
                                                 self.scene_novelty = 0.5
                                         else:
                                             self.scene_novelty = 0.8
+                                    old_objects = set(self.detected_objects)
                                     self._extract_objects(description)
+                                    # Associate NEW objects with servo angle at capture time
+                                    new_objects = self.detected_objects - old_objects
+                                    cap_time = time.time()
+                                    for obj in new_objects:
+                                        self.object_servo_positions[obj] = {
+                                            "base": cap_base, "nod": cap_nod,
+                                            "time": cap_time
+                                        }
                                     # Score salience for adaptive capture interval
                                     score, _ = salience_filter.score_description(description)
                                     self.last_salience = score
@@ -507,8 +526,12 @@ class SceneContext:
             if obj in desc_lower:
                 self.detected_objects.add(obj)
 
-    def update_face_state(self, face_detected, expression="neutral"):
-        """Called from vision data handler to keep face state current."""
+    def update_face_state(self, face_detected, expression="neutral",
+                          servo_base=None, servo_nod=None):
+        """Called from vision data handler to keep face state current.
+        servo_base/servo_nod: current servo angles when face was seen.
+        When face is centered by PID, these approximate its world position.
+        """
         with self.lock:
             now = time.time()
             if face_detected and not self.face_present:
@@ -517,6 +540,32 @@ class SceneContext:
                 self.face_absent_since = now
             self.face_present = face_detected
             self.face_expression = expression
+            # Record where the face was (servo angles ≈ world position)
+            if face_detected and servo_base is not None:
+                self.last_face_servo = (servo_base, servo_nod)
+
+    def get_interesting_target(self):
+        """Return (base, nod) servo angles of the most interesting thing, or None.
+
+        Priority: face (if recently seen) > newest object > None.
+        All positions are approximate (servo angle when thing was seen).
+        Caller must NOT hold self.lock or teensy_state_lock.
+        """
+        with self.lock:
+            now = time.time()
+            # Face seen in last 30s — highest priority
+            if self.last_face_servo and self.face_present:
+                return self.last_face_servo
+
+            # Recently detected object — pick most recent
+            best = None
+            best_time = 0
+            for obj, pos in self.object_servo_positions.items():
+                # Only use positions from last 5 minutes
+                if now - pos["time"] < 300 and pos["time"] > best_time:
+                    best = (pos["base"], pos["nod"])
+                    best_time = pos["time"]
+            return best
 
     def get_vision_command(self):
         """Build the !VISION command string for Teensy."""
@@ -1793,9 +1842,13 @@ def teensy_poll_loop():
                 if scene_context.running:
                     vision = get_vision_state()
                     if vision:
+                        # s is local snapshot — pass servo angles so SceneContext
+                        # knows WHERE in the world the face/scene is
                         scene_context.update_face_state(
                             face_detected=vision.get("face_detected", False),
-                            expression=vision.get("face_expression", "neutral")
+                            expression=vision.get("face_expression", "neutral"),
+                            servo_base=s.get("servoBase", 90),
+                            servo_nod=s.get("servoNod", 115)
                         )
 
                 # Spontaneous speech check (skip in test mode)
@@ -1993,12 +2046,14 @@ def record_and_process():
             _wh_t = threading.Thread(target=_do_transcribe_ww, daemon=True)
             _wh_t.start()
             _wh_t.join(timeout=30)
-            _transcribing_since_set(0)  # FIX BUG-13: clear tracking
             if _wh_t.is_alive():
+                # Thread still running — keep _transcribing_since set so
+                # watchdog can detect and recover if this persists
                 print("[SPEECH] Whisper transcription timed out after 30s")
                 socketio.emit('log', {'message': 'Whisper transcription timed out', 'level': 'error'})
                 socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
                 return
+            _transcribing_since_set(0)  # Clear AFTER confirming thread finished
             if _wh_error[0]:
                 raise _wh_error[0]
             r = _wh_result[0]
@@ -2084,9 +2139,10 @@ def transcribe_audio(data):
         _ta_t = threading.Thread(target=_do_transcribe_browser, daemon=True)
         _ta_t.start()
         _ta_t.join(timeout=30)
-        _transcribing_since_set(0)  # FIX BUG-13: clear tracking
         if _ta_t.is_alive():
+            # Don't clear _transcribing_since — let watchdog track the hung thread
             raise TimeoutError("Whisper transcription timed out after 30s")
+        _transcribing_since_set(0)  # Clear AFTER confirming thread finished
         if _ta_error[0]:
             raise _ta_error[0]
         return _ta_result[0]["text"].strip()
@@ -2630,6 +2686,9 @@ def _execute_physical_expression(state, intent_strategy):
         scene_interest = scene_context.last_salience
         has_objects = bool(scene_context.detected_objects)
 
+    # Get target of most interesting thing (face > recent object > None)
+    target = scene_context.get_interesting_target()
+
     # Map intent strategy to emotional context
     emotion_map = {
         "subtle_movement": "curious",
@@ -2663,8 +2722,11 @@ def _execute_physical_expression(state, intent_strategy):
         base = teensy_state.get("servoBase", 90)
         nod = teensy_state.get("servoNod", 115)
 
+    # Pass target so expressions like pointed_look aim at the interesting thing
     commands = physical_expression_mgr.get_expression_commands(
-        expr_name, current_base=base, current_nod=nod
+        expr_name, current_base=base, current_nod=nod,
+        target_base=target[0] if target else None,
+        target_nod=target[1] if target else None
     )
 
     socketio.emit('log', {
@@ -3081,6 +3143,7 @@ def handle_audio_input(data):
     teensy_send_with_fallback("LISTENING", "LOOK:90,110")  # Attentive pose
     try:
         text = transcribe_audio(base64.b64decode(data.get('audio', '')))
+        _transcribing_since_set(0)  # Success — clear tracking
         if text and len(text) > 2:
             emit('log', {'message': f'Heard: "{text}"', 'level': 'success'})
             threading.Thread(target=process_input, args=(text, data.get('include_vision', False)), daemon=True).start()  # FIX BUG-14: daemon=True
@@ -3088,12 +3151,17 @@ def handle_audio_input(data):
             teensy_send_command("IDLE")
             emit('log', {'message': "Didn't catch that", 'level': 'warning'})
             emit('status', {'state': 'ready', 'message': 'Ready'})
+    except TimeoutError as e:
+        # Whisper thread still running — DON'T clear _transcribing_since so
+        # watchdog can track and recover. Status is reset for the browser.
+        teensy_send_command("IDLE")
+        emit('error', {'message': str(e)})
+        emit('status', {'state': 'ready', 'message': 'Ready'})
     except Exception as e:
         teensy_send_command("IDLE")
         emit('error', {'message': str(e)})
         emit('status', {'state': 'ready', 'message': 'Ready'})
-    finally:
-        _transcribing_since_set(0)  # FIX BUG-13: clear tracking
+        _transcribing_since_set(0)  # Only clear on non-timeout errors
 
 @socketio.on('pause_wake_word')
 def handle_pause(): CONFIG['wake_word_enabled'] = False
