@@ -65,6 +65,10 @@ class NarrativeEngine:
         # Tracks objects across scene descriptions for persistent reference
         self.object_memory = {}  # name → {first_seen, last_seen, times_seen, mentioned_by_buddy, state}
 
+        # ── Overheard Speech ──
+        # What Buddy has heard from ambient room listening
+        self.overheard_history = deque(maxlen=15)
+
         # ── Conversation state ──
         self.last_speech_time = 0
         self.total_utterances_session = 0
@@ -474,6 +478,11 @@ class NarrativeEngine:
             if obj_ctx:
                 sections.append(obj_ctx)
 
+            # 5b. Overheard context
+            overheard_ctx = self._get_overheard_context_unlocked()
+            if overheard_ctx:
+                sections.append(overheard_ctx)
+
             # 6. Recent events
             recent = [
                 e for e in self.recent_events
@@ -625,6 +634,67 @@ class NarrativeEngine:
                 if obj_name in self.object_memory:
                     if any(kw in text_lower for kw in keywords):
                         self.object_memory[obj_name]["mentioned_by_buddy"] = True
+
+    # ═══════════════════════════════════════════════════════
+    # OVERHEARD SPEECH — Ambient room listening context
+    # ═══════════════════════════════════════════════════════
+
+    def record_overheard(self, text, salience_score):
+        """Record something Buddy overheard (not directed at him)."""
+        with self.lock:
+            now = time.time()
+            self.overheard_history.append({
+                "text": text,
+                "time": now,
+                "salience": salience_score,
+            })
+
+            # If text mentions Buddy's name → high interest event
+            text_lower = text.lower()
+            buddy_names = ["buddy", "robot", "le robot", "petit robot"]
+            if any(name in text_lower for name in buddy_names):
+                self.recent_events.append({
+                    "event": "name_mentioned_nearby",
+                    "time": now,
+                    "buddy_reaction": "alert_interest",
+                })
+
+            # If text mentions objects Buddy can see → moderate interest
+            for obj_name in self.object_memory:
+                if obj_name in text_lower:
+                    self.recent_events.append({
+                        "event": f"overheard_mention_{obj_name}",
+                        "time": now,
+                        "buddy_reaction": "noticed",
+                    })
+                    break  # One event per overheard snippet is enough
+
+    def get_overheard_context(self):
+        """Build LLM context about what Buddy has overheard recently."""
+        with self.lock:
+            return self._get_overheard_context_unlocked()
+
+    def _get_overheard_context_unlocked(self):
+        """Build overheard context (caller must hold self.lock)."""
+        now = time.time()
+        # Only include recent overheard speech (last 5 minutes)
+        recent = [o for o in self.overheard_history if now - o["time"] < 300]
+        if not recent:
+            return ""
+
+        parts = ["What you've overheard nearby:"]
+        for o in recent[-5:]:  # Last 5 snippets
+            age = int(now - o["time"])
+            if age < 60:
+                time_str = f"{age}s ago"
+            else:
+                time_str = f"{age // 60}min ago"
+            text_short = o["text"][:80]
+            if len(o["text"]) > 80:
+                text_short += "..."
+            parts.append(f'  - "{text_short}" ({time_str})')
+
+        return "\n".join(parts)
 
     # ═══════════════════════════════════════════════════════
     # TIME-SINCE HELPERS

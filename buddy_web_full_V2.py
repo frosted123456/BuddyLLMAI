@@ -63,6 +63,7 @@ from physical_expression import (
     calculate_speech_delay,
     PHYSICAL_EXPRESSIONS,
 )
+from audio_context import AudioContext
 
 # =============================================================================
 # DEFAULT CONFIGURATION
@@ -120,6 +121,18 @@ CONFIG = {
     "spontaneous_speech_enabled": True,
     "spontaneous_max_per_hour": 6,
     "spontaneous_min_gap": 120,  # seconds
+
+    # Conversation Mode
+    "conversation_mode_enabled": True,
+    "conversation_window_seconds": 8,
+    "conversation_max_turns": 10,
+    "conversation_cooldown": 3,     # seconds after Buddy finishes speaking before listening
+
+    # Ambient Listening (privacy-sensitive — OFF by default)
+    "ambient_listening_enabled": False,
+    "ambient_transcription_interval": 8,
+    "ambient_salience_threshold": 3,
+    "ambient_react_threshold": 5,
 
     # System Prompt — Layered personality with subtext
     "system_prompt": """Tu ES Buddy. Tu parles TOUJOURS en français québécois. Tu comprends l'anglais et le français, mais tu réponds UNIQUEMENT en français. Tu parles à la première personne. Tu réponds avec SEULEMENT tes propres mots — 1-3 courtes phrases maximum. Jamais de narration, jamais de troisième personne, jamais d'essais ou d'analyses.
@@ -574,6 +587,7 @@ narrative_engine = NarrativeEngine()
 intent_manager = IntentManager()
 salience_filter = SalienceFilter()
 physical_expression_mgr = PhysicalExpressionManager()
+audio_context = AudioContext()
 
 # Pending speech state — used by the delayed speech system
 _pending_speech = {
@@ -596,10 +610,22 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 whisper_model = None
 porcupine = None
 recorder = None
+porcupine_lock = threading.Lock()   # Protects porcupine + recorder access
 wake_word_thread = None
 wake_word_running = False
 processing_lock = threading.Lock()  # Phase 1C: BUG-4 fix — replaces bare bool is_processing
 current_image_base64 = None
+
+# Echo suppression — timestamp until which wake word skips processing
+_tts_playing_until = 0
+
+# Conversation mode globals
+_conversation_mode = False
+_conversation_window_end = 0
+_conversation_turn_count = 0
+_max_conversation_turns = 10
+_conversation_history = []  # List of {"role": "user"/"assistant", "content": "..."}
+_MAX_CONVERSATION_HISTORY = 10
 
 # Teensy state
 teensy_serial = None
@@ -1065,6 +1091,8 @@ HTML_TEMPLATE = """
                 <div class="settings-section">
                     <h3>Behavior</h3>
                     <div class="setting-row-inline"><input type="checkbox" id="settingSpontaneous"><label for="settingSpontaneous">Spontaneous Speech</label></div>
+                    <div class="setting-row-inline"><input type="checkbox" id="settingConversationMode" checked><label for="settingConversationMode">Conversation Mode (follow-up listening)</label></div>
+                    <div class="setting-row-inline"><input type="checkbox" id="settingAmbientListening"><label for="settingAmbientListening">Ambient Listening (privacy-sensitive)</label></div>
                 </div>
                 <div class="settings-section">
                     <h3>Wake Word</h3>
@@ -1157,6 +1185,8 @@ HTML_TEMPLATE = """
             document.getElementById('settingTeensyAutoDetect').checked = d.teensy_auto_detect !== false;
             document.getElementById('settingTeensyPort').value = d.teensy_port || 'COM12';
             document.getElementById('settingSpontaneous').checked = d.spontaneous_speech_enabled || false;
+            document.getElementById('settingConversationMode').checked = d.conversation_mode_enabled !== false;
+            document.getElementById('settingAmbientListening').checked = d.ambient_listening_enabled || false;
             document.getElementById('settingWakeWordEnabled').checked = d.wake_word_enabled;
             document.getElementById('settingWakeWord').value = d.wake_word || 'jarvis';
             document.getElementById('settingWakeWordPath').value = d.wake_word_path || '';
@@ -1240,6 +1270,24 @@ HTML_TEMPLATE = """
         // Spontaneous speech toggle
         document.getElementById('settingSpontaneous').addEventListener('change', (e) => {
             socket.emit('toggle_spontaneous', { enabled: e.target.checked });
+        });
+
+        // Conversation mode toggle
+        document.getElementById('settingConversationMode').addEventListener('change', (e) => {
+            socket.emit('toggle_conversation_mode', { enabled: e.target.checked });
+        });
+
+        // Ambient listening toggle
+        document.getElementById('settingAmbientListening').addEventListener('change', (e) => {
+            socket.emit('toggle_ambient_listening', { enabled: e.target.checked });
+        });
+
+        // Conversation mode status events
+        socket.on('conversation_started', (d) => {
+            log('Conversation mode active (turn ' + (d.turn + 1) + '/' + d.max_turns + ')', 'info');
+        });
+        socket.on('conversation_ended', () => {
+            log('Conversation ended', 'info');
         });
 
         // ═══════════════════════════════════════════════════════════
@@ -1770,18 +1818,42 @@ def init_wake_word():
             socketio.emit('wake_word_status', {'enabled': False, 'word': 'disabled (no mic)'})
             return False
 
-        # Original init logic continues...
-        if porcupine: porcupine.delete()
-        wp = CONFIG.get("wake_word_path", "")
-        mp = CONFIG.get("wake_word_model_path", "")
-        if wp and os.path.exists(wp):
-            args = {"access_key": CONFIG["picovoice_access_key"], "keyword_paths": [wp], "sensitivities": [CONFIG["wake_word_sensitivity"]]}
-            if mp and os.path.exists(mp): args["model_path"] = mp
-            porcupine = pvporcupine.create(**args)
-        else:
-            porcupine = pvporcupine.create(access_key=CONFIG["picovoice_access_key"], keywords=[CONFIG["wake_word"]], sensitivities=[CONFIG["wake_word_sensitivity"]])
+        # Acquire lock to prevent wake_word_loop() from accessing stale objects
+        with porcupine_lock:
+            # Delete old porcupine
+            if porcupine:
+                try:
+                    porcupine.delete()
+                except Exception:
+                    pass
+                porcupine = None
+
+            # Delete old recorder — always recreate to match new frame_length
+            if recorder:
+                try:
+                    recorder.stop()
+                except Exception:
+                    pass  # May throw if not started
+                try:
+                    recorder.delete()
+                except Exception:
+                    pass
+                recorder = None
+
+            # Create new porcupine
+            wp = CONFIG.get("wake_word_path", "")
+            mp = CONFIG.get("wake_word_model_path", "")
+            if wp and os.path.exists(wp):
+                args = {"access_key": CONFIG["picovoice_access_key"], "keyword_paths": [wp], "sensitivities": [CONFIG["wake_word_sensitivity"]]}
+                if mp and os.path.exists(mp): args["model_path"] = mp
+                porcupine = pvporcupine.create(**args)
+            else:
+                porcupine = pvporcupine.create(access_key=CONFIG["picovoice_access_key"], keywords=[CONFIG["wake_word"]], sensitivities=[CONFIG["wake_word_sensitivity"]])
+
+            # Always create new recorder with matching frame_length
+            recorder = PvRecorder(device_index=-1, frame_length=porcupine.frame_length)
+
         socketio.emit('log', {'message': f'Wake word "{CONFIG["wake_word"]}" ready', 'level': 'success'})
-        if recorder is None: recorder = PvRecorder(device_index=-1, frame_length=porcupine.frame_length)
         return True
     except Exception as e:
         socketio.emit('log', {'message': f'Wake word init failed: {e}. Push-to-talk still works.', 'level': 'warning'})
@@ -1790,35 +1862,187 @@ def init_wake_word():
 
 def wake_word_loop():
     global wake_word_running, recorder, porcupine, noise_floor
+    global _conversation_mode, _conversation_window_end, _conversation_turn_count
     if not init_wake_word(): return
     socketio.emit('wake_word_status', {'enabled': True, 'word': CONFIG["wake_word"]})
     try:
-        recorder.start()
+        with porcupine_lock:
+            if recorder:
+                recorder.start()
         wake_word_running = True
         while wake_word_running:
-            if not CONFIG.get("wake_word_enabled", True): time.sleep(0.1); continue
+            if not CONFIG.get("wake_word_enabled", True) and not _conversation_mode:
+                time.sleep(0.1)
+                continue
+
+            # Flags set inside lock, actions taken outside
+            do_record_and_process = False
+            do_conversation_record = False
+            do_end_conversation = False
+
             try:
-                pcm = recorder.read()
-                if pcm:
-                    level = max(abs(min(pcm)), abs(max(pcm)))
-                    # Adapt noise floor during non-speech
-                    if level < noise_floor * 2:
-                        noise_floor = noise_floor * (1 - NOISE_FLOOR_ALPHA) + level * NOISE_FLOOR_ALPHA
-                    socketio.emit('audio_level', {'level': level})
-                if porcupine.process(pcm) >= 0:
-                    # Don't trigger wake word if Buddy is speaking spontaneously
-                    if processing_lock.locked():
+                # Acquire lock for read + process cycle only
+                with porcupine_lock:
+                    if porcupine is None or recorder is None:
+                        # During reinit — skip this cycle
+                        time.sleep(0.05)
                         continue
+
+                    pcm = recorder.read()
+
+                    # Feed frame to AudioContext for ambient listening
+                    if audio_context.enabled:
+                        audio_context.feed_frame(pcm)
+
+                    level = 0
+                    if pcm:
+                        level = max(abs(min(pcm)), abs(max(pcm)))
+                        # Adapt noise floor during non-speech
+                        if level < noise_floor * 2:
+                            noise_floor = noise_floor * (1 - NOISE_FLOOR_ALPHA) + level * NOISE_FLOOR_ALPHA
+
+                    # Echo suppression: if TTS is playing, drain buffer but skip processing
+                    if time.time() < _tts_playing_until:
+                        socketio.emit('audio_level', {'level': level})
+                        continue
+
+                    socketio.emit('audio_level', {'level': level})
+
+                    # ── Conversation mode: listen for follow-up ──
+                    if _conversation_mode:
+                        now = time.time()
+                        if now > _conversation_window_end:
+                            do_end_conversation = True
+                        else:
+                            # Use VAD-like amplitude detection for speech
+                            adaptive_threshold = max(noise_floor * 3, 300)
+                            if pcm and level > adaptive_threshold:
+                                _conversation_window_end = now + CONFIG.get("conversation_window_seconds", 8)
+                                do_conversation_record = True
+                            # else: no speech yet, keep waiting
+                    elif CONFIG.get("wake_word_enabled", True):
+                        # ── Normal wake word detection ──
+                        if porcupine.process(pcm) >= 0:
+                            if not processing_lock.locked():
+                                do_record_and_process = True
+
+                # ── Actions outside the lock (no deadlock risk) ──
+                if do_end_conversation:
+                    _end_conversation_mode()
+                elif do_conversation_record:
+                    socketio.emit('status', {
+                        'state': 'listening',
+                        'message': f'Listening (turn {_conversation_turn_count + 1}/{CONFIG.get("conversation_max_turns", 10)})...'
+                    })
+                    record_and_process_conversation()
+                elif do_record_and_process:
+                    _conversation_history.clear()
                     socketio.emit('wake_word_detected')
                     socketio.emit('status', {'state': 'listening', 'message': 'Listening...'})
                     teensy_send_command("PRESENCE")
-                    teensy_send_with_fallback("LISTENING", "LOOK:90,110")  # Fallback: look center/up
+                    teensy_send_with_fallback("LISTENING", "LOOK:90,110")
                     record_and_process()
+
             except Exception as e:
                 socketio.emit('log', {'message': f'Wake error: {e}', 'level': 'error'})
                 time.sleep(0.1)
     finally:
-        if recorder: recorder.stop()
+        with porcupine_lock:
+            if recorder:
+                try:
+                    recorder.stop()
+                except Exception:
+                    pass
+
+
+def _end_conversation_mode():
+    """Close conversation mode and return to normal wake word state."""
+    global _conversation_mode, _conversation_window_end, _conversation_turn_count
+    _conversation_mode = False
+    _conversation_window_end = 0
+    _conversation_turn_count = 0
+    _conversation_history.clear()
+    teensy_send_command("IDLE")
+    socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
+    socketio.emit('conversation_ended', {})
+    print("[SPEECH] Conversation mode ended")
+
+
+def record_and_process_conversation():
+    """Record and process speech as a conversation turn (no wake word needed)."""
+    global _conversation_turn_count, _conversation_mode, _conversation_window_end
+    global recorder, noise_floor
+
+    _conversation_turn_count += 1
+
+    # Safety limit
+    if _conversation_turn_count >= CONFIG.get("conversation_max_turns", 10):
+        _end_conversation_mode()
+        return
+
+    frames, silent_frames, speech_started, pre_speech_count = [], 0, True, 0
+    sr = 16000
+    fps = sr / 512
+    silence_needed = int(CONFIG["silence_duration"] * fps)
+    max_frames = int(CONFIG["max_recording_time"] * fps)
+    adaptive_threshold = max(noise_floor * 3, 300)
+
+    try:
+        while True:
+            with porcupine_lock:
+                if recorder is None:
+                    break
+                frame = recorder.read()
+                # Feed to AudioContext
+                if audio_context.enabled:
+                    audio_context.feed_frame(frame)
+
+            frames.extend(frame)
+            amp = max(abs(min(frame)), abs(max(frame)))
+            socketio.emit('audio_level', {'level': amp})
+            if amp > adaptive_threshold:
+                speech_started = True
+                silent_frames = 0
+            else:
+                if speech_started:
+                    silent_frames += 1
+
+            if speech_started and silent_frames >= silence_needed:
+                break
+            if len(frames) / sr > CONFIG["max_recording_time"]:
+                break
+
+        if not frames or len(frames) < sr * 0.3:
+            # Too short — extend window and continue listening
+            _conversation_window_end = time.time() + CONFIG.get("conversation_window_seconds", 8)
+            return
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            with wave.open(f.name, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(sr)
+                w.writeframes(struct.pack(f"{len(frames)}h", *frames))
+            wp = f.name
+
+        try:
+            socketio.emit('status', {'state': 'thinking', 'message': 'Transcribing...'})
+            lang = CONFIG["whisper_language"]
+            r = whisper_model.transcribe(wp, fp16=False) if lang == "auto" else whisper_model.transcribe(wp, fp16=False, language=lang)
+            text = r["text"].strip()
+            if text and len(text) > 2:
+                # Process as conversation turn (blocking — we're already in the wake_word_loop thread)
+                process_input(text, True, is_conversation=True)
+            else:
+                # No valid speech — extend window
+                _conversation_window_end = time.time() + CONFIG.get("conversation_window_seconds", 8)
+                socketio.emit('status', {'state': 'ready', 'message': f'Listening for follow-up...'})
+        finally:
+            os.unlink(wp)
+
+    except Exception as e:
+        socketio.emit('log', {'message': f'Conversation record error: {e}', 'level': 'error'})
+        _conversation_window_end = time.time() + CONFIG.get("conversation_window_seconds", 8)
 
 def record_and_process():
     global recorder, noise_floor
@@ -1835,7 +2059,13 @@ def record_and_process():
     adaptive_threshold = max(noise_floor * 3, 300)
     try:
         while True:
-            frame = recorder.read()
+            with porcupine_lock:
+                if recorder is None:
+                    break
+                frame = recorder.read()
+                # Feed to AudioContext
+                if audio_context.enabled:
+                    audio_context.feed_frame(frame)
             frames.extend(frame)
             amp = max(abs(min(frame)), abs(max(frame)))
             socketio.emit('audio_level', {'level': amp})
@@ -2023,6 +2253,13 @@ def get_buddy_state_prompt():
         state_parts.append("")
         state_parts.append(vision_context)
 
+    # Room audio context from ambient listening
+    if audio_context and audio_context.enabled:
+        room_ctx = audio_context.get_room_context()
+        if room_ctx:
+            state_parts.append("")
+            state_parts.append(room_ctx)
+
     buddy_state = "\n".join(state_parts)
 
     # Narrative context from the narrative engine
@@ -2033,11 +2270,12 @@ def get_buddy_state_prompt():
 
     return buddy_state, narrative_context, intent_context
 
-def query_ollama(text, img=None, timeout=60):
+def query_ollama(text, img=None, timeout=60, is_conversation=False):
     """
     Query Ollama with timeout and priority gating.
     Speech generation gets priority over scene descriptions.
     Uses the text-only model unless an image is provided.
+    When is_conversation=True, includes recent conversation history for multi-turn quality.
     """
     global _ollama_speech_priority
 
@@ -2046,6 +2284,11 @@ def query_ollama(text, img=None, timeout=60):
     prompt = prompt.replace("{narrative_context}", narrative_ctx)
     prompt = prompt.replace("{intent_context}", intent_ctx)
     msgs = [{"role": "system", "content": prompt}]
+
+    # Include conversation history for multi-turn conversations
+    if is_conversation and _conversation_history:
+        for turn in _conversation_history[-6:]:  # Last 3 exchanges
+            msgs.append(turn)
 
     # Use vision model only when an image is actually provided
     if img:
@@ -2059,7 +2302,7 @@ def query_ollama(text, img=None, timeout=60):
     error = [None]
     error_tb = [None]
 
-    print(f"[SPEECH] Calling Ollama model={model}, prompt_len={sum(len(m['content']) for m in msgs)}")
+    print(f"[SPEECH] Calling Ollama model={model}, prompt_len={sum(len(m.get('content', '')) for m in msgs)}, conversation={is_conversation}")
 
     def _query():
         try:
@@ -2097,6 +2340,14 @@ def query_ollama(text, img=None, timeout=60):
         if error[0]:
             print(f"[SPEECH] Ollama call failed: {error[0]}")
             raise error[0]
+
+        # Save to conversation history if in conversation mode
+        if is_conversation and result[0]:
+            _conversation_history.append({"role": "user", "content": text})
+            _conversation_history.append({"role": "assistant", "content": result[0]})
+            if len(_conversation_history) > _MAX_CONVERSATION_HISTORY * 2:
+                del _conversation_history[:2]  # Remove oldest exchange
+
         return result[0]
     finally:
         _ollama_lock.release()
@@ -2112,8 +2363,9 @@ async def generate_tts(text, volume=None):
         with open(tp, "rb") as f: return base64.b64encode(f.read()).decode("utf-8")
     finally: os.unlink(tp)
 
-def process_input(text, include_vision):
-    print(f'[SPEECH] Received user input: "{text[:80]}" (vision={include_vision})')
+def process_input(text, include_vision, is_conversation=False):
+    global _tts_playing_until, _conversation_mode, _conversation_window_end, _conversation_turn_count
+    print(f'[SPEECH] Received user input: "{text[:80]}" (vision={include_vision}, conv={is_conversation})')
     if not processing_lock.acquire(blocking=False):
         print("[SPEECH] Already processing, skipping")
         socketio.emit('log', {'message': 'Already processing, skipping', 'level': 'warning'})
@@ -2162,7 +2414,7 @@ def process_input(text, include_vision):
         
         # Query LLM (this is the slow part - 10-30 seconds on CPU)
         print(f"[SPEECH] Querying Ollama (model={CONFIG['ollama_model']})...")
-        resp = query_ollama(text, img)
+        resp = query_ollama(text, img, is_conversation=is_conversation)
         print(f'[SPEECH] Ollama response: "{(resp or "")[:100]}"')
 
         # Stop thinking animation
@@ -2198,25 +2450,44 @@ def process_input(text, include_vision):
         
         # Estimate speech duration (~80ms per character, clamped 1-30s)
         speech_duration = max(1.0, min(len(clean) * 0.08, 30.0))
-        
+
+        # Set echo suppression timestamp
+        _tts_playing_until = time.time() + speech_duration + 2.0
+        # Also set it on AudioContext for ambient listening echo suppression
+        audio_context.tts_playing_until = _tts_playing_until
+
         # Schedule cleanup after speech likely finishes
         def finish_speaking():
             time.sleep(speech_duration)
-            # Drain mic buffer to prevent echo self-trigger
-            if recorder:
-                for _ in range(5):
-                    try: recorder.read()
-                    except: break
             teensy_send_command("STOP_SPEAKING")
-            teensy_send_command("IDLE")
-            # Occasionally celebrate if mood is good
-            with teensy_state_lock:
-                valence = teensy_state.get('valence', 0)
-            if valence > 0.4:
-                teensy_send_with_fallback("CELEBRATE", "EXPRESS:content")
-        
+
+            # ── Conversation mode: keep listening for follow-up ──
+            if CONFIG.get("conversation_mode_enabled", True):
+                global _conversation_mode, _conversation_window_end
+                cooldown = CONFIG.get("conversation_cooldown", 3)
+                time.sleep(cooldown)
+                _conversation_mode = True
+                _conversation_window_end = time.time() + CONFIG.get("conversation_window_seconds", 8)
+                teensy_send_with_fallback("LISTENING", "LOOK:90,110")
+                socketio.emit('status', {
+                    'state': 'listening',
+                    'message': f'Listening for follow-up (turn {_conversation_turn_count + 1})...'
+                })
+                socketio.emit('conversation_started', {
+                    'turn': _conversation_turn_count,
+                    'max_turns': CONFIG.get("conversation_max_turns", 10)
+                })
+                print(f"[SPEECH] Conversation window opened (turn {_conversation_turn_count})")
+            else:
+                teensy_send_command("IDLE")
+                # Occasionally celebrate if mood is good
+                with teensy_state_lock:
+                    valence = teensy_state.get('valence', 0)
+                if valence > 0.4:
+                    teensy_send_with_fallback("CELEBRATE", "EXPRESS:content")
+
         threading.Thread(target=finish_speaking, daemon=True).start()
-        
+
         socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
         
     except Exception as e:
@@ -2257,6 +2528,9 @@ def check_spontaneous_speech(state):
     if processing_lock.locked():
         return
     if not state:
+        return
+    # Don't run spontaneous speech during active conversation
+    if _conversation_mode:
         return
 
     now = time.time()
@@ -2609,6 +2883,11 @@ def process_narrative_speech(strategy, saved_state):
 
         speech_duration = max(1.0, min(len(clean) * 0.08, 30.0))
 
+        # Set echo suppression timestamp for spontaneous speech too
+        global _tts_playing_until
+        _tts_playing_until = time.time() + speech_duration + 2.0
+        audio_context.tts_playing_until = _tts_playing_until
+
         # ═══ PHASE 4: POST-SPEECH ARC (watching) + RESPONSE DETECTION ═══
         def finish_and_watch():
             time.sleep(speech_duration)
@@ -2869,23 +3148,34 @@ def handle_capture_image():
 
 @socketio.on('text_input')
 def handle_text_input(data):
+    global _conversation_window_end
     text = data.get('text', '').strip()
-    if text: threading.Thread(target=process_input, args=(text, data.get('include_vision', False))).start()
+    if text:
+        # If in conversation mode, treat as conversation turn and extend window
+        is_conv = _conversation_mode
+        if is_conv:
+            _conversation_window_end = time.time() + CONFIG.get("conversation_window_seconds", 8)
+        threading.Thread(target=process_input, args=(text, data.get('include_vision', False), is_conv)).start()
 
 @socketio.on('audio_input')
 def handle_audio_input(data):
+    global _conversation_window_end
     emit('status', {'state': 'thinking', 'message': 'Transcribing...'})
     teensy_send_with_fallback("LISTENING", "LOOK:90,110")  # Attentive pose
     try:
         text = transcribe_audio(base64.b64decode(data.get('audio', '')))
-        if text and len(text) > 2: 
+        if text and len(text) > 2:
+            # If in conversation mode, treat as conversation turn
+            is_conv = _conversation_mode
+            if is_conv:
+                _conversation_window_end = time.time() + CONFIG.get("conversation_window_seconds", 8)
             emit('log', {'message': f'Heard: "{text}"', 'level': 'success'})
-            threading.Thread(target=process_input, args=(text, data.get('include_vision', False))).start()
-        else: 
+            threading.Thread(target=process_input, args=(text, data.get('include_vision', False), is_conv)).start()
+        else:
             teensy_send_command("IDLE")
             emit('log', {'message': "Didn't catch that", 'level': 'warning'})
             emit('status', {'state': 'ready', 'message': 'Ready'})
-    except Exception as e: 
+    except Exception as e:
         teensy_send_command("IDLE")
         emit('error', {'message': str(e)})
         emit('status', {'state': 'ready', 'message': 'Ready'})
@@ -2903,6 +3193,31 @@ def handle_toggle_spontaneous(data):
     CONFIG["spontaneous_speech_enabled"] = spontaneous_speech_enabled
     socketio.emit('log', {
         'message': f'Spontaneous speech {"enabled" if spontaneous_speech_enabled else "disabled"}',
+        'level': 'info'
+    })
+
+@socketio.on('toggle_conversation_mode')
+def handle_toggle_conversation_mode(data):
+    enabled = data.get('enabled', True)
+    CONFIG["conversation_mode_enabled"] = enabled
+    # If disabling while active, close conversation
+    if not enabled and _conversation_mode:
+        _end_conversation_mode()
+    socketio.emit('log', {
+        'message': f'Conversation mode {"enabled" if enabled else "disabled"}',
+        'level': 'info'
+    })
+
+@socketio.on('toggle_ambient_listening')
+def handle_toggle_ambient_listening(data):
+    enabled = data.get('enabled', True)
+    CONFIG["ambient_listening_enabled"] = enabled
+    if enabled:
+        audio_context.start()
+    else:
+        audio_context.stop()
+    socketio.emit('log', {
+        'message': f'Ambient listening {"enabled" if enabled else "disabled"}',
         'level': 'info'
     })
 
@@ -3413,6 +3728,23 @@ if __name__ == '__main__':
     print(f"  Intent Manager: active (goal pursuit, escalation)")
     print(f"  Salience Filter: active (attention scoring)")
     print(f"  Physical Expressions: active (non-verbal communication)")
+
+    # AudioContext — wire references and start if configured
+    audio_context.whisper_model = whisper_model
+    audio_context.narrative_engine = narrative_engine
+    audio_context.intent_manager = intent_manager
+    audio_context.socketio = socketio
+    audio_context.salience_store_threshold = CONFIG.get("ambient_salience_threshold", 3)
+    audio_context.salience_react_threshold = CONFIG.get("ambient_react_threshold", 5)
+    audio_context.transcription_interval = CONFIG.get("ambient_transcription_interval", 8)
+    if CONFIG.get("ambient_listening_enabled", False):
+        audio_context.start()
+        print(f"  AudioContext: active (ambient listening)")
+    else:
+        print(f"  AudioContext: inactive (enable in settings)")
+
+    # Conversation mode
+    print(f"  Conversation Mode: {'enabled' if CONFIG.get('conversation_mode_enabled', True) else 'disabled'}")
 
     # Face Tracking Debug Dashboard background thread
     threading.Thread(target=tracking_dashboard_thread, daemon=True, name="tracking-dashboard").start()

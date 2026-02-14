@@ -132,6 +132,15 @@ INTENT_TYPES = {
             "cautious_engagement",      # Level 1: Engaging but with residual attitude
         ],
     },
+    "react_to_overheard": {
+        "description": "Buddy overheard something interesting and wants to comment",
+        "escalation_window": 60,
+        "max_level": 1,
+        "strategies": [
+            "subtle_reaction",          # Level 0: Physical reaction (look toward speaker)
+            "unsolicited_comment",      # Level 1: Actually say something about what was heard
+        ],
+    },
 }
 
 # Strategies that use speech vs. physical expression only
@@ -146,6 +155,8 @@ SPEECH_STRATEGIES = {
     "theatrical_resignation", "pointed_disinterest",
     "musing_to_self", "passive_commentary",
     "skeptical_approach", "cautious_engagement",
+    # Overheard reaction strategies
+    "unsolicited_comment",
 }
 
 PHYSICAL_ONLY_STRATEGIES = {
@@ -153,6 +164,8 @@ PHYSICAL_ONLY_STRATEGIES = {
     "playful_movement", "ambient_presence", "pointed_silence",
     # Engagement cycle
     "idle_fidgeting",
+    # Overheard reaction
+    "subtle_reaction",
 }
 
 
@@ -565,6 +578,14 @@ class IntentManager:
                 "Engage with the person but let them know — through tone, "
                 "not through words — that you remember being ignored. "
                 "Quick to deflect if they don't respond."
+            ),
+            # ── Overheard reaction strategies ──
+            "unsolicited_comment": (
+                "You overheard something that caught your attention. "
+                "React to it naturally — you weren't TRYING to listen, "
+                "but you heard it and now you have thoughts. "
+                "Don't apologize for eavesdropping. You're a desk robot, "
+                "you can't exactly leave the room. Own it."
             ),
         }
         return guidance_map.get(strategy, "")
