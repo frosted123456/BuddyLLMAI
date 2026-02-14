@@ -637,6 +637,13 @@ wake_word_lock = threading.Lock()  # FIX BUG-04: protects porcupine/recorder fro
 processing_lock = threading.Lock()  # Phase 1C: BUG-4 fix — replaces bare bool is_processing
 _processing_lock_acquired_at = 0    # HARDENING: timestamp when processing_lock was acquired
 _processing_lock_owner = ""         # HARDENING: which function holds the lock
+_transcribing_since = 0             # FIX BUG-13: timestamp when transcription started (for watchdog)
+
+def _transcribing_since_set(t):
+    """Set transcription start time (0 to clear). Thread-safe under GIL."""
+    global _transcribing_since
+    _transcribing_since = t
+
 current_image_base64 = None
 
 # Teensy state
@@ -663,8 +670,7 @@ NOISE_FLOOR_ALPHA = 0.01
 
 # Spontaneous speech engine
 spontaneous_speech_enabled = True
-spontaneous_speech_lock = threading.Lock()
-spontaneous_utterance_log = []  # List of timestamps for rate limiting
+spontaneous_utterance_log = []  # List of timestamps for rate limiting  # FIX BUG-15: removed dead spontaneous_speech_lock (never acquired)
 SPONTANEOUS_MAX_PER_HOUR = 6
 SPONTANEOUS_MIN_GAP_SECONDS = 120  # 2 minutes between utterances (idle mode)
 last_spontaneous_utterance = 0
@@ -1913,8 +1919,29 @@ def record_and_process():
             wp = f.name
         try:
             socketio.emit('status', {'state': 'thinking', 'message': 'Transcribing...'})
+            _transcribing_since_set(time.time())  # FIX BUG-13: track for watchdog
             lang = CONFIG["whisper_language"]
-            r = whisper_model.transcribe(wp, fp16=False) if lang == "auto" else whisper_model.transcribe(wp, fp16=False, language=lang)
+            # FIX BUG-11: run whisper in a thread with timeout to prevent
+            # stuck "Transcribing..." if whisper hangs (blocks wake_word_loop)
+            _wh_result = [None]
+            _wh_error = [None]
+            def _do_transcribe_ww():
+                try:
+                    _wh_result[0] = whisper_model.transcribe(wp, fp16=False) if lang == "auto" else whisper_model.transcribe(wp, fp16=False, language=lang)
+                except Exception as e:
+                    _wh_error[0] = e
+            _wh_t = threading.Thread(target=_do_transcribe_ww, daemon=True)
+            _wh_t.start()
+            _wh_t.join(timeout=30)
+            _transcribing_since_set(0)  # FIX BUG-13: clear tracking
+            if _wh_t.is_alive():
+                print("[SPEECH] Whisper transcription timed out after 30s")
+                socketio.emit('log', {'message': 'Whisper transcription timed out', 'level': 'error'})
+                socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
+                return
+            if _wh_error[0]:
+                raise _wh_error[0]
+            r = _wh_result[0]
             text = r["text"].strip()
             if text and len(text) > 2:
                 # Hand off to thread so wake word loop resumes immediately
@@ -1923,6 +1950,7 @@ def record_and_process():
                 socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
         finally: os.unlink(wp)
     except Exception as e:
+        _transcribing_since_set(0)  # FIX BUG-13: ensure cleared on any error
         socketio.emit('log', {'message': f'Record error: {e}', 'level': 'error'})
         socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
 
@@ -1984,8 +2012,24 @@ def transcribe_audio(data):
     with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f: f.write(data); tp = f.name
     try:
         lang = CONFIG["whisper_language"]
-        r = whisper_model.transcribe(tp, fp16=False) if lang == "auto" else whisper_model.transcribe(tp, fp16=False, language=lang)
-        return r["text"].strip()
+        # FIX BUG-12: run whisper in a thread with timeout to prevent
+        # stuck "Transcribing..." on browser audio input path
+        _ta_result = [None]
+        _ta_error = [None]
+        def _do_transcribe_browser():
+            try:
+                _ta_result[0] = whisper_model.transcribe(tp, fp16=False) if lang == "auto" else whisper_model.transcribe(tp, fp16=False, language=lang)
+            except Exception as e:
+                _ta_error[0] = e
+        _ta_t = threading.Thread(target=_do_transcribe_browser, daemon=True)
+        _ta_t.start()
+        _ta_t.join(timeout=30)
+        _transcribing_since_set(0)  # FIX BUG-13: clear tracking
+        if _ta_t.is_alive():
+            raise TimeoutError("Whisper transcription timed out after 30s")
+        if _ta_error[0]:
+            raise _ta_error[0]
+        return _ta_result[0]["text"].strip()
     finally: os.unlink(tp)
 
 def get_vision_state():
@@ -2937,25 +2981,28 @@ def handle_capture_image():
 @socketio.on('text_input')
 def handle_text_input(data):
     text = data.get('text', '').strip()
-    if text: threading.Thread(target=process_input, args=(text, data.get('include_vision', False))).start()
+    if text: threading.Thread(target=process_input, args=(text, data.get('include_vision', False)), daemon=True).start()  # FIX BUG-14: daemon=True
 
 @socketio.on('audio_input')
 def handle_audio_input(data):
     emit('status', {'state': 'thinking', 'message': 'Transcribing...'})
+    _transcribing_since_set(time.time())  # FIX BUG-13: track for watchdog
     teensy_send_with_fallback("LISTENING", "LOOK:90,110")  # Attentive pose
     try:
         text = transcribe_audio(base64.b64decode(data.get('audio', '')))
-        if text and len(text) > 2: 
+        if text and len(text) > 2:
             emit('log', {'message': f'Heard: "{text}"', 'level': 'success'})
-            threading.Thread(target=process_input, args=(text, data.get('include_vision', False))).start()
-        else: 
+            threading.Thread(target=process_input, args=(text, data.get('include_vision', False)), daemon=True).start()  # FIX BUG-14: daemon=True
+        else:
             teensy_send_command("IDLE")
             emit('log', {'message': "Didn't catch that", 'level': 'warning'})
             emit('status', {'state': 'ready', 'message': 'Ready'})
-    except Exception as e: 
+    except Exception as e:
         teensy_send_command("IDLE")
         emit('error', {'message': str(e)})
         emit('status', {'state': 'ready', 'message': 'Ready'})
+    finally:
+        _transcribing_since_set(0)  # FIX BUG-13: clear tracking
 
 @socketio.on('pause_wake_word')
 def handle_pause(): CONFIG['wake_word_enabled'] = False
@@ -3212,6 +3259,10 @@ def api_health():
             "owner": _processing_lock_owner,
             "held_for_seconds": round(lock_held_for, 1) if processing_lock.locked() else 0,
         },
+        "transcribing": {  # FIX BUG-13: expose transcription state
+            "active": _transcribing_since > 0,
+            "since_seconds": round(now - _transcribing_since, 1) if _transcribing_since > 0 else 0,
+        },
         "ollama_lock_locked": _ollama_lock.locked(),
         "ollama_speech_priority": _ollama_speech_priority,
         "teensy": {
@@ -3239,7 +3290,7 @@ def api_health():
 
     # Check named threads
     for t in threading.enumerate():
-        if t.name in ("tts-loop", "scene-context", "vision-sender", "tracking-dashboard"):
+        if t.name in ("tts-loop", "scene-context", "vision-sender", "tracking-dashboard", "watchdog"):
             health["threads"][t.name] = {"alive": t.is_alive()}
 
     return jsonify(health)
@@ -3249,11 +3300,13 @@ def _watchdog_loop():
     """
     HARDENING: Background watchdog that detects stuck states.
     - If processing_lock held >90s: force-release and reset status.
-    - If status is not 'ready' but no lock held: reset status.
+    - If transcription stuck >45s: reset status (FIX BUG-13).
+    - Status recovery: if no lock/transcription active, emit Ready (hardening).
     Runs every 30 seconds.
     """
     global _processing_lock_acquired_at, _processing_lock_owner
-    WATCHDOG_TIMEOUT = 90  # seconds
+    WATCHDOG_TIMEOUT = 90   # seconds — processing lock
+    TRANSCRIBE_TIMEOUT = 45  # seconds — transcription (FIX BUG-13)
 
     while True:
         time.sleep(30)
@@ -3285,6 +3338,27 @@ def _watchdog_loop():
                         teensy_send_command("IDLE")
                     except Exception:
                         pass
+
+            # FIX BUG-13: Check 2 — transcription stuck too long
+            # Whisper now has a 30s thread timeout, but if that somehow fails
+            # (or an older code path is hit), this is the safety net.
+            ts = _transcribing_since
+            if ts > 0 and (now - ts) > TRANSCRIBE_TIMEOUT:
+                print(f"[WATCHDOG] Transcription stuck for {now - ts:.0f}s — resetting status")
+                socketio.emit('log', {
+                    'message': f'Watchdog: transcription stuck for {now - ts:.0f}s. Resetting.',
+                    'level': 'error'
+                })
+                _transcribing_since_set(0)
+                socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
+
+            # HARDENING: Status recovery — if nothing is active, ensure Ready
+            # Catches any edge case where status got stuck without lock/transcription
+            if (not processing_lock.locked()
+                    and _transcribing_since == 0
+                    and _processing_lock_acquired_at == 0):
+                # Emit Ready as a heartbeat — harmless if already Ready
+                socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
 
         except Exception as e:
             print(f"[WATCHDOG] Error: {e}")
