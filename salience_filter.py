@@ -123,15 +123,30 @@ class SalienceFilter:
             score = max(score, 1)
             reasons.append("environment")
 
-        # Level 0: Suppress irrelevant
+        # Level 0: Suppress irrelevant — walls, empty space, boring environment
         suppress_words = [
             "shadow", "reflection", "texture", "light on wall",
             "corner of", "edge of", "similar to before",
-            "unchanged", "same as", "nothing new"
+            "unchanged", "same as", "nothing new",
+            "empty wall", "blank wall", "plain wall", "bare wall",
+            "empty desk", "nothing on", "no objects", "nothing interesting",
+            "ceiling", "carpet", "curtain", "blinds",
+            "empty room", "empty space",
         ]
         if any(w in desc_lower for w in suppress_words) and score < 2:
             score = 0
             reasons = ["suppressed_irrelevant"]
+
+        # Suppress pure environment descriptions with no identifiable objects
+        only_env_words = {"desk", "table", "room", "wall", "floor", "ceiling",
+                          "door", "window", "chair", "light", "dark", "empty"}
+        desc_tokens = set(re.findall(r'\w+', desc_lower))
+        if score <= 1 and desc_tokens and desc_tokens.issubset(
+                only_env_words | {"the", "a", "an", "is", "are", "on", "in", "of",
+                                  "and", "with", "to", "it", "there", "no", "just",
+                                  "same", "nothing", "very", "still", "only"}):
+            score = 0
+            reasons = ["suppressed_boring_environment"]
 
         return (score, ", ".join(reasons) if reasons else "generic")
 
