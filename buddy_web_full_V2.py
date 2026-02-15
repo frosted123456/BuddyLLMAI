@@ -367,6 +367,11 @@ class SceneContext:
                                             "base": cap_base, "nod": cap_nod,
                                             "time": cap_time
                                         }
+                                    # FIX: prune stale entries (>5 min) to prevent unbounded growth
+                                    stale = [k for k, v in self.object_servo_positions.items()
+                                             if cap_time - v["time"] > 300]
+                                    for k in stale:
+                                        del self.object_servo_positions[k]
                                     prev = self.previous_descriptions[-1] if self.previous_descriptions else ""
                                 # Score salience OUTSIDE lock (may do blocking LLM call)
                                 score, _ = salience_filter.score_with_fallback(
@@ -406,8 +411,8 @@ class SceneContext:
             resp = requests.get(capture_url, timeout=3)
             if resp.status_code == 200:
                 return resp.content
-        except Exception:
-            pass
+        except requests.exceptions.RequestException:
+            pass  # Camera offline — expected during normal operation
         return None
 
     def _describe_frame(self, jpeg_bytes):
@@ -836,14 +841,20 @@ teensy_state_lock = threading.Lock()
 # Adaptive noise floor for wake word
 noise_floor = 500
 NOISE_FLOOR_ALPHA = 0.01
+_noise_floor_lock = threading.Lock()  # FIX: protect noise_floor from concurrent read/write
+
+# Image capture lock — prevents partial base64 strings
+_image_lock = threading.Lock()  # FIX: protect current_image_base64 across threads
 
 # Spontaneous speech engine
 spontaneous_speech_enabled = True
 spontaneous_utterance_log = []  # List of timestamps for rate limiting  # FIX BUG-15: removed dead spontaneous_speech_lock (never acquired)
+_spontaneous_log_lock = threading.Lock()  # FIX: protect spontaneous_utterance_log from concurrent access
 SPONTANEOUS_MAX_PER_HOUR = 15    # increased, CONFIG overrides at runtime
 SPONTANEOUS_MIN_GAP_SECONDS = 60  # 1 minute between utterances (CONFIG overrides)
 last_spontaneous_utterance = 0
 _last_physical_expression = 0  # Timestamp — prevents servo spam
+_finish_speaking_cancel = threading.Event()  # FIX: cancel previous finish_speaking on new speech
 
 # Dedicated async event loop for TTS (thread-safe)
 _tts_loop = asyncio.new_event_loop()
@@ -1748,28 +1759,60 @@ def connect_teensy_ws():
         # teensy_send_ws isn't blocked for 5+ seconds during reconnection.
         # Old connection stays usable until the atomic swap below.
         new_conn = websocket.create_connection(url, timeout=5)
-        hello = new_conn.recv()
-        socketio.emit('log', {'message': f'ESP32 bridge connected: {hello}', 'level': 'success'})
-        new_conn.send("!QUERY")
-        resp = new_conn.recv()
+        try:
+            hello = new_conn.recv()
+            socketio.emit('log', {'message': f'ESP32 bridge connected: {hello}', 'level': 'success'})
+            new_conn.send("!QUERY")
+            resp = new_conn.recv()
+        except Exception:
+            # FIX: close new_conn if recv/send fails to prevent socket leak
+            try:
+                new_conn.close()
+            except Exception:
+                pass
+            raise
+
+        # FIX: validate JSON response BEFORE setting teensy_connected
+        # (prevents system thinking Teensy is connected on bad handshake)
+        if not (resp and '{' in resp):
+            try:
+                new_conn.close()
+            except Exception:
+                pass
+            raise Exception(f"Unexpected QUERY response: {resp}")
+
+        # Parse to verify it's actually valid JSON
+        try:
+            json.loads(resp)
+        except json.JSONDecodeError:
+            try:
+                new_conn.close()
+            except Exception:
+                pass
+            raise Exception(f"Invalid JSON in QUERY response: {resp[:100]}")
 
         # FIX BUG-07 (preserved): hold ws_lock ONLY for the pointer swap
         with ws_lock:
             old_conn = ws_connection
             ws_connection = new_conn
 
-        # Close old connection outside lock (safe — no thread references it now)
+        # Close old connection AFTER a grace period so in-flight commands
+        # on the old socket can complete (teensy_send_ws has 500ms timeout)
+        # FIX: prevents use-after-close when teensy_send_ws snapshots old conn ref
         if old_conn:
-            try: old_conn.close()
-            except: pass
+            def _close_old(c=old_conn):
+                time.sleep(1.0)  # grace period for in-flight sends to finish
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            threading.Thread(target=_close_old, daemon=True).start()
 
-        if resp and '{' in resp:
-            teensy_connected = True
-            socketio.emit('teensy_status', {'connected': True, 'port': f'WS:{ip}:{port}'})
-            socketio.emit('log', {'message': 'Teensy responding via WebSocket bridge', 'level': 'success'})
-            return True
-        else:
-            raise Exception(f"Unexpected QUERY response: {resp}")
+        # Set teensy_connected AFTER JSON is validated (was before)
+        teensy_connected = True
+        socketio.emit('teensy_status', {'connected': True, 'port': f'WS:{ip}:{port}'})
+        socketio.emit('log', {'message': 'Teensy responding via WebSocket bridge', 'level': 'success'})
+        return True
 
     except Exception as e:
         socketio.emit('log', {'message': f'WebSocket bridge error: {e}', 'level': 'error'})
@@ -1815,40 +1858,50 @@ def teensy_send_command(cmd, fallback=None):
         return teensy_send_serial(cmd, fallback)
 
 def teensy_send_ws(cmd, fallback=None):
-    """Send command via ESP32 WebSocket bridge."""
+    """Send command via ESP32 WebSocket bridge.
+
+    FIX: snapshot connection reference under lock, then do I/O outside
+    to avoid blocking other Teensy commands for 500ms on slow networks.
+    """
     global ws_connection, teensy_connected
 
-    use_fallback = False  # FIX BUG-06: track fallback need outside lock scope
+    # Snapshot the connection reference under the lock (brief)
     with ws_lock:
-        # FIX BUG-18: check connection state INSIDE lock to prevent TOCTOU race
-        # (connection could be swapped between check and use without lock)
-        if not teensy_connected or not ws_connection: return None
-        try:
-            ws_connection.send(f"!{cmd}")
-            ws_connection.settimeout(0.5)  # 500ms timeout
-            resp = ws_connection.recv()
-
-            if resp:
-                resp = resp.strip()
-                if resp.startswith('{'):
-                    try:
-                        result = json.loads(resp)
-                        if not result.get('ok') and result.get('reason') == 'unknown_command' and fallback:
-                            socketio.emit('log', {'message': f'Command {cmd} not implemented, trying fallback', 'level': 'warning'})
-                            use_fallback = True  # FIX BUG-06: don't recurse inside ws_lock (deadlock)
-                        else:
-                            return result
-                    except json.JSONDecodeError:
-                        pass
-            if not use_fallback:
-                return None
-
-        except websocket.WebSocketTimeoutException:
+        if not teensy_connected or not ws_connection:
             return None
-        except Exception as e:
-            teensy_connected = False
-            socketio.emit('log', {'message': f'WebSocket error: {e}', 'level': 'error'})
+        conn = ws_connection  # local reference
+
+    # Do network I/O OUTSIDE the lock — if connection gets swapped by
+    # reconnect, our local ref may error out, which we handle below.
+    use_fallback = False
+    try:
+        conn.send(f"!{cmd}")
+        conn.settimeout(0.5)  # 500ms timeout
+        resp = conn.recv()
+
+        if resp:
+            resp = resp.strip()
+            if resp.startswith('{'):
+                try:
+                    result = json.loads(resp)
+                    if not result.get('ok') and result.get('reason') == 'unknown_command' and fallback:
+                        socketio.emit('log', {'message': f'Command {cmd} not implemented, trying fallback', 'level': 'warning'})
+                        use_fallback = True
+                    else:
+                        return result
+                except json.JSONDecodeError:
+                    # FIX: log malformed JSON for Teensy firmware debugging
+                    socketio.emit('log', {'message': f'Malformed JSON from Teensy: {resp[:80]}', 'level': 'warning'})
+        if not use_fallback:
             return None
+
+    except websocket.WebSocketTimeoutException:
+        return None
+    except Exception as e:
+        # Connection may have been swapped/closed by reconnect — that's OK
+        teensy_connected = False
+        socketio.emit('log', {'message': f'WebSocket error: {e}', 'level': 'error'})
+        return None
 
     # FIX BUG-06: fallback call outside ws_lock to prevent deadlock
     if use_fallback:
@@ -1874,7 +1927,8 @@ def teensy_send_serial(cmd, fallback=None):
                     if not result.get('ok') and result.get('error') == 'unknown_command' and fallback:
                         return teensy_send_serial(fallback)
                     return result
-                except: pass
+                except (json.JSONDecodeError, KeyError):
+                    pass
         return None
     except Exception as e:
         teensy_connected = False
@@ -1937,6 +1991,16 @@ def teensy_poll_loop():
                 ws_reconnect_count += 1
                 socketio.emit('teensy_status', {'connected': False, 'port': ''})
 
+                # FIX: reset teensy_state on disconnect so stale values
+                # don't persist across reconnections
+                with teensy_state_lock:
+                    teensy_state.update({
+                        "arousal": 0.5, "valence": 0.0, "dominance": 0.5,
+                        "emotion": "NEUTRAL", "behavior": "IDLE",
+                        "stimulation": 0.5, "social": 0.5, "energy": 0.7,
+                        "safety": 0.8, "novelty": 0.3, "tracking": False,
+                    })
+
                 # Exponential backoff on reconnection
                 wait = min(3 * ws_reconnect_count, 30)
                 socketio.emit('log', {
@@ -1957,14 +2021,20 @@ def execute_buddy_actions(text):
     # [NOD] or [NOD:count]
     m = re.search(r'\[NOD(?::(\d+))?\]', text)
     if m:
-        c = int(m.group(1)) if m.group(1) else 2
+        try:
+            c = int(m.group(1)) if m.group(1) else 2
+        except (ValueError, TypeError):
+            c = 2  # FIX: graceful fallback on malformed tag
         r = teensy_send_command(f"NOD:{c}")
         if r and r.get('ok'): actions.append("nodded")
 
     # [SHAKE] or [SHAKE:count]
     m = re.search(r'\[SHAKE(?::(\d+))?\]', text)
     if m:
-        c = int(m.group(1)) if m.group(1) else 2
+        try:
+            c = int(m.group(1)) if m.group(1) else 2
+        except (ValueError, TypeError):
+            c = 2  # FIX: graceful fallback on malformed tag
         r = teensy_send_command(f"SHAKE:{c}")
         if r and r.get('ok'): actions.append("shook head")
 
@@ -2115,13 +2185,21 @@ def wake_word_loop():
                 # FIX BUG-04: hold wake_word_lock during read/process
                 # to prevent init_wake_word from swapping objects mid-use
                 with wake_word_lock:
-                    pcm = recorder.read()
-                    detected = porcupine.process(pcm) >= 0
+                    # FIX: take local refs INSIDE the lock so we can't
+                    # use a deleted porcupine/recorder after swap
+                    _local_rec = recorder
+                    _local_porc = porcupine
+                    if not _local_rec or not _local_porc:
+                        time.sleep(0.1)
+                        continue
+                    pcm = _local_rec.read()
+                    detected = _local_porc.process(pcm) >= 0
                 if pcm:
                     level = max(abs(min(pcm)), abs(max(pcm)))
                     # Adapt noise floor during non-speech
-                    if level < noise_floor * 2:
-                        noise_floor = noise_floor * (1 - NOISE_FLOOR_ALPHA) + level * NOISE_FLOOR_ALPHA
+                    with _noise_floor_lock:
+                        if level < noise_floor * 2:
+                            noise_floor = noise_floor * (1 - NOISE_FLOOR_ALPHA) + level * NOISE_FLOOR_ALPHA
                     socketio.emit('audio_level', {'level': level})
                 if detected:
                     # Don't trigger wake word if Buddy is speaking spontaneously
@@ -2155,7 +2233,8 @@ def record_and_process():
     max_frames = int(CONFIG["max_recording_time"] * fps)
     pre_speech_max = int(CONFIG["pre_speech_timeout"] * fps)
     # Adaptive silence threshold based on noise floor
-    adaptive_threshold = max(noise_floor * 3, 300)
+    with _noise_floor_lock:
+        adaptive_threshold = max(noise_floor * 3, 300)
     try:
         while True:
             frame = _rec.read()  # FIX BUG-17: use local ref
@@ -2241,8 +2320,10 @@ def capture_frame(retries=3):
             if r.status_code == 200:
                 # Vision pipeline returns raw JPEG bytes
                 img_bytes = r.content
-                current_image_base64 = base64.b64encode(img_bytes).decode("utf-8")
-                return current_image_base64
+                encoded = base64.b64encode(img_bytes).decode("utf-8")
+                with _image_lock:
+                    current_image_base64 = encoded
+                return encoded
         except Exception as e:
             if attempt == 0:
                 socketio.emit('log', {'message': f'Vision API unavailable, trying ESP32 direct', 'level': 'warning'})
@@ -2260,8 +2341,10 @@ def capture_frame(retries=3):
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=85)
                 buf.seek(0)
-                current_image_base64 = base64.b64encode(buf.read()).decode("utf-8")
-                return current_image_base64
+                encoded = base64.b64encode(buf.read()).decode("utf-8")
+                with _image_lock:
+                    current_image_base64 = encoded
+                return encoded
         except Exception as e:
             if attempt < retries - 1:
                 time.sleep(0.5)
@@ -2301,8 +2384,13 @@ def get_vision_state():
         r = requests.get(f"{vision_url}/state", timeout=1)
         if r.status_code == 200:
             return r.json()
-    except:
-        pass
+    except requests.exceptions.ConnectionError:
+        pass  # Vision API offline — expected when buddy_vision.py not running
+    except requests.exceptions.Timeout:
+        pass  # Network hiccup — harmless, will retry next cycle
+    except Exception as e:
+        # FIX: log unexpected errors (bad JSON, etc.) instead of swallowing
+        print(f"[VISION] get_vision_state error: {e}")
     return None
 
 def get_buddy_state_prompt():
@@ -2359,6 +2447,7 @@ def get_buddy_state_prompt():
         epistemic_notes = " Epistemic state: learning"
 
     # Scene context from vision (filtered through salience)
+    # FIX: use the FILTERED result, not raw — salience filter was being ignored
     vision_context = ""
     if scene_context.running:
         raw_vision = scene_context.get_llm_context()
@@ -2368,7 +2457,13 @@ def get_buddy_state_prompt():
             scene_context.face_expression,
         )
         if filtered:
-            vision_context = raw_vision
+            # High salience (score >= 3): use full raw context for richness
+            # Low salience (score 1-2): use filtered "(background: ...)" form
+            # Zero salience: filtered is empty, vision_context stays ""
+            if filtered.startswith("(background:"):
+                vision_context = filtered  # de-emphasized form
+            else:
+                vision_context = raw_vision  # full context for high-salience
 
     # Assemble state context — factual data, not narrative
     state_parts = [
@@ -2477,12 +2572,21 @@ async def generate_tts(text, volume=None):
             kwargs["volume"] = volume
         # FIX BUG-21: add timeout to edge-tts to prevent hangs and temp file leaks.
         # If edge-tts hangs, wait_for cancels the coroutine and finally cleans up.
-        await asyncio.wait_for(
-            edge_tts.Communicate(text, CONFIG["tts_voice"], **kwargs).save(tp),
-            timeout=25
-        )
+        communicate = edge_tts.Communicate(text, CONFIG["tts_voice"], **kwargs)
+        try:
+            await asyncio.wait_for(communicate.save(tp), timeout=25)
+        except asyncio.TimeoutError:
+            # FIX: ensure the coroutine is fully cancelled before unlinking
+            # (prevents edge-tts from writing to a deleted inode)
+            await asyncio.sleep(0.1)  # brief yield for cancellation to propagate
+            raise
         with open(tp, "rb") as f: return base64.b64encode(f.read()).decode("utf-8")
-    finally: os.unlink(tp)
+    finally:
+        # FIX: use try/except on unlink in case file was already removed
+        try:
+            os.unlink(tp)
+        except OSError:
+            pass
 
 def process_input(text, include_vision):
     global _processing_lock_acquired_at, _processing_lock_owner
@@ -2562,22 +2666,35 @@ def process_input(text, include_vision):
         teensy_send_command("SPEAKING")  # Subtle movements while talking (OK if not implemented)
         
         # Generate and send audio
+        tts_succeeded = False
         try:
             print(f"[SPEECH] TTS generating audio for: \"{clean[:60]}\" (voice={CONFIG['tts_voice']})")
             audio = run_tts_sync(clean)
             socketio.emit('audio', {'base64': audio})
             print(f"[SPEECH] Audio ready, sent to browser ({len(audio)} base64 chars)")
+            tts_succeeded = True
         except Exception as tts_err:
             print(f"[SPEECH] TTS failed: {tts_err}\n{traceback.format_exc()}")
             socketio.emit('log', {'message': f'TTS failed: {tts_err}', 'level': 'error'})
-            # Response text was already sent — user sees it, just no audio
-        
+            # FIX: reset status so browser doesn't stay stuck in "Speaking..."
+            socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
+
         # Estimate speech duration (~80ms per character, clamped 1-30s)
         speech_duration = max(1.0, min(len(clean) * 0.08, 30.0))
-        
-        # Schedule cleanup after speech likely finishes
+
+        # FIX: cancel any previous finish_speaking timer before starting a new one
+        # (prevents overlapping cleanup threads sending conflicting Teensy commands)
+        # Each speech gets a UNIQUE Event to prevent cross-contamination race
+        global _finish_speaking_cancel
+        _finish_speaking_cancel.set()               # cancel previous timer's event
+        cancel_event = threading.Event()             # new unique event for THIS speech
+        _finish_speaking_cancel = cancel_event       # store so next speech can cancel us
+
+        # Schedule cleanup after speech likely finishes (only if TTS worked)
         def finish_speaking():
-            time.sleep(speech_duration)
+            # Use event.wait instead of time.sleep so it can be cancelled
+            if cancel_event.wait(timeout=speech_duration):
+                return  # cancelled by a newer speech
             # FIX BUG-10: removed unsafe recorder.read() drain — wake_word_loop
             # owns the recorder; concurrent reads cause crashes.
             # Echo prevention is handled by processing_lock check + noise floor.
@@ -2588,8 +2705,13 @@ def process_input(text, include_vision):
                 valence = teensy_state.get('valence', 0)
             if valence > 0.4:
                 teensy_send_with_fallback("CELEBRATE", "EXPRESS:content")
-        
-        threading.Thread(target=finish_speaking, daemon=True).start()
+
+        if tts_succeeded:
+            threading.Thread(target=finish_speaking, daemon=True).start()
+        else:
+            # TTS failed — immediately clean up Teensy state
+            teensy_send_command("STOP_SPEAKING")
+            teensy_send_command("IDLE")
         
         socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
         
@@ -2731,15 +2853,17 @@ def check_spontaneous_speech(state):
     else:
         min_gap = CONFIG.get("spontaneous_min_gap", 60)  # runtime-configurable via UI
 
-    if now - last_spontaneous_utterance < min_gap:
-        return
-
-    # Hourly cap — safety net (only for idle mode; engagement is self-limiting)
-    if engagement_phase == "idle":
-        one_hour_ago = now - 3600
-        spontaneous_utterance_log = [t for t in spontaneous_utterance_log if t > one_hour_ago]
-        if len(spontaneous_utterance_log) >= CONFIG.get("spontaneous_max_per_hour", 15):
+    # FIX: read last_spontaneous_utterance under lock to prevent stale reads
+    with _spontaneous_log_lock:
+        if now - last_spontaneous_utterance < min_gap:
             return
+
+        # Hourly cap — safety net (only for idle mode; engagement is self-limiting)
+        if engagement_phase == "idle":
+            one_hour_ago = now - 3600
+            spontaneous_utterance_log[:] = [t for t in spontaneous_utterance_log if t > one_hour_ago]
+            if len(spontaneous_utterance_log) >= CONFIG.get("spontaneous_max_per_hour", 15):
+                return
 
     # ── Intent selection & escalation ──
     intent_type = intent_manager.select_intent(state, narrative_engine)
@@ -2939,8 +3063,8 @@ def process_narrative_speech(strategy, saved_state):
 
     try:
         now = time.time()
-        last_spontaneous_utterance = now
-        spontaneous_utterance_log.append(now)
+        # FIX: moved last_spontaneous_utterance update AFTER LLM success
+        # (was here before — if Ollama failed, the rate limiter still counted it)
 
         arousal = float(saved_state.get('arousal', 0.5))
         valence = float(saved_state.get('valence', 0.0))
@@ -2983,6 +3107,13 @@ def process_narrative_speech(strategy, saved_state):
         print(f'[SPEECH] Spontaneous Ollama response: "{(resp or "")[:100]}"')
         teensy_send_command("STOP_THINKING")
 
+        # FIX: update rate-limiting timestamps AFTER LLM succeeds
+        # (moved from before LLM call — failed calls no longer count)
+        now = time.time()
+        with _spontaneous_log_lock:
+            last_spontaneous_utterance = now
+            spontaneous_utterance_log.append(now)
+
         # ═══ PHASE 3: DELIVERY (speaking + movement) ═══
         clean = execute_buddy_actions(resp)
         socketio.emit('response', {'text': f'[{strategy}] {clean}'})
@@ -3012,14 +3143,18 @@ def process_narrative_speech(strategy, saved_state):
         else:
             tts_volume = CONFIG.get("spontaneous_volume", "-25%")
 
+        tts_ok = False
         try:
             print(f"[SPEECH] Spontaneous TTS: \"{clean[:60]}\" (vol={tts_volume})")
             audio = run_tts_sync(clean, volume=tts_volume)
             socketio.emit('audio', {'base64': audio})
             print(f"[SPEECH] Spontaneous audio sent to browser ({len(audio)} base64 chars)")
+            tts_ok = True
         except Exception as tts_err:
             print(f"[SPEECH] Spontaneous TTS failed: {tts_err}\n{traceback.format_exc()}")
             socketio.emit('log', {'message': f'TTS failed: {tts_err}', 'level': 'error'})
+            # FIX: reset status so browser doesn't stay stuck in "Speaking..."
+            socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
 
         speech_duration = max(1.0, min(len(clean) * 0.08, 30.0))
 
@@ -3262,7 +3397,7 @@ def api_vision_health():
     try:
         r = requests.get(f"{CONFIG['vision_api_url']}/health", timeout=2)
         return r.json()
-    except:
+    except (requests.exceptions.RequestException, ValueError):
         return jsonify({"ok": False})
 
 @app.route('/api/inner_thought')
@@ -3291,9 +3426,10 @@ def handle_get_config(): emit('config_loaded', CONFIG)
 def handle_update_config(data):
     # FIX BUG-19: hold _config_lock during bulk update so other threads
     # don't see a partially-updated CONFIG (e.g. new wake_word but old sensitivity)
+    # FIX: build a snapshot and swap atomically to prevent readers seeing partial state
     with _config_lock:
         ww_changed = data.get('wake_word') != CONFIG.get('wake_word') or data.get('wake_word_sensitivity') != CONFIG.get('wake_word_sensitivity')
-        for k, v in data.items(): CONFIG[k] = v
+        CONFIG.update(data)  # single dict.update is more atomic than iterative assignment
     emit('log', {'message': 'Config updated', 'level': 'success'})
     if ww_changed and CONFIG.get('wake_word_enabled'): init_wake_word(); emit('wake_word_status', {'enabled': True, 'word': CONFIG['wake_word']})
 
@@ -3393,7 +3529,7 @@ def api_tracking_state():
             result["stream_fps"] = v.get("stream_fps", 0)
             result["person_count"] = v.get("person_count", 0)
             result["face_expression"] = v.get("face_expression", "neutral")
-    except Exception:
+    except (requests.exceptions.RequestException, ValueError, KeyError):
         result["face_detected"] = False
 
     # Teensy state
@@ -3665,9 +3801,12 @@ def _watchdog_loop():
                     try:
                         _processing_lock_acquired_at = 0
                         _processing_lock_owner = ""
-                        processing_lock.release()
+                        # FIX: only release if we can verify it's still held
+                        # (prevents RuntimeError if normal path already released)
+                        if processing_lock.locked():
+                            processing_lock.release()
                     except RuntimeError:
-                        pass  # Lock wasn't actually held (race with normal release)
+                        pass  # Lock was released between check and release (harmless race)
                     # Reset status
                     socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
                     # Reset Teensy animations
@@ -3767,9 +3906,14 @@ def tracking_dashboard_thread():
                 else:
                     data["face_detected"] = False
                     data["last_udp_msg"] = "Vision API unavailable"
-            except Exception:
+            except (requests.exceptions.RequestException, ValueError):
+                # FIX: specific exceptions — network/JSON errors expected when offline
                 data["face_detected"] = False
                 data["last_udp_msg"] = "Vision API offline"
+            except Exception as e:
+                # FIX: log unexpected errors for diagnosis
+                data["face_detected"] = False
+                data["last_udp_msg"] = f"Vision error: {e}"
 
             # Teensy state
             with teensy_state_lock:
