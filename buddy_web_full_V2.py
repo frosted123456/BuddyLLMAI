@@ -56,7 +56,7 @@ import websocket  # pip install websocket-client
 # NARRATIVE ENGINE IMPORTS — "The Spark"
 # ═══════════════════════════════════════════════════════
 from narrative_engine import NarrativeEngine
-from intent_manager import IntentManager, should_speak_or_physical
+from intent_manager import IntentManager, StrategyTracker, should_speak_or_physical
 from salience_filter import SalienceFilter
 from physical_expression import (
     PhysicalExpressionManager,
@@ -198,9 +198,13 @@ Ne te répète jamais. Si t'as déjà utilisé une expression, trouve une façon
 
 {intent_context}
 
-EXPRESSIONS (utilise 0-2 naturellement, force pas):
-[NOD] [SHAKE] [CURIOUS] [EXCITED] [CONTENT] [CONFUSED] [STARTLED] [CELEBRATE]
-[LOOK:base,nod] [ATTENTION:direction]
+ACTIONS PHYSIQUES (utilise 0-2 naturellement, force pas):
+Émotions: [CURIOUS] [EXCITED] [CONTENT] [CONFUSED] [STARTLED]
+Gestes: [NOD] [SHAKE] [CELEBRATE]
+Regard: [ATTENTION:center] [ATTENTION:left] [ATTENTION:right] [ATTENTION:up] [ATTENTION:down]
+Cibler un objet: [LOOK_AT:nom_objet] — tourne vers un objet que tu vois (ex: [LOOK_AT:mug], [LOOK_AT:phone])
+Regard précis: [LOOK:base,nod] — angle exact (ex: [LOOK:45,110])
+Expressif: [SIGH] — soupir résigné, [DOUBLE_TAKE] — surprise, [DISMISS] — se détourner lentement
 
 RAPPEL: Réponds avec SEULEMENT les mots de Buddy. Première personne. 1-3 phrases. En français québécois. Sois drôle, passive-agressif, et secrètement attachant. Rien d'autre."""
 }
@@ -217,6 +221,12 @@ try:
     _ollama_client = ollama.Client(timeout=65.0)
 except Exception:
     _ollama_client = None
+
+# Short-timeout client for lightweight scoring calls (salience, etc.)
+try:
+    _ollama_fast_client = ollama.Client(timeout=10.0)
+except Exception:
+    _ollama_fast_client = None
 
 # =============================================================================
 # SCENE UNDERSTANDING — Phase C: Vision-aware context for LLM + Teensy
@@ -357,8 +367,12 @@ class SceneContext:
                                             "base": cap_base, "nod": cap_nod,
                                             "time": cap_time
                                         }
-                                    # Score salience for adaptive capture interval
-                                    score, _ = salience_filter.score_description(description)
+                                    prev = self.previous_descriptions[-1] if self.previous_descriptions else ""
+                                # Score salience OUTSIDE lock (may do blocking LLM call)
+                                score, _ = salience_filter.score_with_fallback(
+                                    description, prev
+                                )
+                                with self.lock:
                                     self.last_salience = score
                                 try:
                                     short = description[:80] + '...' if len(description) > 80 else description
@@ -544,6 +558,22 @@ class SceneContext:
             if face_detected and servo_base is not None:
                 self.last_face_servo = (servo_base, servo_nod)
 
+    def get_object_position(self, obj_name):
+        """Return (base, nod) servo angles for a named object, or None."""
+        with self.lock:
+            obj_lower = obj_name.lower()
+            # Direct match
+            if obj_lower in self.object_servo_positions:
+                pos = self.object_servo_positions[obj_lower]
+                if time.time() - pos["time"] < 300:
+                    return (pos["base"], pos["nod"])
+            # Partial match (e.g., "coffee" matches "coffee cup")
+            for name, pos in self.object_servo_positions.items():
+                if obj_lower in name or name in obj_lower:
+                    if time.time() - pos["time"] < 300:
+                        return (pos["base"], pos["nod"])
+            return None
+
     def get_interesting_target(self):
         """Return (base, nod) servo angles of the most interesting thing, or None.
 
@@ -568,12 +598,13 @@ class SceneContext:
             return best
 
     def get_vision_command(self):
-        """Build the !VISION command string for Teensy."""
+        """Build the !VISION command string for Teensy with structured object data."""
         with self.lock:
+            now = time.time()
             change_type = "none"
             if self.detected_changes:
                 latest_change, change_time = self.detected_changes[-1]
-                if time.time() - change_time < 30:
+                if now - change_time < 30:
                     if "new_object" in latest_change:
                         change_type = "new_object"
                     elif "person_appeared" in latest_change:
@@ -582,9 +613,42 @@ class SceneContext:
                         change_type = "person_left"
 
             objects_str = ",".join(list(self.detected_objects)[:5])
-            desc_short = self.current_description[:100] if self.current_description else ""
-            # Escape quotes in description for JSON safety
-            desc_short = desc_short.replace('"', "'")
+            desc_short = self.current_description[:80] if self.current_description else ""
+            # Escape for JSON safety — newlines, backslashes, and quotes
+            desc_short = (desc_short
+                          .replace('\\', '\\\\')
+                          .replace('"', '\\"')
+                          .replace('\n', ' ')
+                          .replace('\r', ' ')
+                          .replace('\t', ' '))
+
+            # Build structured object list with positions for Teensy
+            obj_list = []
+            for name, pos in list(self.object_servo_positions.items())[:3]:
+                if now - pos["time"] < 300:
+                    obj_list.append(
+                        f'{{"n":"{name[:8]}","b":{pos["base"]},"d":{pos["nod"]}}}'
+                    )
+            obj_array = "[" + ",".join(obj_list) + "]" if obj_list else "[]"
+
+            # Find direction of most interesting object for autonomous look
+            interest_dir = -1  # -1 = no target
+            best_time = 0
+            for name, pos in self.object_servo_positions.items():
+                if now - pos["time"] < 300 and pos["time"] > best_time:
+                    best_time = pos["time"]
+                    # Map base angle to direction quadrant (0-4)
+                    base = pos["base"]
+                    if base < 50:
+                        interest_dir = 2   # right
+                    elif base > 130:
+                        interest_dir = 1   # left
+                    elif pos["nod"] < 100:
+                        interest_dir = 3   # up
+                    elif pos["nod"] > 130:
+                        interest_dir = 4   # down
+                    else:
+                        interest_dir = 0   # center
 
             cmd = (
                 f'VISION {{"faces":{1 if self.face_present else 0},'
@@ -593,6 +657,8 @@ class SceneContext:
                 f'"change":"{change_type}",'
                 f'"novelty":{self.scene_novelty:.2f},'
                 f'"interest":{self.last_salience},'
+                f'"idir":{interest_dir},'
+                f'"objs":{obj_array},'
                 f'"desc":"{desc_short}"}}'
             )
             return cmd
@@ -612,7 +678,13 @@ class SceneContext:
         with self.lock:
             self.current_description = description
 
-        desc_short = description[:100].replace('"', "'")
+        desc_short = description[:100]
+        desc_short = (desc_short
+                      .replace('\\', '\\\\')
+                      .replace('"', '\\"')
+                      .replace('\n', ' ')
+                      .replace('\r', ' ')
+                      .replace('\t', ' '))
         cmd = (
             f'VISION {{"faces":{1 if self.face_present else 0},'
             f'"expr":"{self.face_expression}",'
@@ -699,6 +771,12 @@ narrative_engine = NarrativeEngine()
 intent_manager = IntentManager()
 salience_filter = SalienceFilter()
 physical_expression_mgr = PhysicalExpressionManager()
+
+# Configure salience filter with fast LLM client for semantic scoring
+if _ollama_fast_client:
+    salience_filter.configure_llm(
+        _ollama_fast_client, CONFIG.get("ollama_model", "llama3.1:8b")
+    )
 
 # Pending speech state — used by the delayed speech system
 _pending_speech = {
@@ -1875,49 +1953,117 @@ def teensy_poll_loop():
 def execute_buddy_actions(text):
     """Parse and execute action commands from Buddy's response."""
     actions = []
-    
+
     # [NOD] or [NOD:count]
     m = re.search(r'\[NOD(?::(\d+))?\]', text)
     if m:
         c = int(m.group(1)) if m.group(1) else 2
         r = teensy_send_command(f"NOD:{c}")
         if r and r.get('ok'): actions.append("nodded")
-    
+
     # [SHAKE] or [SHAKE:count]
     m = re.search(r'\[SHAKE(?::(\d+))?\]', text)
     if m:
         c = int(m.group(1)) if m.group(1) else 2
         r = teensy_send_command(f"SHAKE:{c}")
         if r and r.get('ok'): actions.append("shook head")
-    
+
     # Emotion expressions
     for e in ['CURIOUS', 'EXCITED', 'CONTENT', 'ANXIOUS', 'NEUTRAL', 'STARTLED', 'BORED', 'CONFUSED']:
         if f'[{e}]' in text:
             r = teensy_send_command(f"EXPRESS:{e.lower()}")
             if r and r.get('ok'): actions.append(f"expressed {e.lower()}")
             break
-    
+
+    # [LOOK_AT:object_name] — resolve object name to servo position
+    m = re.search(r'\[LOOK_AT:(\w+)\]', text)
+    if m:
+        obj_name = m.group(1).lower()
+        target = scene_context.get_object_position(obj_name)
+        if target:
+            r = teensy_send_command(f"LOOK:{target[0]},{target[1]}")
+            if r and r.get('ok'):
+                actions.append(f"looked at {obj_name}")
+        else:
+            # Object not tracked — try ATTENTION based on name guess
+            actions.append(f"wanted to look at {obj_name} (not found)")
+
     # [LOOK:base,nod]
     m = re.search(r'\[LOOK:(\d+),(\d+)\]', text)
     if m:
         r = teensy_send_command(f"LOOK:{m.group(1)},{m.group(2)}")
         if r and r.get('ok'): actions.append(f"looked at {m.group(1)},{m.group(2)}")
-    
+
     # [ATTENTION:direction] - center, left, right, up, down
     m = re.search(r'\[ATTENTION:(\w+)\]', text)
     if m:
         r = teensy_send_command(f"ATTENTION:{m.group(1).lower()}")
         if r and r.get('ok'): actions.append(f"looked {m.group(1).lower()}")
-    
+
     # [CELEBRATE] - happy wiggle
     if '[CELEBRATE]' in text:
         r = teensy_send_command("CELEBRATE")
         if r and r.get('ok'): actions.append("celebrated")
-    
+
+    # [SIGH] — physical expression: deflated sigh
+    if '[SIGH]' in text:
+        with teensy_state_lock:
+            base = teensy_state.get("servoBase", 90)
+            nod = teensy_state.get("servoNod", 115)
+        cmds = physical_expression_mgr.get_expression_commands(
+            "sigh", current_base=base, current_nod=nod
+        )
+        for cmd, delay in cmds:
+            if cmd == "wait":
+                time.sleep(delay)
+            else:
+                teensy_send_command(cmd)
+                if delay > 0:
+                    time.sleep(delay)
+        actions.append("sighed")
+
+    # [DOUBLE_TAKE] — physical expression: surprise double-take
+    if '[DOUBLE_TAKE]' in text:
+        with teensy_state_lock:
+            base = teensy_state.get("servoBase", 90)
+            nod = teensy_state.get("servoNod", 115)
+        cmds = physical_expression_mgr.get_expression_commands(
+            "double_take", current_base=base, current_nod=nod
+        )
+        for cmd, delay in cmds:
+            if cmd == "wait":
+                time.sleep(delay)
+            else:
+                teensy_send_command(cmd)
+                if delay > 0:
+                    time.sleep(delay)
+        actions.append("double take")
+
+    # [DISMISS] — physical expression: slow dismissive turn
+    if '[DISMISS]' in text:
+        with teensy_state_lock:
+            base = teensy_state.get("servoBase", 90)
+            nod = teensy_state.get("servoNod", 115)
+        cmds = physical_expression_mgr.get_expression_commands(
+            "dismissive_turn", current_base=base, current_nod=nod
+        )
+        for cmd, delay in cmds:
+            if cmd == "wait":
+                time.sleep(delay)
+            else:
+                teensy_send_command(cmd)
+                if delay > 0:
+                    time.sleep(delay)
+        actions.append("dismissed")
+
     if actions: socketio.emit('log', {'message': f'Actions: {", ".join(actions)}', 'level': 'info'})
-    
+
     # Remove all action tags from response text
-    clean = re.sub(r'\[(NOD|SHAKE|CURIOUS|EXCITED|CONTENT|ANXIOUS|NEUTRAL|STARTLED|BORED|CONFUSED|LOOK:\d+,\d+|ATTENTION:\w+|CELEBRATE)(?::\d+)?\]', '', text)
+    clean = re.sub(
+        r'\[(NOD|SHAKE|CURIOUS|EXCITED|CONTENT|ANXIOUS|NEUTRAL|STARTLED|BORED|CONFUSED'
+        r'|LOOK:\d+,\d+|LOOK_AT:\w+|ATTENTION:\w+|CELEBRATE|SIGH|DOUBLE_TAKE|DISMISS)(?::\d+)?\]',
+        '', text
+    )
     return clean.strip()
 
 # =============================================================================
@@ -2503,6 +2649,13 @@ def check_spontaneous_speech(state):
         face_present = vision.get("face_detected", False)
         was_present = narrative_engine.is_person_present()
         narrative_engine.update_face_state(face_present)
+
+        # Track person identity for profiles
+        if face_present:
+            person_id = vision.get("person_id", "default_person")
+            narrative_engine.set_current_person(person_id)
+            intent_manager.strategy_tracker.set_current_person(person_id)
+
         # Track departures for engagement cycle
         if was_present and not face_present:
             intent_manager.person_departed()
@@ -2593,8 +2746,8 @@ def check_spontaneous_speech(state):
     if intent_type:
         intent_manager.set_intent(intent_type)
 
-    # Check if we should escalate existing intent
-    if intent_manager.should_escalate():
+    # Check if we should escalate existing intent (signal-aware timing)
+    if intent_manager.should_escalate(narrative_engine):
         new_strategy = intent_manager.escalate()
         if new_strategy:
             socketio.emit('log', {
@@ -2658,10 +2811,14 @@ def check_spontaneous_speech(state):
         delay = calculate_speech_delay(arousal, float(state.get('valence', 0)),
                                         strategy, ignored_streak)
 
+        # Use the actual active intent type, not select_intent's return
+        current = intent_manager.get_current_intent()
+        active_intent_type = current["type"] if current else intent_type
+
         with _pending_speech_lock:
             _pending_speech["active"] = True
             _pending_speech["fire_at"] = now + delay
-            _pending_speech["intent_type"] = intent_type
+            _pending_speech["intent_type"] = active_intent_type
             _pending_speech["strategy"] = strategy
             _pending_speech["teensy_state"] = state.copy()
 
@@ -2936,6 +3093,12 @@ def process_narrative_speech(strategy, saved_state):
                 narrative_engine.record_response(response_detected)
                 intent_manager.mark_success()
 
+                # Record in person profile
+                response_delay = time.time() - now
+                narrative_engine.record_person_response(
+                    response_detected, strategy=strategy, delay=response_delay
+                )
+
                 # Break engagement cycle if self-occupied
                 cycle_override = intent_manager.person_responded()
                 if cycle_override:
@@ -2958,6 +3121,10 @@ def process_narrative_speech(strategy, saved_state):
                 })
             else:
                 narrative_engine.record_ignored()
+                intent_manager.mark_failure()
+                narrative_engine.record_person_response(
+                    "ignored", strategy=strategy
+                )
                 resolution_commands = physical_expression_mgr.get_resolution_arc(
                     "ignored"
                 )
@@ -3045,6 +3212,19 @@ def build_narrative_prompt(strategy, state):
     obj_ctx = narrative_engine.get_object_context()
     if obj_ctx:
         parts.append(obj_ctx)
+
+    # Available objects for [LOOK_AT:] targeting
+    if scene_context.running:
+        with scene_context.lock:
+            available_objects = [
+                name for name, pos in scene_context.object_servo_positions.items()
+                if time.time() - pos["time"] < 300
+            ]
+        if available_objects:
+            parts.append(
+                f"Objects you can look at with [LOOK_AT:name]: "
+                f"{', '.join(available_objects)}"
+            )
 
     # Ignored streak context — factual
     ignored_streak = narrative_engine.get_ignored_streak()
@@ -3809,10 +3989,13 @@ if __name__ == '__main__':
     print(f"  Vision updates: EVENT-DRIVEN (salience-filtered)")
 
     # "The Spark" — Narrative Engine systems
+    # Load cross-session memory (person profiles, strategy stats, object familiarity)
+    narrative_engine.load_memory(intent_manager.strategy_tracker)
     print(f"  Narrative Engine: active (utterance history, thread tracking)")
-    print(f"  Intent Manager: active (goal pursuit, escalation)")
-    print(f"  Salience Filter: active (attention scoring)")
-    print(f"  Physical Expressions: active (non-verbal communication)")
+    print(f"  Intent Manager: active (goal pursuit, escalation, feedback loop)")
+    print(f"  Strategy Tracker: active (learning from outcomes)")
+    print(f"  Salience Filter: active (keyword + LLM semantic scoring)")
+    print(f"  Physical Expressions: active (LLM-driven action selection)")
 
     # Face Tracking Debug Dashboard background thread
     threading.Thread(target=tracking_dashboard_thread, daemon=True, name="tracking-dashboard").start()
@@ -3823,8 +4006,32 @@ if __name__ == '__main__':
     print("  Watchdog: active (checks every 30s, timeout 90s)")
     print("  Health: GET /api/health")
 
+    # Periodic memory save (every 5 minutes) + shutdown save
+    def _memory_save_loop():
+        while True:
+            time.sleep(300)  # 5 minutes
+            try:
+                narrative_engine.save_memory(intent_manager.strategy_tracker)
+            except Exception as e:
+                print(f"[MEMORY] Periodic save error: {e}")
+
+    threading.Thread(target=_memory_save_loop, daemon=True, name="memory-saver").start()
+    print("  Memory Persistence: active (save every 5min)")
+
+    import atexit
+    def _save_on_exit():
+        print("[MEMORY] Saving on shutdown...")
+        try:
+            narrative_engine.save_memory(intent_manager.strategy_tracker)
+        except Exception as e:
+            print(f"[MEMORY] Shutdown save error: {e}")
+    atexit.register(_save_on_exit)
+
     print()
     print(f"Open http://0.0.0.0:5000 from any browser on the network")
     print("=" * 50)
 
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
+    try:
+        socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
+    finally:
+        _save_on_exit()

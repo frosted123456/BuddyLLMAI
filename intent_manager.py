@@ -17,6 +17,149 @@ expression, or stay silent — breaking the "every urge = speech" pattern.
 import time
 import random
 import threading
+from collections import defaultdict
+
+
+# ═══════════════════════════════════════════════════════
+# STRATEGY SUCCESS TRACKER — Closes the feedback loop
+# ═══════════════════════════════════════════════════════
+
+class StrategyTracker:
+    """
+    Tracks which strategies succeed/fail and adapts future selection.
+    This is the core feedback loop: Intent → Action → Response → Learn.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        # strategy_name → {"attempts": int, "successes": int, "last_used": float}
+        self._stats = defaultdict(lambda: {
+            "attempts": 0, "successes": 0, "last_used": 0,
+        })
+        # Per-person override (person_id → strategy → stats)
+        self._person_stats = defaultdict(
+            lambda: defaultdict(lambda: {"attempts": 0, "successes": 0})
+        )
+        self._current_person_id = None
+
+    def set_current_person(self, person_id):
+        """Set the current person being interacted with."""
+        with self.lock:
+            self._current_person_id = person_id
+
+    def record_attempt(self, strategy):
+        """Record that a strategy was attempted."""
+        with self.lock:
+            self._stats[strategy]["attempts"] += 1
+            self._stats[strategy]["last_used"] = time.time()
+            pid = self._current_person_id
+            if pid:
+                self._person_stats[pid][strategy]["attempts"] += 1
+
+    def record_outcome(self, strategy, success):
+        """Record whether the strategy got a response."""
+        with self.lock:
+            if success:
+                self._stats[strategy]["successes"] += 1
+            pid = self._current_person_id
+            if pid and success:
+                self._person_stats[pid][strategy]["successes"] += 1
+
+    def get_success_rate(self, strategy):
+        """Return success rate 0.0-1.0 for a strategy (global)."""
+        with self.lock:
+            s = self._stats.get(strategy)
+            if not s or s["attempts"] < 2:
+                return 0.5  # Not enough data — neutral
+            return s["successes"] / s["attempts"]
+
+    def get_person_success_rate(self, strategy, person_id=None):
+        """Return per-person success rate (falls back to global)."""
+        with self.lock:
+            pid = person_id or self._current_person_id
+            if pid and pid in self._person_stats:
+                person_strats = self._person_stats[pid]
+                if strategy in person_strats:
+                    ps = person_strats[strategy]
+                    if ps["attempts"] >= 2:
+                        return ps["successes"] / ps["attempts"]
+            # Fall back to global
+            s = self._stats.get(strategy)
+            if not s or s["attempts"] < 2:
+                return 0.5
+            return s["successes"] / s["attempts"]
+
+    def rank_strategies(self, strategies, person_id=None):
+        """
+        Rank a list of strategies by success rate, with exploration bonus.
+        Returns strategies reordered from best to worst, with noise for variety.
+        """
+        with self.lock:
+            pid = person_id or self._current_person_id
+            now = time.time()
+            scored = []
+            for s in strategies:
+                # Per-person rate first, fall back to global
+                rate = 0.5
+                if pid and pid in self._person_stats:
+                    person_strats = self._person_stats[pid]
+                    ps = person_strats.get(s)
+                    if ps and ps["attempts"] >= 2:
+                        rate = ps["successes"] / ps["attempts"]
+                    else:
+                        gs = self._stats.get(s)
+                        if gs and gs["attempts"] >= 2:
+                            rate = gs["successes"] / gs["attempts"]
+                else:
+                    gs = self._stats.get(s)
+                    if gs and gs["attempts"] >= 2:
+                        rate = gs["successes"] / gs["attempts"]
+
+                # Exploration bonus: under-tried strategies get a boost
+                gs = self._stats.get(s)
+                attempts = gs["attempts"] if gs else 0
+                explore_bonus = 0.15 / (1 + attempts * 0.1)
+
+                # Recency penalty: recently used strategies get slight downgrade
+                last_used = gs["last_used"] if gs else 0
+                recency_penalty = 0.0
+                if last_used > 0:
+                    since = now - last_used
+                    if since < 120:
+                        recency_penalty = 0.1
+
+                # Add randomness for variety (±0.1)
+                noise = random.uniform(-0.1, 0.1)
+
+                final_score = rate + explore_bonus - recency_penalty + noise
+                scored.append((s, final_score))
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+            return [s for s, _ in scored]
+
+    def get_stats_summary(self):
+        """Return a summary dict for persistence."""
+        with self.lock:
+            return {
+                "global": {
+                    k: dict(v) for k, v in self._stats.items()
+                },
+                "per_person": {
+                    pid: {s: dict(v) for s, v in strats.items()}
+                    for pid, strats in self._person_stats.items()
+                },
+            }
+
+    def load_stats(self, data):
+        """Load stats from persistence dict."""
+        with self.lock:
+            if "global" in data:
+                for k, v in data["global"].items():
+                    self._stats[k] = v
+            if "per_person" in data:
+                for pid, strats in data["per_person"].items():
+                    for s, v in strats.items():
+                        self._person_stats[pid][s] = v
 
 
 # ═══════════════════════════════════════════════════════
@@ -169,6 +312,9 @@ class IntentManager:
         self.current_intent = None  # dict or None
         self._intent_history = []   # recent intents for variety
 
+        # Strategy success tracker — the feedback loop
+        self.strategy_tracker = StrategyTracker()
+
         # ── Engagement cycle ──
         # Tracks Buddy's arc: eager → persistent → giving up → self-occupied → reluctant retry
         self._engagement_phase = "idle"    # idle / engaging / giving_up / self_occupied
@@ -318,6 +464,17 @@ class IntentManager:
             self._archive_current_intent()
 
             config = INTENT_TYPES[intent_type]
+            strategies = list(config["strategies"])
+
+        # Outside lock: call strategy_tracker (has its own lock)
+        ranked = self.strategy_tracker.rank_strategies(strategies)
+        # Always start at level 0 — ranking only influences WHICH level-0
+        # strategy gets picked when there's a single-level intent.
+        # For multi-level intents, we always start at level 0 to ensure
+        # escalation order is preserved.
+        first_strategy = strategies[0]
+
+        with self.lock:
             self.current_intent = {
                 "type": intent_type,
                 "description": config["description"],
@@ -326,12 +483,14 @@ class IntentManager:
                 "max_level": config["max_level"],
                 "escalation_window": config["escalation_window"],
                 "last_escalation": time.time(),
-                "strategies": config["strategies"],
-                "current_strategy": config["strategies"][0],
+                "strategies": strategies,
+                "current_strategy": first_strategy,
                 "success": False,
                 "reason": reason,
                 "attempts": 0,
             }
+
+        self.strategy_tracker.record_attempt(first_strategy)
 
     def escalate(self):
         """
@@ -339,6 +498,9 @@ class IntentManager:
         Called when the current strategy hasn't gotten a response.
         Returns the new strategy name or None if already at max.
         """
+        old_strategy = None
+        new_strategy = None
+
         with self.lock:
             if not self.current_intent:
                 return None
@@ -347,19 +509,43 @@ class IntentManager:
             if intent["escalation_level"] >= intent["max_level"]:
                 return None
 
+            old_strategy = intent["current_strategy"]
+
             intent["escalation_level"] += 1
             intent["last_escalation"] = time.time()
             intent["current_strategy"] = intent["strategies"][
                 intent["escalation_level"]
             ]
             intent["attempts"] += 1
-            return intent["current_strategy"]
+            new_strategy = intent["current_strategy"]
+
+        # Outside lock: call strategy_tracker (has its own lock)
+        if old_strategy:
+            self.strategy_tracker.record_outcome(old_strategy, False)
+        if new_strategy:
+            self.strategy_tracker.record_attempt(new_strategy)
+        return new_strategy
 
     def mark_success(self):
         """Mark current intent as successful (got a response)."""
+        strategy = None
         with self.lock:
             if self.current_intent:
                 self.current_intent["success"] = True
+                strategy = self.current_intent.get("current_strategy")
+        # Outside lock: call strategy_tracker
+        if strategy:
+            self.strategy_tracker.record_outcome(strategy, True)
+
+    def mark_failure(self):
+        """Mark current strategy as failed (ignored)."""
+        strategy = None
+        with self.lock:
+            if self.current_intent:
+                strategy = self.current_intent.get("current_strategy")
+        # Outside lock: call strategy_tracker
+        if strategy:
+            self.strategy_tracker.record_outcome(strategy, False)
 
     def clear_intent(self):
         """Clear the current intent (completed or abandoned)."""
@@ -370,8 +556,12 @@ class IntentManager:
                     self._intent_history.pop(0)
             self.current_intent = None
 
-    def should_escalate(self):
-        """Check if it's time to escalate the current intent."""
+    def should_escalate(self, narrative_engine=None):
+        """
+        Check if it's time to escalate the current intent.
+        Now signal-aware: adapts timing based on success rates and context.
+        """
+        # Extract needed data under lock
         with self.lock:
             if not self.current_intent:
                 return False
@@ -379,11 +569,36 @@ class IntentManager:
                 return False
 
             intent = self.current_intent
+            if intent["escalation_level"] >= intent["max_level"]:
+                return False
+
             elapsed = time.time() - intent["last_escalation"]
-            return (
-                elapsed >= intent["escalation_window"] and
-                intent["escalation_level"] < intent["max_level"]
-            )
+            base_window = intent["escalation_window"]
+            current_strategy = intent["current_strategy"]
+
+        # Outside lock: call strategy_tracker and narrative_engine
+        success_rate = self.strategy_tracker.get_success_rate(
+            current_strategy
+        )
+
+        # Low success rate → escalate faster (this isn't working)
+        # High success rate → wait longer (give it more time)
+        if success_rate < 0.25:
+            window = base_window * 0.6   # Failing badly, move on
+        elif success_rate > 0.7:
+            window = base_window * 1.3   # Working well, be patient
+        else:
+            window = base_window
+
+        # If person glanced (face detected briefly), accelerate
+        if narrative_engine:
+            pattern = narrative_engine.get_pattern()
+            if pattern == "distracted":
+                window *= 0.7  # They noticed something, push harder
+            elif pattern == "mostly_ignoring":
+                window *= 0.8  # Move through strategies faster
+
+        return elapsed >= window
 
     def should_act(self):
         """
@@ -453,12 +668,29 @@ class IntentManager:
                     "You're skeptical it'll work this time."
                 )
 
+            attempts = intent["attempts"]
+
             # Strategy-specific guidance
             guidance = self.get_strategy_guidance(strategy, level)
             if guidance:
                 parts.append(guidance)
 
-            return "\n".join(parts)
+            context = "\n".join(parts)
+
+        # Outside lock: strategy effectiveness feedback from tracker
+        rate = self.strategy_tracker.get_person_success_rate(strategy)
+        if attempts > 0:
+            if rate < 0.25:
+                context += (
+                    f"\nThis approach has a LOW success rate ({rate:.0%}). "
+                    "Consider trying something different in tone."
+                )
+            elif rate > 0.7:
+                context += (
+                    f"\nThis approach has worked well before ({rate:.0%})."
+                )
+
+        return context
 
     def get_strategy_guidance(self, strategy, level):
         """

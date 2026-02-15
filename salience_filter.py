@@ -20,6 +20,7 @@ SALIENCE LEVELS:
 import time
 import threading
 import re
+import traceback
 
 
 class SalienceFilter:
@@ -48,6 +49,17 @@ class SalienceFilter:
 
         # Scene description novelty
         self._description_history = []
+
+        # LLM salience scoring — semantic fallback
+        self._ollama_client = None
+        self._ollama_model = None
+        self._last_llm_score_time = 0
+        self._llm_score_interval = 15  # Don't LLM-score more than every 15s
+
+    def configure_llm(self, ollama_client, model="llama3.1:8b"):
+        """Configure the LLM client for semantic salience scoring."""
+        self._ollama_client = ollama_client
+        self._ollama_model = model
 
     def score_description(self, description):
         """
@@ -149,6 +161,83 @@ class SalienceFilter:
             reasons = ["suppressed_boring_environment"]
 
         return (score, ", ".join(reasons) if reasons else "generic")
+
+    def score_description_semantic(self, description, previous_description=""):
+        """
+        Use a fast LLM call to score scene change salience semantically.
+        Returns (score 0-5, reason) or None if LLM unavailable.
+        Falls back gracefully — never blocks the main pipeline.
+        """
+        if not self._ollama_client or not self._ollama_model:
+            return None
+
+        now = time.time()
+        with self.lock:
+            if now - self._last_llm_score_time < self._llm_score_interval:
+                return None
+            # Reserve the slot BEFORE the call to prevent double-fire
+            self._last_llm_score_time = now
+
+        if not description or len(description) < 10:
+            return None
+
+        try:
+            prompt = (
+                "You are scoring scene changes for a small desk robot.\n"
+                "Rate this scene change from 0 to 5:\n"
+                "0=nothing changed/boring, 1=minor environment, "
+                "2=static objects, 3=active objects/new items, "
+                "4=person state change, 5=person present/interacting\n"
+            )
+            if previous_description:
+                prompt += f"Previous: {previous_description[:120]}\n"
+            prompt += f"Current: {description[:120]}\n"
+            prompt += "Reply with ONLY a single digit 0-5."
+
+            response = self._ollama_client.chat(
+                model=self._ollama_model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0, "num_predict": 20},
+            )
+
+            if isinstance(response, dict):
+                text = response["message"]["content"]
+            else:
+                text = response.message.content
+
+            text = text.strip()
+            # Extract score digit
+            m = re.search(r'(\d)', text)
+            if m:
+                score = min(5, max(0, int(m.group(1))))
+                reason = text.replace(m.group(0), "").strip(": .-")
+                return (score, reason or "llm_scored")
+        except Exception as e:
+            # On failure (cold start, timeout), reset cooldown so retry is faster
+            with self.lock:
+                self._last_llm_score_time = now - self._llm_score_interval + 5
+            print(f"[SALIENCE] LLM scoring failed: {e}")
+        return None
+
+    def score_with_fallback(self, description, previous_description=""):
+        """
+        Score using keyword matching, enhanced by LLM when available.
+        LLM score overrides keyword score when they disagree significantly.
+        """
+        keyword_score, keyword_reason = self.score_description(description)
+
+        # Only call LLM for ambiguous cases (score 1-3)
+        if 1 <= keyword_score <= 3:
+            llm_result = self.score_description_semantic(
+                description, previous_description
+            )
+            if llm_result:
+                llm_score, llm_reason = llm_result
+                # LLM overrides if it disagrees by 2+ points
+                if abs(llm_score - keyword_score) >= 2:
+                    return (llm_score, f"llm:{llm_reason}")
+
+        return (keyword_score, keyword_reason)
 
     def should_send_vision_update(self, face_present, face_count, expression,
                                    scene_description, novelty):
