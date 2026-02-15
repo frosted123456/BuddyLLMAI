@@ -11,10 +11,11 @@ This is the core of "The Spark" — what makes Buddy feel genuinely alive
 rather than a collection of periodic systems.
 """
 
+import os
 import time
 import threading
 import json
-from collections import deque
+from collections import deque, defaultdict
 
 
 class NarrativeEngine:
@@ -64,6 +65,11 @@ class NarrativeEngine:
         # ── Object Memory ──
         # Tracks objects across scene descriptions for persistent reference
         self.object_memory = {}  # name → {first_seen, last_seen, times_seen, mentioned_by_buddy, state}
+
+        # ── Person Profiles ──
+        # Tracks per-person behavioral patterns across interactions
+        self.person_profiles = {}  # person_id → profile dict
+        self._current_person_id = None
 
         # ── Conversation state ──
         self.last_speech_time = 0
@@ -494,7 +500,12 @@ class NarrativeEngine:
                     "Recent events:\n" + "\n".join(event_lines)
                 )
 
-            # 6. Session context
+            # 7. Person profile context
+            person_ctx = self._get_person_context_unlocked()
+            if person_ctx:
+                sections.append(f"What you know about this person:\n  {person_ctx}")
+
+            # 8. Session context
             session_min = int((now - self.session_start) / 60)
             if session_min > 0:
                 sections.append(
@@ -627,6 +638,167 @@ class NarrativeEngine:
                         self.object_memory[obj_name]["mentioned_by_buddy"] = True
 
     # ═══════════════════════════════════════════════════════
+    # PERSON PROFILES — Per-person behavioral memory
+    # ═══════════════════════════════════════════════════════
+
+    def set_current_person(self, person_id):
+        """Track which person Buddy is interacting with."""
+        with self.lock:
+            self._current_person_id = person_id
+            if person_id and person_id not in self.person_profiles:
+                self.person_profiles[person_id] = {
+                    "first_seen": time.time(),
+                    "interaction_count": 0,
+                    "total_responses": 0,
+                    "total_ignores": 0,
+                    "avg_response_delay": 0.0,
+                    "preferred_timing": "normal",
+                    "responded_to_strategies": defaultdict(int),
+                    "ignored_strategies": defaultdict(int),
+                    "last_interaction": time.time(),
+                }
+
+    def record_person_response(self, response_type, strategy=None, delay=0.0):
+        """Record a person's response to Buddy's speech."""
+        with self.lock:
+            pid = self._current_person_id
+            if not pid or pid not in self.person_profiles:
+                return
+            p = self.person_profiles[pid]
+            p["interaction_count"] += 1
+            p["last_interaction"] = time.time()
+
+            if response_type in ("smiled", "laughed", "spoke", "looked"):
+                p["total_responses"] += 1
+                if strategy:
+                    p["responded_to_strategies"][strategy] += 1
+                # Update average response delay
+                if delay > 0:
+                    n = p["total_responses"]
+                    p["avg_response_delay"] = (
+                        (p["avg_response_delay"] * (n - 1) + delay) / n
+                    )
+                    if p["avg_response_delay"] < 3:
+                        p["preferred_timing"] = "quick"
+                    elif p["avg_response_delay"] > 8:
+                        p["preferred_timing"] = "slow"
+                    else:
+                        p["preferred_timing"] = "normal"
+            else:
+                p["total_ignores"] += 1
+                if strategy:
+                    p["ignored_strategies"][strategy] += 1
+
+    def _get_person_context_unlocked(self):
+        """Build person context (caller must hold self.lock)."""
+        pid = self._current_person_id
+        if not pid or pid not in self.person_profiles:
+            return ""
+        p = self.person_profiles[pid]
+        if p["interaction_count"] < 3:
+            return ""
+
+        parts = []
+        total = p["total_responses"] + p["total_ignores"]
+        if total > 0:
+            rate = p["total_responses"] / total
+            if rate > 0.7:
+                parts.append("This person is generally responsive to you.")
+            elif rate < 0.3:
+                parts.append("This person usually ignores you.")
+
+        if p["responded_to_strategies"]:
+            best = max(
+                p["responded_to_strategies"],
+                key=p["responded_to_strategies"].get
+            )
+            parts.append(
+                f"They respond best to: {best.replace('_', ' ')}"
+            )
+
+        if p["preferred_timing"] == "quick":
+            parts.append("They react quickly — be responsive.")
+        elif p["preferred_timing"] == "slow":
+            parts.append("They take time to react — be patient.")
+
+        return " ".join(parts) if parts else ""
+
+    def get_person_context(self):
+        """Build person-specific context for the LLM."""
+        with self.lock:
+            pid = self._current_person_id
+            if not pid or pid not in self.person_profiles:
+                return ""
+            p = self.person_profiles[pid]
+            if p["interaction_count"] < 3:
+                return ""  # Not enough data yet
+
+            parts = []
+            total = p["total_responses"] + p["total_ignores"]
+            if total > 0:
+                rate = p["total_responses"] / total
+                if rate > 0.7:
+                    parts.append("This person is generally responsive to you.")
+                elif rate < 0.3:
+                    parts.append("This person usually ignores you.")
+
+            # What strategies worked
+            if p["responded_to_strategies"]:
+                best = max(
+                    p["responded_to_strategies"],
+                    key=p["responded_to_strategies"].get
+                )
+                parts.append(
+                    f"They respond best to: {best.replace('_', ' ')}"
+                )
+
+            if p["preferred_timing"] == "quick":
+                parts.append("They react quickly — be responsive.")
+            elif p["preferred_timing"] == "slow":
+                parts.append("They take time to react — be patient.")
+
+            return "\n".join(parts) if parts else ""
+
+    def get_person_profiles_data(self):
+        """Return serializable person profiles for persistence."""
+        with self.lock:
+            result = {}
+            for pid, p in self.person_profiles.items():
+                result[pid] = {
+                    "first_seen": p["first_seen"],
+                    "interaction_count": p["interaction_count"],
+                    "total_responses": p["total_responses"],
+                    "total_ignores": p["total_ignores"],
+                    "avg_response_delay": p["avg_response_delay"],
+                    "preferred_timing": p["preferred_timing"],
+                    "responded_to_strategies": dict(p["responded_to_strategies"]),
+                    "ignored_strategies": dict(p["ignored_strategies"]),
+                    "last_interaction": p["last_interaction"],
+                }
+            return result
+
+    def load_person_profiles(self, data):
+        """Load person profiles from persistence."""
+        with self.lock:
+            for pid, p in data.items():
+                profile = {
+                    "first_seen": p.get("first_seen", 0),
+                    "interaction_count": p.get("interaction_count", 0),
+                    "total_responses": p.get("total_responses", 0),
+                    "total_ignores": p.get("total_ignores", 0),
+                    "avg_response_delay": p.get("avg_response_delay", 0.0),
+                    "preferred_timing": p.get("preferred_timing", "normal"),
+                    "responded_to_strategies": defaultdict(
+                        int, p.get("responded_to_strategies", {})
+                    ),
+                    "ignored_strategies": defaultdict(
+                        int, p.get("ignored_strategies", {})
+                    ),
+                    "last_interaction": p.get("last_interaction", 0),
+                }
+                self.person_profiles[pid] = profile
+
+    # ═══════════════════════════════════════════════════════
     # TIME-SINCE HELPERS
     # ═══════════════════════════════════════════════════════
 
@@ -658,3 +830,118 @@ class NarrativeEngine:
     def is_person_present(self):
         """Whether someone is currently visible."""
         return self.human_responsiveness["face_present"]
+
+    # ═══════════════════════════════════════════════════════
+    # CROSS-SESSION PERSISTENCE
+    # ═══════════════════════════════════════════════════════
+
+    MEMORY_FILE = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "buddy_memory.json"
+    )
+
+    def save_memory(self, strategy_tracker=None):
+        """Save persistent state to disk. Call on shutdown or periodically."""
+        with self.lock:
+            data = {
+                "version": 1,
+                "saved_at": time.time(),
+                "person_profiles": {},
+                "object_familiarity": {},
+                "strategy_stats": {},
+                "session_count": 0,
+            }
+
+            # Person profiles
+            for pid, p in self.person_profiles.items():
+                data["person_profiles"][pid] = {
+                    "first_seen": p.get("first_seen", 0),
+                    "interaction_count": p.get("interaction_count", 0),
+                    "total_responses": p.get("total_responses", 0),
+                    "total_ignores": p.get("total_ignores", 0),
+                    "avg_response_delay": p.get("avg_response_delay", 0.0),
+                    "preferred_timing": p.get("preferred_timing", "normal"),
+                    "responded_to_strategies": dict(
+                        p.get("responded_to_strategies", {})
+                    ),
+                    "ignored_strategies": dict(
+                        p.get("ignored_strategies", {})
+                    ),
+                    "last_interaction": p.get("last_interaction", 0),
+                }
+
+            # Object familiarity (long-term: how familiar is each object)
+            for name, mem in self.object_memory.items():
+                data["object_familiarity"][name] = {
+                    "first_seen": mem.get("first_seen", 0),
+                    "times_seen": mem.get("times_seen", 0),
+                    "mentioned_by_buddy": mem.get("mentioned_by_buddy", False),
+                }
+
+        # Strategy stats (outside narrative lock to avoid nesting)
+        if strategy_tracker:
+            data["strategy_stats"] = strategy_tracker.get_stats_summary()
+
+        # Load existing to increment session count
+        try:
+            with open(self.MEMORY_FILE, "r") as f:
+                existing = json.load(f)
+                data["session_count"] = existing.get("session_count", 0) + 1
+        except (FileNotFoundError, json.JSONDecodeError):
+            data["session_count"] = 1
+
+        try:
+            tmp_path = self.MEMORY_FILE + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_path, self.MEMORY_FILE)
+            print(f"[MEMORY] Saved to {self.MEMORY_FILE} "
+                  f"({len(data['person_profiles'])} profiles, "
+                  f"session #{data['session_count']})")
+        except Exception as e:
+            print(f"[MEMORY] Save failed: {e}")
+
+    def load_memory(self, strategy_tracker=None):
+        """Load persistent state from disk. Call on startup."""
+        try:
+            with open(self.MEMORY_FILE, "r") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            print("[MEMORY] No saved memory found — starting fresh")
+            return
+
+        version = data.get("version", 0)
+        if version < 1:
+            print("[MEMORY] Incompatible memory version, skipping")
+            return
+
+        # Load person profiles
+        profiles = data.get("person_profiles", {})
+        if profiles:
+            self.load_person_profiles(profiles)
+            print(f"[MEMORY] Loaded {len(profiles)} person profiles")
+
+        # Load object familiarity into object_memory
+        with self.lock:
+            for name, fam in data.get("object_familiarity", {}).items():
+                if name not in self.object_memory:
+                    self.object_memory[name] = {
+                        "first_seen": fam.get("first_seen", 0),
+                        "last_seen": fam.get("first_seen", 0),
+                        "times_seen": fam.get("times_seen", 0),
+                        "mentioned_by_buddy": fam.get(
+                            "mentioned_by_buddy", False
+                        ),
+                        "disappeared_at": None,
+                    }
+
+        # Load strategy stats
+        if strategy_tracker and "strategy_stats" in data:
+            strategy_tracker.load_stats(data["strategy_stats"])
+            print("[MEMORY] Loaded strategy success rates")
+
+        session = data.get("session_count", 0)
+        saved_at = data.get("saved_at", 0)
+        if saved_at > 0:
+            age_hours = (time.time() - saved_at) / 3600
+            print(f"[MEMORY] Session #{session + 1}, "
+                  f"last save {age_hours:.1f}h ago")
