@@ -107,6 +107,11 @@ class VisionState:
         self.objects = []              # Detected objects in scene
         self.face_expression = None    # Expression of primary face
         self.face_landmarks = None     # Landmark points
+
+        # Head pose (from solvePnP on face mesh landmarks)
+        self.head_yaw = 0.0           # degrees, 0 = facing camera
+        self.head_pitch = 0.0         # degrees, 0 = level
+        self.facing_camera = False    # True if yaw within ±20° AND pitch within ±15°
         self.scene_description = ""    # Brief scene summary
         self.scene_novelty = 0.0       # How different from previous
         self.person_count = 0
@@ -234,6 +239,9 @@ class VisionState:
                 "reconnect_count": self.reconnect_count,
                 "objects": self.objects,
                 "face_expression": self.face_expression,
+                "head_yaw": round(self.head_yaw, 1),
+                "head_pitch": round(self.head_pitch, 1),
+                "facing_camera": self.facing_camera,
                 "scene_novelty": round(self.scene_novelty, 2),
                 "person_count": self.person_count,
                 "errors": self.errors,
@@ -715,17 +723,28 @@ def rich_vision_thread(config):
 
             expression = None
             if mesh_results.multi_face_landmarks:
-                state.person_count = len(mesh_results.multi_face_landmarks)
-
-                # Simple expression estimation from key landmarks
+                # Compute expression and head pose outside lock (pure computation)
                 landmarks = mesh_results.multi_face_landmarks[0]
                 expression = estimate_expression(landmarks, frame_w, frame_h)
-                state.face_expression = expression
-                state.face_landmarks = True  # Flag that landmarks are available
+                yaw, pitch = estimate_head_pose(landmarks, frame_w, frame_h)
+                person_count = len(mesh_results.multi_face_landmarks)
+
+                # Write all state fields under lock for consistent API snapshots
+                with state.lock:
+                    state.person_count = person_count
+                    state.face_expression = expression
+                    state.face_landmarks = True
+                    state.head_yaw = yaw
+                    state.head_pitch = pitch
+                    state.facing_camera = abs(yaw) < 20.0 and abs(pitch) < 15.0
             else:
-                state.person_count = 0
-                state.face_expression = None
-                state.face_landmarks = None
+                with state.lock:
+                    state.person_count = 0
+                    state.face_expression = None
+                    state.face_landmarks = None
+                    state.head_yaw = 0.0
+                    state.head_pitch = 0.0
+                    state.facing_camera = False
 
             # -- Response Detection: track expression changes --
             if expression:
@@ -785,6 +804,78 @@ def rich_vision_thread(config):
                 print(f"[RICH] Error: {e}")
             state.errors += 1
             time.sleep(1)
+
+
+def estimate_head_pose(landmarks, frame_w, frame_h):
+    """
+    Estimate head pose (yaw, pitch) from MediaPipe face mesh landmarks
+    using cv2.solvePnP with 6 key facial points.
+
+    Returns: (yaw_degrees, pitch_degrees) or (0.0, 0.0) on failure.
+    Yaw: 0 = facing camera, positive = turned right, negative = turned left.
+    Pitch: 0 = level, positive = looking down, negative = looking up.
+    """
+    try:
+        # 3D model points (generic face model in arbitrary units)
+        # X-axis matches image space: positive X = right side of image.
+        # MediaPipe convention: subject's left eye appears on image RIGHT side.
+        model_points = np.array([
+            (0.0, 0.0, 0.0),        # Nose tip (landmark 1)
+            (0.0, -63.6, -12.5),     # Chin (landmark 152)
+            (43.3, 32.7, -26.0),     # Left eye outer (landmark 263) — appears image-right
+            (-43.3, 32.7, -26.0),    # Right eye outer (landmark 33) — appears image-left
+            (28.9, -28.9, -24.1),    # Left mouth corner (landmark 291) — appears image-right
+            (-28.9, -28.9, -24.1),   # Right mouth corner (landmark 61) — appears image-left
+        ], dtype=np.float64)
+
+        # Corresponding 2D image points from face mesh landmarks
+        landmark_indices = [1, 152, 263, 33, 291, 61]
+        image_points = np.array([
+            (landmarks.landmark[i].x * frame_w,
+             landmarks.landmark[i].y * frame_h)
+            for i in landmark_indices
+        ], dtype=np.float64)
+
+        # Camera matrix (approximate, assuming no lens distortion)
+        focal_length = frame_w
+        center = (frame_w / 2, frame_h / 2)
+        camera_matrix = np.array([
+            [focal_length, 0, center[0]],
+            [0, focal_length, center[1]],
+            [0, 0, 1],
+        ], dtype=np.float64)
+
+        dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+
+        success, rotation_vec, _ = cv2.solvePnP(
+            model_points, image_points, camera_matrix, dist_coeffs,
+            flags=cv2.SOLVEPNP_ITERATIVE
+        )
+
+        if not success:
+            return 0.0, 0.0
+
+        # Convert rotation vector to rotation matrix
+        rotation_mat, _ = cv2.Rodrigues(rotation_vec)
+
+        # Decompose rotation matrix to Euler angles
+        # Use projectPoints approach for yaw/pitch extraction
+        sy = np.sqrt(rotation_mat[0, 0] ** 2 + rotation_mat[1, 0] ** 2)
+        if sy > 1e-6:
+            pitch = np.degrees(np.arctan2(rotation_mat[2, 1], rotation_mat[2, 2]))
+            yaw = np.degrees(np.arctan2(-rotation_mat[2, 0], sy))
+        else:
+            pitch = np.degrees(np.arctan2(-rotation_mat[1, 2], rotation_mat[1, 1]))
+            yaw = np.degrees(np.arctan2(-rotation_mat[2, 0], sy))
+
+        # Guard against NaN from degenerate geometry
+        if not (np.isfinite(yaw) and np.isfinite(pitch)):
+            return 0.0, 0.0
+
+        return float(yaw), float(pitch)
+
+    except Exception:
+        return 0.0, 0.0
 
 
 def estimate_expression(landmarks, frame_w, frame_h):
@@ -877,6 +968,9 @@ def get_face():
             "face": state.primary_face,
             "expression": state.face_expression,
             "person_count": state.person_count,
+            "head_yaw": round(state.head_yaw, 1),
+            "head_pitch": round(state.head_pitch, 1),
+            "facing_camera": state.facing_camera,
         })
 
 
@@ -994,6 +1088,9 @@ def get_response_detection():
             "person_left_at": state.person_left_at,
             "person_count": state.person_count,
             "scene_novelty": round(state.scene_novelty, 2),
+            "head_yaw": round(state.head_yaw, 1),
+            "head_pitch": round(state.head_pitch, 1),
+            "facing_camera": state.facing_camera,
         })
 
 

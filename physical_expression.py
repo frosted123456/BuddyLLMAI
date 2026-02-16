@@ -148,6 +148,16 @@ PHYSICAL_EXPRESSIONS = {
         "base_away_offset": 15,
         "nod_offset": 5,
     },
+    # ── Attention-triggered expressions ──
+    "attention_ready": {
+        "description": "Subtle perk-up — 'I see you looking at me'",
+        "commands": [
+            ("LOOK:90,{nod_up}", 0.3),           # Slight lean forward toward person
+            ("wait", 0.4),                         # Brief hold — shows acknowledgment
+        ],
+        "mood": "attentive",
+        "nod_offset": 5,  # Small movement — subtle, not dramatic
+    },
 }
 
 # Map emotional states to appropriate physical expressions
@@ -166,6 +176,7 @@ EMOTION_TO_EXPRESSION = {
     "self_occupied": ["restless_scan", "curious_tilt", "fidgety_shift"],
     "resigned": ["conspicuous_settle", "sigh", "settle"],
     "reluctant": ["expectant_look", "curious_tilt"],
+    "attentive": ["attention_ready"],
 }
 
 
@@ -249,6 +260,20 @@ class PhysicalExpressionManager:
             commands.append((cmd, delay))
 
         return commands
+
+    def get_attention_ready_commands(self, current_base=90, current_nod=115):
+        """
+        Get commands for the subtle "I see you" ready signal.
+        Bypasses the normal expression cooldown — this is a feedback signal, not
+        a narrative expression.
+
+        Returns: list of (command_string, delay_seconds) tuples
+        """
+        return self.get_expression_commands(
+            "attention_ready",
+            current_base=current_base,
+            current_nod=current_nod
+        )
 
     # ═══════════════════════════════════════════════════════
     # SPEECH PERFORMANCE ARC
