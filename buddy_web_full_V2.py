@@ -58,6 +58,7 @@ import websocket  # pip install websocket-client
 from narrative_engine import NarrativeEngine
 from intent_manager import IntentManager, StrategyTracker, should_speak_or_physical
 from salience_filter import SalienceFilter
+from consciousness_substrate import ConsciousnessSubstrate
 from physical_expression import (
     PhysicalExpressionManager,
     calculate_speech_delay,
@@ -777,6 +778,10 @@ narrative_engine = NarrativeEngine()
 intent_manager = IntentManager()
 salience_filter = SalienceFilter()
 physical_expression_mgr = PhysicalExpressionManager()
+consciousness = ConsciousnessSubstrate(
+    ollama_client=_ollama_fast_client,
+    embed_model="nomic-embed-text"
+)
 
 # Configure salience filter with fast LLM client for semantic scoring
 if _ollama_fast_client:
@@ -2488,6 +2493,14 @@ def get_buddy_state_prompt():
     # Narrative context from the narrative engine
     narrative_context = narrative_engine.get_narrative_context()
 
+    # Consciousness substrate: felt-sense (emotional coloring, not facts)
+    try:
+        felt_sense = consciousness.get_felt_sense()
+        if felt_sense:
+            narrative_context += "\n\n" + felt_sense
+    except Exception:
+        pass  # Substrate is optional — never breaks existing flow
+
     # Intent context from the intent manager
     intent_context = intent_manager.get_intent_context_for_llm()
 
@@ -2660,6 +2673,25 @@ def process_input(text, include_vision):
         cycle_override = intent_manager.person_responded()
         if cycle_override:
             intent_manager.set_intent(cycle_override)
+
+        # ═══ CONSCIOUSNESS: Human spoke — record as positive experience ═══
+        try:
+            _intent_obj = intent_manager.get_current_intent()
+            consciousness.record_experience({
+                "situation": f"Human spoke: {text[:100]}",
+                "intent": _intent_obj["type"] if _intent_obj else "response_to_human",
+                "strategy": "response_to_human",
+                "outcome": "spoke",
+                "person_id": narrative_engine.get_current_person(),
+                "ignored_streak_before": pre_streak,
+                "valence_before": 0.0,
+                "valence_after": 0.0,
+                "arousal": 0.5,
+                "what_buddy_said": "",
+                "scene_description": "",
+            })
+        except Exception:
+            pass
 
         # If they spoke after ignoring us, note it for narrative color
         if pre_streak >= 2:
@@ -2918,6 +2950,15 @@ def check_spontaneous_speech(state):
             spontaneous_utterance_log[:] = [t for t in spontaneous_utterance_log if t > one_hour_ago]
             if len(spontaneous_utterance_log) >= CONFIG.get("spontaneous_max_per_hour", 15):
                 return
+
+    # ── Consciousness bias: accumulated experience shapes intent selection ──
+    try:
+        _scene_desc = scene_context.current_description if scene_context.running else ""
+        _person_id = narrative_engine.get_current_person()
+        _consciousness_bias = consciousness.get_behavioral_bias(_scene_desc, _person_id)
+        intent_manager.apply_consciousness_bias(_consciousness_bias)
+    except Exception:
+        pass  # Substrate is optional — never breaks existing flow
 
     # ── Intent selection & escalation ──
     intent_type = intent_manager.select_intent(state, narrative_engine)
@@ -3326,6 +3367,29 @@ def process_narrative_speech(strategy, saved_state):
                     teensy_send_command(cmd)
                     if delay > 0:
                         time.sleep(delay)
+
+            # ═══ CONSCIOUSNESS: Record experience ═══
+            try:
+                _scene_desc = scene_context.current_description if scene_context.running else ""
+                _person_id = narrative_engine.get_current_person()
+                _intent_obj = intent_manager.get_current_intent()
+                _valence_after = float(saved_state.get('valence', 0.0))
+                consciousness.record_experience({
+                    "situation": f"{_scene_desc} | strategy={strategy} | "
+                                 f"valence={valence:.1f} arousal={arousal:.1f}",
+                    "intent": _intent_obj["type"] if _intent_obj else strategy,
+                    "strategy": strategy,
+                    "outcome": response_detected or "ignored",
+                    "person_id": _person_id,
+                    "ignored_streak_before": narrative_engine.get_ignored_streak(),
+                    "valence_before": valence,
+                    "valence_after": _valence_after,
+                    "arousal": arousal,
+                    "what_buddy_said": clean,
+                    "scene_description": _scene_desc,
+                })
+            except Exception as _ce:
+                print(f"[CONSCIOUSNESS] Record experience error: {_ce}")
 
             teensy_send_command("IDLE")
 
@@ -4196,6 +4260,12 @@ if __name__ == '__main__':
     print(f"  Salience Filter: active (keyword + LLM semantic scoring)")
     print(f"  Physical Expressions: active (LLM-driven action selection)")
 
+    # Consciousness Substrate — cumulative experience & felt state
+    consciousness.load()
+    consciousness.start()
+    print(f"  Consciousness Substrate: active (somatic state, emotional baseline, "
+          f"anticipatory model, {len(consciousness.long_term)} long-term memories)")
+
     # Face Tracking Debug Dashboard background thread
     threading.Thread(target=tracking_dashboard_thread, daemon=True, name="tracking-dashboard").start()
     print("  Debug Dashboard: merged into main UI (toggle 'Debug Tools' button)")
@@ -4224,6 +4294,11 @@ if __name__ == '__main__':
             narrative_engine.save_memory(intent_manager.strategy_tracker)
         except Exception as e:
             print(f"[MEMORY] Shutdown save error: {e}")
+        try:
+            consciousness.save()
+            consciousness.stop()
+        except Exception as e:
+            print(f"[CONSCIOUSNESS] Shutdown save error: {e}")
     atexit.register(_save_on_exit)
 
     print()
