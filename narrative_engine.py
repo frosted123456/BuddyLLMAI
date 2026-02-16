@@ -692,6 +692,11 @@ class NarrativeEngine:
     # PERSON PROFILES — Per-person behavioral memory
     # ═══════════════════════════════════════════════════════
 
+    def get_current_person(self):
+        """Return the current person's ID (or None)."""
+        with self.lock:
+            return self._current_person_id
+
     def set_current_person(self, person_id):
         """Track which person Buddy is interacting with."""
         with self.lock:

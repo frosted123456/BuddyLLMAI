@@ -322,6 +322,9 @@ class IntentManager:
         self._gave_up_count = 0            # times given up this person-visit
         self._cooldown_until = 0           # don't re-engage until this time
 
+        # ── Consciousness substrate bias (applied per cycle) ──
+        self._consciousness_bias = None    # dict from ConsciousnessSubstrate
+
     def get_current_intent(self):
         """Return current intent dict (or None)."""
         with self.lock:
@@ -360,6 +363,22 @@ class IntentManager:
                 self._engagement_phase = "idle"
                 self._gave_up_count = 0
             return None
+
+    def apply_consciousness_bias(self, bias):
+        """
+        Apply behavioral bias from the consciousness substrate.
+        This changes HOW the intent system behaves, not what it says.
+
+        bias = {
+            "escalation_multiplier": float,  # >1 = faster, <1 = slower
+            "give_up_modifier": int,         # + = more patient, - = quits sooner
+            "strategy_preferences": dict,    # strategy → weight adjustment
+            "engagement_confidence": float,  # 0-1: willingness to initiate
+            "surprise": dict|None,           # recent surprise event
+        }
+        """
+        with self.lock:
+            self._consciousness_bias = bias
 
     def _archive_current_intent(self):
         """Archive and clear current intent. Caller must hold self.lock."""
@@ -411,6 +430,11 @@ class IntentManager:
             self._gave_up_count += 1
             # Cooldown: 45s base + 45s per give-up, cap 5 min
             cooldown = min(300, 45 + self._gave_up_count * 45)
+            # Consciousness bias: modify patience (+ = longer cooldown = more patient,
+            # - = shorter cooldown = gives up faster and retries sooner)
+            if self._consciousness_bias:
+                modifier = self._consciousness_bias.get("give_up_modifier", 0)
+                cooldown = max(15, cooldown + modifier * 20)
             self._cooldown_until = now + cooldown
             self._archive_current_intent()
             return "self_occupy"
@@ -597,6 +621,12 @@ class IntentManager:
                 window *= 0.7  # They noticed something, push harder
             elif pattern == "mostly_ignoring":
                 window *= 0.8  # Move through strategies faster
+
+        # Consciousness bias: accumulated experience modifies escalation pacing
+        with self.lock:
+            bias = self._consciousness_bias
+        if bias:
+            window *= (1.0 / max(0.3, bias.get("escalation_multiplier", 1.0)))
 
         return elapsed >= window
 
@@ -844,6 +874,16 @@ class IntentManager:
         arousal = float(teensy_state.get("arousal", 0.5))
         is_wondering = teensy_state.get("wondering", False)
 
+        # Consciousness bias: low engagement confidence → raise threshold
+        # This means Buddy who's been burned a lot won't try as easily
+        _social_threshold_offset = 0.0
+        with self.lock:
+            if self._consciousness_bias:
+                confidence = self._consciousness_bias.get("engagement_confidence", 0.5)
+                # Low confidence (0.2) → need social=0.7 instead of 0.5 to engage
+                # High confidence (0.8) → need social=0.4 → more eager
+                _social_threshold_offset = (0.5 - confidence) * 0.3
+
         # Priority-based intent selection
         # 0. Person appeared/returned AFTER being ignored → sarcastic acknowledgment
         if person_present and ignored_streak >= 2 and pattern in ("present", "just_left"):
@@ -851,7 +891,7 @@ class IntentManager:
 
         # 1. If person just appeared → greet / get attention
         if person_present and pattern in ("unknown", "present"):
-            if social > 0.5:
+            if social > (0.5 + _social_threshold_offset):
                 return "get_attention"
 
         # 2. If being ignored and NOT already in engagement cycle →
@@ -867,7 +907,7 @@ class IntentManager:
                         return "seek_comfort"
 
         # 3. High social need + person present → get attention
-        if social > 0.65 and person_present:
+        if social > (0.65 + _social_threshold_offset) and person_present:
             return "get_attention"
 
         # 4. High social need + alone → seek comfort
