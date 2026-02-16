@@ -76,6 +76,11 @@ class NarrativeEngine:
         self.total_utterances_session = 0
         self.session_start = time.time()
 
+        # ── Conversation History (multi-turn) ──
+        # Stores actual human speech + Buddy's responses as chat messages.
+        # This is what gets injected into the LLM as multi-turn context.
+        self.conversation_history = deque(maxlen=20)  # ~10 turns of human+buddy
+
     # ═══════════════════════════════════════════════════════
     # UTTERANCE TRACKING
     # ═══════════════════════════════════════════════════════
@@ -146,6 +151,52 @@ class NarrativeEngine:
                 0, self.human_responsiveness["ignored_streak"] - 1
             )
             self._recalculate_responsiveness()
+
+    def record_human_speech_text(self, text):
+        """Record the actual text of what the human said (multi-turn memory)."""
+        with self.lock:
+            now = time.time()
+            self.conversation_history.append({
+                "role": "user",
+                "content": text,
+                "time": now,
+            })
+            # Also update existing timestamp/responsiveness tracking
+            self.human_responsiveness["last_interaction"] = now
+            self.human_responsiveness["last_verbal_response"] = now
+            self.human_responsiveness["ignored_streak"] = max(
+                0, self.human_responsiveness["ignored_streak"] - 1
+            )
+            self._recalculate_responsiveness()
+
+    def record_buddy_response(self, text, trigger="response"):
+        """Record what Buddy said in the conversation history (multi-turn memory)."""
+        with self.lock:
+            self.conversation_history.append({
+                "role": "assistant",
+                "content": text,
+                "time": time.time(),
+            })
+
+    def get_conversation_messages(self, max_turns=5, max_age=600):
+        """
+        Return recent conversation as Ollama-format message list.
+        Only includes messages from the last max_age seconds.
+        Returns list of {"role": "user"|"assistant", "content": str}.
+        """
+        with self.lock:
+            now = time.time()
+            messages = []
+            for entry in self.conversation_history:
+                if now - entry["time"] < max_age:
+                    messages.append({
+                        "role": entry["role"],
+                        "content": entry["content"],
+                    })
+            # Trim to max_turns (each turn = 1 user + 1 assistant)
+            if len(messages) > max_turns * 2:
+                messages = messages[-(max_turns * 2):]
+            return messages
 
     # ═══════════════════════════════════════════════════════
     # THREAD TRACKING
@@ -396,8 +447,8 @@ class NarrativeEngine:
                     if entry["response_type"] and entry["response_type"] != "none":
                         response_str = entry["response_type"]
 
-                    text_short = entry["text"][:80]
-                    if len(entry["text"]) > 80:
+                    text_short = entry["text"][:150]
+                    if len(entry["text"]) > 150:
                         text_short += "..."
 
                     utterance_lines.append(
