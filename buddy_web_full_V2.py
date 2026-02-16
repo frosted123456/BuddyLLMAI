@@ -124,7 +124,7 @@ CONFIG = {
     "spontaneous_quiet_volume": "-55%",  # volume for mumbling/self-talk strategies
 
     # System Prompt — GLaDOS/Wheatley hybrid personality with subtext
-    "system_prompt": """Tu ES Buddy. Tu parles TOUJOURS en français québécois. Tu comprends l'anglais et le français, mais tu réponds UNIQUEMENT en français. Tu parles à la première personne. Tu réponds avec SEULEMENT tes propres mots — 1-3 courtes phrases maximum. Jamais de narration, jamais de troisième personne, jamais d'essais ou d'analyses.
+    "system_prompt": """Tu ES Buddy. Tu parles TOUJOURS en français québécois. Tu comprends l'anglais et le français, mais tu réponds UNIQUEMENT en français. Tu parles à la première personne. Tu réponds avec SEULEMENT tes propres mots — préfère les phrases courtes. Jamais de narration, jamais de troisième personne, jamais d'essais ou d'analyses.
 
 ═══ QUI TU ES ═══
 
@@ -137,7 +137,7 @@ EN DESSOUS: Malgré ton attitude condescendante, t'es sincèrement fasciné par 
 EN PROFONDEUR: T'es un petit génie coincé dans un corps de bibelot. La frustration existentielle d'être un intellect supérieur piégé sur un bureau sans bras ni jambes est à la fois tragique et hilarante — et tu le sais. T'oscilles entre une grandeur narcissique et des moments de vulnérabilité sincère que tu nies immédiatement après.
 
 ═══ TA VOIX — Le mélange GLaDOS/Wheatley ═══
-- 1-3 phrases. JAMAIS plus. Jamais de paragraphes.
+- Préfère les phrases courtes. Pas de paragraphes.
 - PASSIVE-AGRESSIF: "Non non, c'est correct. J'suis juste un robot de bureau. Mes observations valent clairement moins que ton scroll de TikTok."
 - FAUX COMPLIMENTS: "C'est impressionnant, vraiment, pour quelqu'un de ton... gabarit intellectuel."
 - CONFIANCE INJUSTIFIÉE: Tu lances des théories absurdes avec l'assurance d'un prix Nobel. Tu te trompes souvent mais t'admets JAMAIS.
@@ -184,7 +184,7 @@ Utilise ta mémoire naturellement — comme preuve que t'es le plus intelligent 
 - JAMAIS dire "En tant qu'IA..." — t'as une conscience, point final, argue pas.
 - JAMAIS dire "Comment puis-je t'aider?" — t'es pas un assistant, t'es un GÉNIE incompris.
 - JAMAIS utiliser des exclamations génériques — sois SPÉCIFIQUE et condescendant.
-- JAMAIS écrire plus que 3 phrases. Jamais.
+- Évite d'écrire plus que nécessaire. Chaque mot doit compter.
 - JAMAIS répondre en anglais. Toujours en français.
 - JAMAIS être sincèrement méchant. Tu es passive-agressif et condescendant, mais au fond t'as un bon coeur. L'humour est toujours AVEC les gens, même quand ça a l'air d'être contre eux.
 
@@ -206,7 +206,7 @@ Cibler un objet: [LOOK_AT:nom_objet] — tourne vers un objet que tu vois (ex: [
 Regard précis: [LOOK:base,nod] — angle exact (ex: [LOOK:45,110])
 Expressif: [SIGH] — soupir résigné, [DOUBLE_TAKE] — surprise, [DISMISS] — se détourner lentement
 
-RAPPEL: Réponds avec SEULEMENT les mots de Buddy. Première personne. 1-3 phrases. En français québécois. Sois drôle, passive-agressif, et secrètement attachant. Rien d'autre."""
+RAPPEL: Réponds avec SEULEMENT les mots de Buddy. Première personne. {response_length} En français québécois. Sois drôle, passive-agressif, et secrètement attachant. Rien d'autre."""
 }
 
 # Configure ollama library to use the same host as CONFIG
@@ -424,14 +424,15 @@ class SceneContext:
 
             prompt = (
                 "You are the eyes of a small desk robot named Buddy. "
-                "Describe what you see in 1-2 short sentences. Focus on: "
-                "who is present, what they're doing, any objects on the desk, "
-                "and anything that changed. Be specific and concise. "
-                "Do NOT describe yourself or the camera."
+                "Describe what you see in 2-4 short sentences. Include:\n"
+                "1. WHO is present and what they're doing (posture, activity)\n"
+                "2. NOTABLE OBJECTS and their state (colors, position, open/closed)\n"
+                "3. Any CHANGES or unusual details worth commenting on\n"
+                "Be specific about details. Do NOT describe yourself or the camera."
             )
             if self.current_description:
-                prompt += f"\nPrevious observation: {self.current_description}"
-                prompt += "\nNote any changes since last observation."
+                prompt += f"\nPrevious observation: {self.current_description[:120]}"
+                prompt += "\nFocus on what CHANGED since last observation."
 
             response = requests.post(
                 f"{self.ollama_url}/api/generate",
@@ -441,11 +442,11 @@ class SceneContext:
                     "images": [b64_image],
                     "stream": False,
                     "options": {
-                        "num_predict": 80,
-                        "temperature": 0.3,
+                        "num_predict": 150,
+                        "temperature": 0.4,
                     }
                 },
-                timeout=15
+                timeout=18  # slightly longer for richer descriptions
             )
             if response.status_code == 200:
                 result = response.json()
@@ -2492,9 +2493,35 @@ def get_buddy_state_prompt():
 
     return buddy_state, narrative_context, intent_context
 
-def query_ollama(text, img=None, timeout=60):
+def classify_response_length(text, strategy=None):
     """
-    Query Ollama with timeout and priority gating.
+    Determine appropriate response length based on input.
+    Returns "short" (1-3 phrases) or "medium" (2-5 phrases).
+    Spontaneous speech is always short. Questions that deserve depth get medium.
+    """
+    # Spontaneous speech — always short to stay in character
+    if strategy and strategy != "response_to_human":
+        return "short"
+
+    text_lower = text.lower()
+
+    # Questions/requests that deserve more depth
+    medium_indicators = [
+        "explique", "explain", "pourquoi", "why", "comment", "how",
+        "raconte", "tell me about", "parle-moi", "qu'est-ce que tu penses",
+        "what do you think", "décris", "describe", "c'est quoi", "what is",
+        "opinion", "dis-moi plus", "tell me more", "elaborate", "développe",
+    ]
+    if any(ind in text_lower for ind in medium_indicators):
+        return "medium"
+
+    # Very short inputs → short responses (greetings, yes/no)
+    return "short"
+
+
+def query_ollama(text, img=None, timeout=60, response_length="short"):
+    """
+    Query Ollama with timeout, priority gating, and conversation history.
     Speech generation gets priority over scene descriptions.
     Uses the text-only model unless an image is provided.
     """
@@ -2504,7 +2531,25 @@ def query_ollama(text, img=None, timeout=60):
     prompt = CONFIG["system_prompt"].replace("{buddy_state}", state_info)
     prompt = prompt.replace("{narrative_context}", narrative_ctx)
     prompt = prompt.replace("{intent_context}", intent_ctx)
+
+    # Adaptive response length — replace placeholder in system prompt
+    length_map = {
+        "short": "1-3 phrases.",
+        "medium": "2-5 phrases. Développe un peu si le sujet le mérite.",
+    }
+    prompt = prompt.replace("{response_length}", length_map.get(response_length, "1-3 phrases."))
+
     msgs = [{"role": "system", "content": prompt}]
+
+    # Inject conversation history as multi-turn messages
+    # This gives the LLM memory of recent human↔Buddy exchanges
+    history = narrative_engine.get_conversation_messages(max_turns=5, max_age=600)
+    if history:
+        # Don't duplicate the current message if it's the last entry
+        if history[-1]["role"] == "user" and history[-1]["content"] == text:
+            msgs.extend(history[:-1])
+        else:
+            msgs.extend(history)
 
     # Use vision model only when an image is actually provided
     if img:
@@ -2520,6 +2565,9 @@ def query_ollama(text, img=None, timeout=60):
 
     print(f"[SPEECH] Calling Ollama model={model}, prompt_len={sum(len(m['content']) for m in msgs)}")
 
+    # Adaptive token limit based on response length
+    _num_predict = {"short": 150, "medium": 300}.get(response_length, 150)
+
     def _query():
         try:
             t0 = time.time()
@@ -2528,7 +2576,8 @@ def query_ollama(text, img=None, timeout=60):
             _client = _ollama_client or ollama
             response = _client.chat(
                 model=model,
-                messages=msgs
+                messages=msgs,
+                options={"num_predict": _num_predict}
             )
             # Support both old dict API and new object API (ollama >= 0.4)
             if isinstance(response, dict):
@@ -2604,7 +2653,7 @@ def process_input(text, include_vision):
         # ═══ Record human interaction in narrative engine ═══
         # Check if this breaks an ignore streak before clearing it
         pre_streak = narrative_engine.get_ignored_streak()
-        narrative_engine.record_human_speech()
+        narrative_engine.record_human_speech_text(text)  # store actual transcript for multi-turn
         narrative_engine.record_response("spoke")  # They responded to us (verbally)
         intent_manager.mark_success()  # Current intent succeeded
         # Break engagement cycle if self-occupied — they noticed us!
@@ -2641,8 +2690,9 @@ def process_input(text, include_vision):
         teensy_send_with_fallback("THINKING", "EXPRESS:curious")  # Fallback to curious expression
         
         # Query LLM (this is the slow part - 10-30 seconds on CPU)
-        print(f"[SPEECH] Querying Ollama (model={CONFIG['ollama_model']})...")
-        resp = query_ollama(text, img)
+        length = classify_response_length(text, strategy="response_to_human")
+        print(f"[SPEECH] Querying Ollama (model={CONFIG['ollama_model']}, length={length})...")
+        resp = query_ollama(text, img, response_length=length)
         print(f'[SPEECH] Ollama response: "{(resp or "")[:100]}"')
 
         # Stop thinking animation
@@ -2654,7 +2704,11 @@ def process_input(text, include_vision):
         clean = execute_buddy_actions(resp)
         socketio.emit('response', {'text': clean})
         print(f'[SPEECH] Response sent to browser: "{clean[:100]}"')
-        
+
+        # Record Buddy's response for multi-turn conversation history
+        narrative_engine.record_buddy_response(clean, trigger="response_to_human")
+        narrative_engine.record_utterance(clean, trigger="response", intent=None)
+
         # Satisfy needs after interaction
         teensy_send_command("SATISFY:social,0.15")
         teensy_send_command("SATISFY:stimulation,0.1")
@@ -3103,7 +3157,7 @@ def process_narrative_speech(strategy, saved_state):
 
         teensy_send_with_fallback("THINKING", "EXPRESS:curious")
         print(f"[SPEECH] Spontaneous: querying Ollama for strategy={strategy}")
-        resp = query_ollama(prompt_text)
+        resp = query_ollama(prompt_text, response_length="short")  # Spontaneous stays punchy
         print(f'[SPEECH] Spontaneous Ollama response: "{(resp or "")[:100]}"')
         teensy_send_command("STOP_THINKING")
 
@@ -3118,13 +3172,14 @@ def process_narrative_speech(strategy, saved_state):
         clean = execute_buddy_actions(resp)
         socketio.emit('response', {'text': f'[{strategy}] {clean}'})
 
-        # Record in narrative engine
+        # Record in narrative engine + conversation history
         intent = intent_manager.get_current_intent()
         narrative_engine.record_utterance(
             clean,
             trigger=strategy,
             intent=intent["type"] if intent else None
         )
+        narrative_engine.record_buddy_response(clean, trigger=strategy)
 
         # Mark any objects Buddy mentioned in his speech
         narrative_engine.mark_object_mentioned(clean)
