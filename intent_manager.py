@@ -434,7 +434,7 @@ class IntentManager:
             # - = shorter cooldown = gives up faster and retries sooner)
             if self._consciousness_bias:
                 modifier = self._consciousness_bias.get("give_up_modifier", 0)
-                cooldown = max(15, cooldown + modifier * 20)
+                cooldown = max(15, min(300, cooldown + modifier * 20))
             self._cooldown_until = now + cooldown
             self._archive_current_intent()
             return "self_occupy"
@@ -623,10 +623,12 @@ class IntentManager:
                 window *= 0.8  # Move through strategies faster
 
         # Consciousness bias: accumulated experience modifies escalation pacing
+        # (reference copy under lock; dict is replaced not mutated, so safe to read outside)
         with self.lock:
             bias = self._consciousness_bias
         if bias:
-            window *= (1.0 / max(0.3, bias.get("escalation_multiplier", 1.0)))
+            mult = max(0.3, min(5.0, bias.get("escalation_multiplier", 1.0)))
+            window *= (1.0 / mult)
 
         return elapsed >= window
 

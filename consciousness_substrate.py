@@ -109,15 +109,18 @@ class VectorStore:
         """
         Find k most similar experiences.
         Returns list of metadata dicts, sorted by similarity (descending).
+        Only compares embeddings of the same dimension to avoid garbage results
+        when switching between real embeddings and text-hash fallback.
         """
         if not self._entries or not query_embedding:
             return []
 
+        query_dim = len(query_embedding)
         scored = []
         for entry in self._entries:
             emb = entry.get("embedding")
-            if not emb:
-                continue
+            if not emb or len(emb) != query_dim:
+                continue  # Skip dimension-mismatched entries
             sim = _cosine_similarity(query_embedding, emb)
             if sim >= min_similarity:
                 scored.append((sim, entry["metadata"]))
@@ -234,6 +237,8 @@ class EmotionalBaseline:
         self.resilience = 0.5
         self.attachment = {}  # person_id → float 0-1
 
+    MAX_PERSONS = 100  # Cap attachment dict to prevent unbounded growth
+
     def update_from_experience(self, outcome, person_id=None):
         """Tiny personality shift from each experience."""
         r = self.DRIFT_RATE
@@ -261,6 +266,12 @@ class EmotionalBaseline:
             elif outcome == "left":
                 att = max(0.05, att - 0.001)
             self.attachment[person_id] = att
+
+            # Evict lowest-attachment person if over capacity
+            if len(self.attachment) > self.MAX_PERSONS:
+                worst = min(self.attachment, key=self.attachment.get)
+                if worst != person_id:
+                    del self.attachment[worst]
 
     def get_attachment(self, person_id):
         return self.attachment.get(person_id, 0.5)
@@ -295,6 +306,8 @@ class AnticipatoryModel:
     - Patterns (e.g., "ignores first 5 min, then engages")
     """
 
+    MAX_PERSONS = 50  # Cap tracked persons to prevent unbounded growth
+
     def __init__(self):
         # person_id → {outcomes: deque, arrival_to_engage: deque, ...}
         self._person_patterns = {}
@@ -303,6 +316,21 @@ class AnticipatoryModel:
 
     def _ensure_person(self, person_id):
         if person_id not in self._person_patterns:
+            # Evict least-recently-used if over capacity
+            if len(self._person_patterns) >= self.MAX_PERSONS:
+                oldest_pid = None
+                oldest_time = float('inf')
+                for pid, pat in self._person_patterns.items():
+                    outcomes = pat.get("outcomes")
+                    # Empty outcomes = never interacted = evict first
+                    last_t = outcomes[-1].get("time", 0) if outcomes else 0
+                    if last_t < oldest_time:
+                        oldest_time = last_t
+                        oldest_pid = pid
+                if oldest_pid:
+                    del self._person_patterns[oldest_pid]
+                    self._last_prediction.pop(oldest_pid, None)
+
             self._person_patterns[person_id] = {
                 "outcomes": deque(maxlen=30),
                 "arrival_to_first_response": deque(maxlen=10),
@@ -472,7 +500,8 @@ class ConsciousnessSubstrate:
 
     SAVE_FILE = "buddy_consciousness.json"
 
-    def __init__(self, ollama_client=None, embed_model="nomic-embed-text"):
+    def __init__(self, ollama_client=None, embed_model="nomic-embed-text",
+                 ollama_lock=None):
         self.lock = threading.Lock()
 
         # Core components
@@ -494,6 +523,10 @@ class ConsciousnessSubstrate:
         self._embed_model = embed_model
         self._embedding_available = False
         self._embedding_dim = None
+        # External Ollama contention lock — prevents embedding calls from
+        # competing with LLM speech generation. NEVER hold self.lock when
+        # acquiring this.
+        self._ollama_lock = ollama_lock
 
         # Background processor
         self._running = False
@@ -502,52 +535,81 @@ class ConsciousnessSubstrate:
         # Stats
         self._total_experiences = 0
         self._last_consolidation = time.time()
+        self._bg_error_count = 0  # Consecutive background errors
 
-        # Test embedding availability
-        self._test_embedding()
+        # Test embedding availability (lazy — deferred to first _embed call)
+        self._embedding_tested = False
 
     def _test_embedding(self):
-        """Check if the embedding model is available."""
+        """
+        Check if the embedding model is available.
+        Called lazily on first _embed() call, not in __init__,
+        to avoid blocking server startup if Ollama is slow.
+        """
+        self._embedding_tested = True
+
         if not self._ollama_client:
             logger.info("[CONSCIOUSNESS] No Ollama client — using text-hash fallback for embeddings")
             return
 
         try:
-            result = self._ollama_client.embeddings(
-                model=self._embed_model,
-                prompt="test"
-            )
-            # Support both dict and object API
-            if isinstance(result, dict):
-                emb = result.get("embedding", [])
-            else:
-                emb = result.embedding if hasattr(result, 'embedding') else []
-
-            if emb:
-                self._embedding_available = True
-                self._embedding_dim = len(emb)
-                logger.info(
-                    "[CONSCIOUSNESS] Embedding available: model=%s, dim=%d",
-                    self._embed_model, self._embedding_dim
+            # Acquire ollama_lock if available to prevent contention
+            if self._ollama_lock:
+                if not self._ollama_lock.acquire(timeout=5):
+                    logger.info("[CONSCIOUSNESS] Ollama busy — deferring embedding test")
+                    self._embedding_tested = False  # Retry next call
+                    return
+            try:
+                result = self._ollama_client.embeddings(
+                    model=self._embed_model,
+                    prompt="test"
                 )
-            else:
-                logger.info("[CONSCIOUSNESS] Embedding model returned empty — using fallback")
+                if isinstance(result, dict):
+                    emb = result.get("embedding", [])
+                else:
+                    emb = result.embedding if hasattr(result, 'embedding') else []
+
+                if emb:
+                    self._embedding_available = True
+                    self._embedding_dim = len(emb)
+                    logger.info(
+                        "[CONSCIOUSNESS] Embedding available: model=%s, dim=%d",
+                        self._embed_model, self._embedding_dim
+                    )
+                else:
+                    logger.info("[CONSCIOUSNESS] Embedding model returned empty — using fallback")
+            finally:
+                if self._ollama_lock and self._ollama_lock.locked():
+                    self._ollama_lock.release()
         except Exception as e:
             logger.info("[CONSCIOUSNESS] Embedding not available (%s) — using text-hash fallback", e)
 
     def _embed(self, text):
         """
-        Generate embedding for text.
+        Generate embedding for text. MUST be called OUTSIDE self.lock.
         Falls back to simple text hashing if Ollama embeddings unavailable.
+        Respects _ollama_lock to prevent contention with speech generation.
         """
         if not text:
             return None
 
+        # Lazy-test embedding availability (deferred from __init__)
+        if not self._embedding_tested:
+            self._test_embedding()
+
         if self._embedding_available and self._ollama_client:
+            # Try to acquire ollama_lock without blocking too long
+            # If Ollama is busy with speech, skip embedding and use fallback
+            acquired = False
+            if self._ollama_lock:
+                acquired = self._ollama_lock.acquire(timeout=2)
+                if not acquired:
+                    # Ollama busy — use fallback for this call
+                    return self._text_hash_embedding(text)
             try:
                 result = self._ollama_client.embeddings(
                     model=self._embed_model,
-                    prompt=text[:500]  # Truncate to avoid huge inputs
+                    prompt=text[:500]
                 )
                 if isinstance(result, dict):
                     emb = result.get("embedding", [])
@@ -557,23 +619,33 @@ class ConsciousnessSubstrate:
                     return emb
             except Exception as e:
                 logger.debug("[CONSCIOUSNESS] Embedding failed: %s", e)
+            finally:
+                if acquired and self._ollama_lock:
+                    self._ollama_lock.release()
 
-        # Fallback: simple bag-of-words hash (still allows rough similarity)
+        # Fallback: deterministic text hashing (rough similarity)
         return self._text_hash_embedding(text)
 
-    def _text_hash_embedding(self, text, dim=64):
+    @staticmethod
+    def _text_hash_embedding(text, dim=64):
         """
         Simple text → vector fallback when no embedding model is available.
-        Uses character trigram hashing. Not great, but allows the system
-        to function and find roughly similar experiences.
+        Uses character n-gram hashing with hashlib for deterministic results
+        across process restarts. Handles short words via bigrams.
         """
+        import hashlib
+
         vec = [0.0] * dim
         words = text.lower().split()
         for w in words:
-            for i in range(len(w) - 2):
-                trigram = w[i:i+3]
-                h = hash(trigram) % dim
-                vec[h] += 1.0
+            # Unigrams for single chars, bigrams for 2-char, trigrams for 3+
+            min_n = min(len(w), 3)
+            for n in range(min_n, max(min_n, 3) + 1):
+                for i in range(max(1, len(w) - n + 1)):
+                    ngram = w[i:i+n]
+                    # Deterministic hash via md5 (not cryptographic, just stable)
+                    h = int(hashlib.md5(ngram.encode()).hexdigest()[:8], 16) % dim
+                    vec[h] += 1.0
 
         # Normalize
         n = _norm(vec)
@@ -603,30 +675,31 @@ class ConsciousnessSubstrate:
             "scene_description": str,
         }
         """
+        # Generate embedding OUTSIDE the lock — this may call Ollama (blocking I/O)
+        situation_text = experience.get("situation", "")
+        embedding = self._embed(situation_text)
+
         with self.lock:
             now = time.time()
             outcome = experience.get("outcome", "ignored")
             person_id = experience.get("person_id")
 
-            # 1. Generate embedding for the situation
-            situation_text = experience.get("situation", "")
-            embedding = self._embed(situation_text)
-
-            # 2. Store in short-term memory
+            # Store in short-term memory
             entry = {
                 **experience,
                 "embedding": embedding,
                 "timestamp": now,
+                "_consolidated": False,
             }
             self.short_term.append(entry)
 
-            # 3. Update somatic state
+            # Update somatic state
             self.somatic.update_from_experience(outcome)
 
-            # 4. Update emotional baseline (very slow drift)
+            # Update emotional baseline (very slow drift)
             self.baseline.update_from_experience(outcome, person_id)
 
-            # 5. Update anticipatory model
+            # Update anticipatory model
             self.anticipatory.record_outcome(
                 person_id, outcome,
                 time_since_arrival=experience.get("time_since_arrival")
@@ -659,6 +732,9 @@ class ConsciousnessSubstrate:
             "surprise": dict|None,              # Recent surprise event
         }
         """
+        # Generate embedding OUTSIDE the lock — may call Ollama (blocking I/O)
+        embedding = self._embed(situation_text) if situation_text else None
+
         with self.lock:
             bias = {
                 "escalation_multiplier": 1.0,
@@ -669,8 +745,6 @@ class ConsciousnessSubstrate:
             }
 
             # ── Baseline personality influence ──
-            # Low trust → escalate slower (what's the point)
-            # High trust → escalate normally (they'll respond)
             if self.baseline.trust < 0.3:
                 bias["escalation_multiplier"] *= 0.75
                 bias["give_up_modifier"] -= 1
@@ -685,64 +759,53 @@ class ConsciousnessSubstrate:
             if person_id:
                 att = self.baseline.get_attachment(person_id)
                 if att > 0.7:
-                    # Try harder with people we're attached to
                     bias["give_up_modifier"] += 1
                     bias["engagement_confidence"] = min(
                         0.95, bias["engagement_confidence"] + 0.2
                     )
                 elif att < 0.3:
-                    # Give up faster with low-attachment people
                     bias["give_up_modifier"] -= 1
 
             # ── Somatic influence ──
             if self.somatic.tension > 0.6:
-                # High tension → more likely to escalate (agitated)
                 bias["escalation_multiplier"] *= 1.2
             if self.somatic.warmth > 0.5:
-                # Feeling warm → more patient
                 bias["give_up_modifier"] += 1
             if self.somatic.restlessness > 0.6:
-                # Restless → escalate faster
                 bias["escalation_multiplier"] *= 1.15
 
             # ── Vector retrieval: similar past experiences ──
-            if situation_text:
-                embedding = self._embed(situation_text)
-                if embedding:
-                    similar = self.long_term.search(embedding, k=5, min_similarity=0.4)
+            if embedding:
+                similar = self.long_term.search(embedding, k=5, min_similarity=0.4)
 
-                    # Also search short-term
-                    for entry in self.short_term:
-                        e = entry.get("embedding")
-                        if e:
-                            sim = _cosine_similarity(embedding, e)
-                            if sim >= 0.5:
-                                similar.append(entry)
+                # Also search short-term
+                for entry in self.short_term:
+                    e = entry.get("embedding")
+                    if e and len(e) == len(embedding):  # Only compare same-dimension
+                        sim = _cosine_similarity(embedding, e)
+                        if sim >= 0.5:
+                            similar.append(entry)
 
-                    if similar:
-                        # What happened in similar situations?
-                        outcomes = [s.get("outcome", "ignored") for s in similar]
-                        ignore_rate = outcomes.count("ignored") / len(outcomes)
+                if similar:
+                    outcomes = [s.get("outcome", "ignored") for s in similar]
+                    ignore_rate = outcomes.count("ignored") / len(outcomes)
 
-                        if ignore_rate > 0.7:
-                            # Similar situations usually end in being ignored
-                            bias["escalation_multiplier"] *= 0.7  # Resigned
-                            bias["give_up_modifier"] -= 1
-                        elif ignore_rate < 0.3:
-                            # Similar situations usually work out
-                            bias["escalation_multiplier"] *= 1.1
-                            bias["give_up_modifier"] += 1
+                    if ignore_rate > 0.7:
+                        bias["escalation_multiplier"] *= 0.7
+                        bias["give_up_modifier"] -= 1
+                    elif ignore_rate < 0.3:
+                        bias["escalation_multiplier"] *= 1.1
+                        bias["give_up_modifier"] += 1
 
-                        # Strategy preferences from past success
-                        for exp in similar:
-                            strat = exp.get("strategy")
-                            if strat:
-                                if exp.get("outcome") in ("spoke", "smiled", "laughed", "looked"):
-                                    bias["strategy_preferences"][strat] = \
-                                        bias["strategy_preferences"].get(strat, 0) + 0.15
-                                else:
-                                    bias["strategy_preferences"][strat] = \
-                                        bias["strategy_preferences"].get(strat, 0) - 0.1
+                    for exp in similar:
+                        strat = exp.get("strategy")
+                        if strat:
+                            if exp.get("outcome") in ("spoke", "smiled", "laughed", "looked"):
+                                bias["strategy_preferences"][strat] = \
+                                    bias["strategy_preferences"].get(strat, 0) + 0.15
+                            else:
+                                bias["strategy_preferences"][strat] = \
+                                    bias["strategy_preferences"].get(strat, 0) - 0.1
 
             # ── Anticipatory surprise ──
             bias["surprise"] = self.anticipatory.get_surprise(max_age=30)
@@ -752,7 +815,6 @@ class ConsciousnessSubstrate:
                 prediction = self.anticipatory.predict(person_id)
                 if prediction["confidence"] > 0.5:
                     if not prediction["expected_positive"]:
-                        # We expect to be ignored — lower confidence
                         bias["engagement_confidence"] *= 0.7
 
             return bias
@@ -859,9 +921,10 @@ class ConsciousnessSubstrate:
 
     def start(self):
         """Start the background processing thread."""
-        if self._running:
-            return
-        self._running = True
+        with self.lock:
+            if self._running:
+                return
+            self._running = True
         self._bg_thread = threading.Thread(
             target=self._background_loop,
             daemon=True,
@@ -872,7 +935,8 @@ class ConsciousnessSubstrate:
 
     def stop(self):
         """Stop the background processing thread."""
-        self._running = False
+        with self.lock:
+            self._running = False
         if self._bg_thread:
             self._bg_thread.join(timeout=5)
         logger.info("[CONSCIOUSNESS] Background processor stopped")
@@ -883,6 +947,7 @@ class ConsciousnessSubstrate:
         - Consolidates significant short-term experiences to long-term
         - Processes somatic decay
         - Saves state periodically
+        Backs off on consecutive errors to avoid log spam.
         """
         save_interval = 300  # Save every 5 minutes
         last_save = time.time()
@@ -901,15 +966,25 @@ class ConsciousnessSubstrate:
                     self.save()
                     last_save = time.time()
 
-            except Exception as e:
-                logger.error("[CONSCIOUSNESS] Background error: %s", e)
+                self._bg_error_count = 0  # Reset on success
 
-            time.sleep(30)
+            except Exception as e:
+                self._bg_error_count += 1
+                logger.error("[CONSCIOUSNESS] Background error (#%d): %s",
+                             self._bg_error_count, e)
+                if self._bg_error_count >= 10:
+                    logger.error("[CONSCIOUSNESS] Too many consecutive errors, "
+                                 "backing off to 5min interval")
+
+            # Back off on persistent errors
+            sleep_time = 300 if self._bg_error_count >= 10 else 30
+            time.sleep(sleep_time)
 
     def _consolidate(self):
         """
         Move significant short-term experiences to long-term vector store.
         Must be called with self.lock held.
+        Marks entries as consolidated to prevent duplicate storage.
         """
         now = time.time()
         if now - self._last_consolidation < 120:
@@ -917,20 +992,27 @@ class ConsciousnessSubstrate:
 
         consolidated = 0
         for entry in list(self.short_term):
+            # Skip already-consolidated entries
+            if entry.get("_consolidated", False):
+                continue
+
             age = now - entry.get("timestamp", now)
             if age < 120:
                 continue  # Too recent — keep in short-term only
 
             if self._is_significant(entry):
-                # Store in long-term (without the embedding key in metadata)
+                # Store in long-term (without internal keys in metadata)
                 metadata = {
                     k: v for k, v in entry.items()
-                    if k != "embedding"
+                    if k not in ("embedding", "_consolidated")
                 }
                 embedding = entry.get("embedding")
                 if embedding:
                     self.long_term.add(embedding, metadata)
                     consolidated += 1
+
+            # Mark as processed regardless of significance
+            entry["_consolidated"] = True
 
         if consolidated:
             logger.info(
@@ -987,8 +1069,12 @@ class ConsciousnessSubstrate:
                 "anticipatory": self.anticipatory.to_dict(),
                 "total_experiences": self._total_experiences,
             }
+            # Snapshot long-term entries under lock (VectorStore has no lock)
+            lt_snapshot = list(self.long_term._entries)
+            total_exp = self._total_experiences
+            lt_count = len(lt_snapshot)
 
-        # Save main state
+        # Save main state (outside lock — file I/O)
         try:
             tmp = self.SAVE_FILE + ".tmp"
             with open(tmp, "w") as f:
@@ -996,14 +1082,27 @@ class ConsciousnessSubstrate:
             os.replace(tmp, self.SAVE_FILE)
             logger.info(
                 "[CONSCIOUSNESS] State saved (%d total experiences, "
-                "%d long-term memories)",
-                self._total_experiences, len(self.long_term)
+                "%d long-term memories)", total_exp, lt_count
             )
         except Exception as e:
             logger.error("[CONSCIOUSNESS] Save failed: %s", e)
+            try:
+                os.remove(self.SAVE_FILE + ".tmp")
+            except OSError:
+                pass
 
-        # Save long-term vector store separately
-        self.long_term.save()
+        # Save long-term vector store from snapshot (outside lock)
+        try:
+            tmp = self.long_term.filepath + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"entries": lt_snapshot}, f)
+            os.replace(tmp, self.long_term.filepath)
+        except Exception as e:
+            logger.error("[CONSCIOUSNESS] VectorStore save failed: %s", e)
+            try:
+                os.remove(self.long_term.filepath + ".tmp")
+            except OSError:
+                pass
 
     def load(self):
         """Load consciousness state from disk."""

@@ -780,7 +780,8 @@ salience_filter = SalienceFilter()
 physical_expression_mgr = PhysicalExpressionManager()
 consciousness = ConsciousnessSubstrate(
     ollama_client=_ollama_fast_client,
-    embed_model="nomic-embed-text"
+    embed_model="nomic-embed-text",
+    ollama_lock=_ollama_lock
 )
 
 # Configure salience filter with fast LLM client for semantic scoring
@@ -2677,6 +2678,9 @@ def process_input(text, include_vision):
         # ═══ CONSCIOUSNESS: Human spoke — record as positive experience ═══
         try:
             _intent_obj = intent_manager.get_current_intent()
+            with teensy_state_lock:
+                _cur_valence = float(teensy_state.get('valence', 0.0))
+                _cur_arousal = float(teensy_state.get('arousal', 0.5))
             consciousness.record_experience({
                 "situation": f"Human spoke: {text[:100]}",
                 "intent": _intent_obj["type"] if _intent_obj else "response_to_human",
@@ -2684,14 +2688,14 @@ def process_input(text, include_vision):
                 "outcome": "spoke",
                 "person_id": narrative_engine.get_current_person(),
                 "ignored_streak_before": pre_streak,
-                "valence_before": 0.0,
-                "valence_after": 0.0,
-                "arousal": 0.5,
+                "valence_before": _cur_valence,
+                "valence_after": _cur_valence,
+                "arousal": _cur_arousal,
                 "what_buddy_said": "",
-                "scene_description": "",
+                "scene_description": scene_context.current_description if scene_context.running else "",
             })
-        except Exception:
-            pass
+        except Exception as _ce:
+            print(f"[CONSCIOUSNESS] Record experience error: {_ce}")
 
         # If they spoke after ignoring us, note it for narrative color
         if pre_streak >= 2:
@@ -3318,9 +3322,9 @@ def process_narrative_speech(strategy, saved_state):
                             break
 
             # ═══ PHASE 6: RESOLUTION ARC ═══
+            # Capture ignored streak BEFORE any updates (used by consciousness recording)
+            pre_response_streak = narrative_engine.get_ignored_streak()
             if response_detected:
-                # Check if this breaks an ignored streak → trigger sarcastic return
-                pre_response_streak = narrative_engine.get_ignored_streak()
                 narrative_engine.record_response(response_detected)
                 intent_manager.mark_success()
 
@@ -3369,11 +3373,13 @@ def process_narrative_speech(strategy, saved_state):
                         time.sleep(delay)
 
             # ═══ CONSCIOUSNESS: Record experience ═══
+            # pre_response_streak was captured BEFORE record_response/record_ignored
             try:
                 _scene_desc = scene_context.current_description if scene_context.running else ""
                 _person_id = narrative_engine.get_current_person()
                 _intent_obj = intent_manager.get_current_intent()
-                _valence_after = float(saved_state.get('valence', 0.0))
+                with teensy_state_lock:
+                    _valence_after = float(teensy_state.get('valence', 0.0))
                 consciousness.record_experience({
                     "situation": f"{_scene_desc} | strategy={strategy} | "
                                  f"valence={valence:.1f} arousal={arousal:.1f}",
@@ -3381,7 +3387,7 @@ def process_narrative_speech(strategy, saved_state):
                     "strategy": strategy,
                     "outcome": response_detected or "ignored",
                     "person_id": _person_id,
-                    "ignored_streak_before": narrative_engine.get_ignored_streak(),
+                    "ignored_streak_before": pre_response_streak,
                     "valence_before": valence,
                     "valence_after": _valence_after,
                     "arousal": arousal,
