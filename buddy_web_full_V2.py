@@ -1981,22 +1981,32 @@ def teensy_poll_loop():
                     socketio.emit('buddy_state', s)
                     ws_reconnect_count = 0  # Reset on success
 
+                    # Get vision state once per cycle (used for scene context + attention)
+                    vision = get_vision_state()
+
                     # Feed face tracking into SceneContext
-                    if scene_context.running:
-                        vision = get_vision_state()
-                        if vision:
-                            # s is local snapshot — pass servo angles so SceneContext
-                            # knows WHERE in the world the face/scene is
-                            scene_context.update_face_state(
-                                face_detected=vision.get("face_detected", False),
-                                expression=vision.get("face_expression", "neutral"),
-                                servo_base=s.get("servoBase", 90),
-                                servo_nod=s.get("servoNod", 115)
-                            )
+                    if scene_context.running and vision:
+                        scene_context.update_face_state(
+                            face_detected=vision.get("face_detected", False),
+                            expression=vision.get("face_expression", "neutral"),
+                            servo_base=s.get("servoBase", 90),
+                            servo_nod=s.get("servoNod", 115)
+                        )
+
+                    # ── Always update attention detector ──
+                    # CRITICAL: runs even during processing or with spontaneous speech
+                    # disabled. Otherwise the 3s rolling window expires during Ollama
+                    # calls and person has to re-stare for seconds after each response.
+                    if vision:
+                        _face = vision.get("face_detected", False)
+                        _facing = vision.get("facing_camera", False)
+                        attention_detector.update(_face, _facing)
+                    else:
+                        attention_detector.update(False, False)
 
                     # Spontaneous speech check (skip in test mode)
                     if not is_test and CONFIG.get("spontaneous_speech_enabled", False) and not processing_lock.locked():
-                        check_spontaneous_speech(s)
+                        check_spontaneous_speech(s, vision)
                 else:
                     teensy_connected = False
                     ws_reconnect_count += 1
@@ -2868,7 +2878,7 @@ def process_input(text, include_vision):
 # SPONTANEOUS SPEECH ENGINE
 # =============================================================================
 
-def check_spontaneous_speech(state):
+def check_spontaneous_speech(state, vision=None):
     """
     Called every poll cycle (~1s) with the latest QUERY state from Teensy.
     Now driven by the Narrative Engine + Intent System instead of simple thresholds.
@@ -2878,6 +2888,10 @@ def check_spontaneous_speech(state):
     2. Let intent manager select/escalate intent
     3. Decide: speak, physical expression, or wait
     4. If speaking: add random delay, then fire with full narrative context
+
+    Note: attention_detector.update() is called in teensy_poll_loop BEFORE this
+    function, so it runs even when spontaneous speech is disabled or processing
+    lock is held. Vision data is passed in to avoid a duplicate HTTP fetch.
     """
     global last_spontaneous_utterance, spontaneous_utterance_log
 
@@ -2897,7 +2911,9 @@ def check_spontaneous_speech(state):
     )
 
     # ── Update face state in narrative engine ──
-    vision = get_vision_state()
+    # Vision data passed from teensy_poll_loop to avoid duplicate HTTP fetch
+    if vision is None:
+        vision = get_vision_state()  # Fallback if not passed
     if vision:
         face_present = vision.get("face_detected", False)
         was_present = narrative_engine.is_person_present()
@@ -2912,13 +2928,6 @@ def check_spontaneous_speech(state):
         # Track departures for engagement cycle
         if was_present and not face_present:
             intent_manager.person_departed()
-
-        # ── Update attention detector with head pose data ──
-        facing_camera = vision.get("facing_camera", False)
-        attention_detector.update(face_present, facing_camera)
-    else:
-        # Vision API offline — feed no-face data to prevent stale ATTENTIVE state
-        attention_detector.update(False, False)
 
     # ── Stale utterance cleanup — mark old pending utterances as ignored ──
     # Primary response detection happens in finish_and_watch() after speech.
@@ -4359,8 +4368,8 @@ if __name__ == '__main__':
         print("  Vision pipeline: OFFLINE (start buddy_vision.py for face tracking)")
 
     # Set up attention detection callbacks and VAD BEFORE starting threads
-    # that use them (teensy_poll_loop calls check_spontaneous_speech which
-    # calls attention_detector.update; wake_word_loop calls VAD is_speech)
+    # that use them (teensy_poll_loop calls attention_detector.update directly;
+    # wake_word_loop calls VAD is_speech)
     # The actual _on_attention_detected function is defined later (after
     # consciousness.start()) but the callback reference is set here.
     threading.Thread(target=voice_activity_detector._lazy_init, daemon=True,
