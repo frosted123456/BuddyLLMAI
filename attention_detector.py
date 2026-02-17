@@ -287,13 +287,7 @@ class VoiceActivityDetector:
         # Load outside lock — may download model (blocking I/O)
         try:
             import torch
-            model, utils = torch.hub.load(
-                repo_or_dir='snakers4/silero-vad',
-                model='silero_vad',
-                trust_repo=True,
-                verbose=False
-            )
-            # Reset initial state to ensure clean start
+            model = self._load_silero(torch)
             model.reset_states()
             with self.lock:
                 self._vad_model = model
@@ -305,6 +299,67 @@ class VoiceActivityDetector:
             with self.lock:
                 self._vad_available = False
                 self._init_complete = True
+
+    @staticmethod
+    def _load_silero(torch):
+        """
+        Load Silero VAD model with multiple fallback strategies.
+        Silero's hubconf.py declares torchaudio as a dependency, but
+        the actual model only uses torch. We try several approaches:
+        1. Standard torch.hub.load (works when torchaudio is installed)
+        2. Mock torchaudio and retry (hubconf check passes, model loads fine)
+        3. Direct JIT download (bypasses hubconf entirely)
+        """
+        import sys
+        import types
+
+        # Strategy 1: standard load
+        try:
+            model, _utils = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                trust_repo=True,
+                verbose=False
+            )
+            return model
+        except Exception as e1:
+            print(f"[VAD] Standard load failed: {e1}")
+
+        # Strategy 2: mock torchaudio (only needed for hubconf dependency check)
+        _mock_installed = False
+        if 'torchaudio' not in sys.modules:
+            try:
+                import torchaudio  # noqa: F401
+            except ImportError:
+                sys.modules['torchaudio'] = types.ModuleType('torchaudio')
+                _mock_installed = True
+                print("[VAD] Mocked torchaudio for Silero hubconf dependency check")
+        try:
+            model, _utils = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                trust_repo=True,
+                verbose=False
+            )
+            return model
+        except Exception as e2:
+            print(f"[VAD] Mock-torchaudio load failed: {e2}")
+        finally:
+            if _mock_installed:
+                del sys.modules['torchaudio']
+
+        # Strategy 3: direct JIT download (no hubconf, no torchaudio)
+        import os
+        cache_dir = os.path.join(torch.hub.get_dir(), "silero_vad_direct")
+        os.makedirs(cache_dir, exist_ok=True)
+        model_path = os.path.join(cache_dir, "silero_vad.jit")
+        if not os.path.exists(model_path):
+            url = "https://models.silero.ai/models/en/en_v5.jit"
+            print(f"[VAD] Downloading Silero VAD directly to {model_path}...")
+            torch.hub.download_url_to_file(url, model_path)
+        model = torch.jit.load(model_path)
+        print("[VAD] Loaded Silero VAD via direct JIT download")
+        return model
 
     def is_ready(self):
         """Return True if initialization is complete (Silero loaded or fallback active)."""
