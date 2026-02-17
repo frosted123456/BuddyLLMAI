@@ -182,8 +182,11 @@ class AttentionDetector:
             # Only credit time when BOTH the previous and current sample are facing
             if prev_facing and facing:
                 dt = ts - prev_ts
-                # Cap individual intervals to 0.5s to handle gaps
-                total += min(dt, 0.5)
+                # Cap individual intervals to 1.2s to handle gaps.
+                # Note: update() is called from teensy_poll_loop at ~1Hz, so
+                # normal intervals are ~1s. Old 0.5s cap halved every interval,
+                # making it impossible to reach 1.5s threshold in 3s window.
+                total += min(dt, 1.2)
             prev_ts, prev_facing = ts, facing
 
         return total
