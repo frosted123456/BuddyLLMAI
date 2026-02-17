@@ -147,9 +147,9 @@ class NarrativeEngine:
             now = time.time()
             self.human_responsiveness["last_interaction"] = now
             self.human_responsiveness["last_verbal_response"] = now
-            self.human_responsiveness["ignored_streak"] = max(
-                0, self.human_responsiveness["ignored_streak"] - 1
-            )
+            # FIX: reset to 0 (was decrement-by-1, making recovery nearly
+            # impossible once streak spikes from stale utterance cleanup)
+            self.human_responsiveness["ignored_streak"] = 0
             self._recalculate_responsiveness()
 
     def record_human_speech_text(self, text):
@@ -164,9 +164,8 @@ class NarrativeEngine:
             # Also update existing timestamp/responsiveness tracking
             self.human_responsiveness["last_interaction"] = now
             self.human_responsiveness["last_verbal_response"] = now
-            self.human_responsiveness["ignored_streak"] = max(
-                0, self.human_responsiveness["ignored_streak"] - 1
-            )
+            # FIX: reset to 0 (was decrement-by-1, same as record_human_speech)
+            self.human_responsiveness["ignored_streak"] = 0
             self._recalculate_responsiveness()
 
     def record_buddy_response(self, text, trigger="response"):

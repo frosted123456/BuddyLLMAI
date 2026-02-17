@@ -484,6 +484,12 @@ class IntentManager:
                 if self._engagement_phase == "idle":
                     self._engagement_phase = "engaging"
 
+            # FIX: Reset engagement phase if new intent is NOT an attention-seeking type
+            # (prevents phase stuck in "engaging" when intent changes to something else)
+            if intent_type not in ("get_attention", "reluctant_reengage"):
+                if self._engagement_phase == "engaging":
+                    self._engagement_phase = "idle"
+
             # Archive old intent
             self._archive_current_intent()
 
