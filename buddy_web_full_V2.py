@@ -59,6 +59,7 @@ from narrative_engine import NarrativeEngine
 from intent_manager import IntentManager, StrategyTracker, should_speak_or_physical
 from salience_filter import SalienceFilter
 from consciousness_substrate import ConsciousnessSubstrate
+from attention_detector import AttentionDetector, VoiceActivityDetector
 from physical_expression import (
     PhysicalExpressionManager,
     calculate_speech_delay,
@@ -783,6 +784,8 @@ consciousness = ConsciousnessSubstrate(
     embed_model="nomic-embed-text",
     ollama_lock=_ollama_lock
 )
+attention_detector = AttentionDetector()
+voice_activity_detector = VoiceActivityDetector()
 
 # Configure salience filter with fast LLM client for semantic scoring
 if _ollama_fast_client:
@@ -2217,6 +2220,28 @@ def wake_word_loop():
                     teensy_send_command("PRESENCE")
                     teensy_send_with_fallback("LISTENING", "LOOK:90,110")  # Fallback: look center/up
                     record_and_process()
+                    continue
+
+                # ── Attention-triggered listening ──
+                # If person is looking at Buddy (ATTENTIVE) and speaking,
+                # start recording without requiring wake word.
+                # Guard: only check VAD if init is complete (prevents blocking
+                # wake_word_loop for seconds if Silero model is still downloading)
+                if pcm and attention_detector.can_trigger_listen() and voice_activity_detector.is_ready():
+                    if voice_activity_detector.is_speech(pcm):
+                        # Don't trigger if Buddy is already processing
+                        if not processing_lock.locked():
+                            print("[ATTENTION] Person attentive + speech detected → listening")
+                            attention_detector.record_listen_triggered()
+                            voice_activity_detector.reset()
+                            socketio.emit('log', {
+                                'message': 'Attention-triggered listening (no wake word needed)',
+                                'level': 'info'
+                            })
+                            socketio.emit('status', {'state': 'listening', 'message': 'Listening...'})
+                            teensy_send_command("PRESENCE")
+                            teensy_send_with_fallback("LISTENING", "LOOK:90,110")
+                            record_and_process()
             except Exception as e:
                 socketio.emit('log', {'message': f'Wake error: {e}', 'level': 'error'})
                 time.sleep(0.1)
@@ -2872,6 +2897,13 @@ def check_spontaneous_speech(state):
         if was_present and not face_present:
             intent_manager.person_departed()
 
+        # ── Update attention detector with head pose data ──
+        facing_camera = vision.get("facing_camera", False)
+        attention_detector.update(face_present, facing_camera)
+    else:
+        # Vision API offline — feed no-face data to prevent stale ATTENTIVE state
+        attention_detector.update(False, False)
+
     # ── Stale utterance cleanup — mark old pending utterances as ignored ──
     # Primary response detection happens in finish_and_watch() after speech.
     # This catches edge cases where the post-speech detection thread didn't run
@@ -3116,27 +3148,33 @@ def _execute_physical_expression(state, intent_strategy):
 
     # Execute commands in sequence
     def run_expression():
-        for cmd, delay in commands:
-            if cmd == "wait":
-                time.sleep(delay)
-            elif cmd.startswith("EXPRESS:"):
-                teensy_send_command(cmd)
-                if delay > 0:
+        # Freeze attention detector during servo movement to prevent
+        # false negatives from camera swing during Buddy's own movement
+        attention_detector.freeze()
+        try:
+            for cmd, delay in commands:
+                if cmd == "wait":
                     time.sleep(delay)
-            elif cmd.startswith("LOOK:"):
-                teensy_send_command(cmd)
-                if delay > 0:
-                    time.sleep(delay)
-            elif cmd.startswith("ATTENTION:"):
-                teensy_send_command(cmd)
-                if delay > 0:
-                    time.sleep(delay)
-            elif cmd.startswith("ACKNOWLEDGE"):
-                teensy_send_command(cmd)
-                if delay > 0:
-                    time.sleep(delay)
-        # Tell Teensy we "spoke" (even though we didn't) to reset the urge
-        teensy_send_command("SPOKE")
+                elif cmd.startswith("EXPRESS:"):
+                    teensy_send_command(cmd)
+                    if delay > 0:
+                        time.sleep(delay)
+                elif cmd.startswith("LOOK:"):
+                    teensy_send_command(cmd)
+                    if delay > 0:
+                        time.sleep(delay)
+                elif cmd.startswith("ATTENTION:"):
+                    teensy_send_command(cmd)
+                    if delay > 0:
+                        time.sleep(delay)
+                elif cmd.startswith("ACKNOWLEDGE"):
+                    teensy_send_command(cmd)
+                    if delay > 0:
+                        time.sleep(delay)
+            # Tell Teensy we "spoke" (even though we didn't) to reset the urge
+            teensy_send_command("SPOKE")
+        finally:
+            attention_detector.unfreeze()
 
     threading.Thread(target=run_expression, daemon=True).start()
 
@@ -3172,13 +3210,18 @@ def process_narrative_speech(strategy, saved_state):
         pre_commands = physical_expression_mgr.get_pre_speech_arc(
             arousal, valence, strategy
         )
-        for cmd, delay in pre_commands:
-            if cmd == "wait":
-                time.sleep(delay)
-            else:
-                teensy_send_command(cmd)
-                if delay > 0:
+        # Freeze attention during servo movement (camera swings)
+        attention_detector.freeze()
+        try:
+            for cmd, delay in pre_commands:
+                if cmd == "wait":
                     time.sleep(delay)
+                else:
+                    teensy_send_command(cmd)
+                    if delay > 0:
+                        time.sleep(delay)
+        finally:
+            attention_detector.unfreeze()
 
         # ═══ PHASE 2: LLM GENERATION ═══
         # Build full-context prompt (no trigger labels!)
@@ -3266,16 +3309,21 @@ def process_narrative_speech(strategy, saved_state):
             person_present = narrative_engine.is_person_present()
 
             # Post-speech hold — watch for response
+            # Freeze attention during servo movement (camera swing)
             post_commands = physical_expression_mgr.get_post_speech_arc(
                 response_expected=person_present
             )
-            for cmd, delay in post_commands:
-                if cmd == "wait":
-                    time.sleep(delay)
-                else:
-                    teensy_send_command(cmd)
-                    if delay > 0:
+            attention_detector.freeze()
+            try:
+                for cmd, delay in post_commands:
+                    if cmd == "wait":
                         time.sleep(delay)
+                    else:
+                        teensy_send_command(cmd)
+                        if delay > 0:
+                            time.sleep(delay)
+            finally:
+                attention_detector.unfreeze()
 
             # ═══ PHASE 5: RESPONSE DETECTION ═══
             # Poll vision for 12 seconds to see if the person reacted
@@ -3364,13 +3412,18 @@ def process_narrative_speech(strategy, saved_state):
                     "ignored"
                 )
 
-            for cmd, delay in resolution_commands:
-                if cmd == "wait":
-                    time.sleep(delay)
-                else:
-                    teensy_send_command(cmd)
-                    if delay > 0:
+            # Resolution arc — freeze attention during servo movement
+            attention_detector.freeze()
+            try:
+                for cmd, delay in resolution_commands:
+                    if cmd == "wait":
                         time.sleep(delay)
+                    else:
+                        teensy_send_command(cmd)
+                        if delay > 0:
+                            time.sleep(delay)
+            finally:
+                attention_detector.unfreeze()
 
             # ═══ CONSCIOUSNESS: Record experience ═══
             # pre_response_streak was captured BEFORE record_response/record_ignored
@@ -3885,6 +3938,7 @@ def api_health():
             "enabled": spontaneous_speech_enabled,
             "pending": _pending_speech.get("active", False),
         },
+        "attention": attention_detector.get_status(),
         "threads": {},
     }
 
@@ -4247,6 +4301,14 @@ if __name__ == '__main__':
     else:
         print("  Vision pipeline: OFFLINE (start buddy_vision.py for face tracking)")
 
+    # Set up attention detection callbacks and VAD BEFORE starting threads
+    # that use them (teensy_poll_loop calls check_spontaneous_speech which
+    # calls attention_detector.update; wake_word_loop calls VAD is_speech)
+    # The actual _on_attention_detected function is defined later (after
+    # consciousness.start()) but the callback reference is set here.
+    threading.Thread(target=voice_activity_detector._lazy_init, daemon=True,
+                     name="vad-init").start()
+
     threading.Thread(target=teensy_poll_loop, daemon=True).start()
     threading.Thread(target=wake_word_loop, daemon=True).start()
 
@@ -4271,6 +4333,61 @@ if __name__ == '__main__':
     consciousness.start()
     print(f"  Consciousness Substrate: active (somatic state, emotional baseline, "
           f"anticipatory model, {len(consciousness.long_term)} long-term memories)")
+
+    # Attention Detection — attention-triggered listening
+    def _on_attention_detected():
+        """Called when person starts paying attention to Buddy (facing for 1.5s)."""
+        # Don't show ready signal if Buddy is already talking/processing
+        if processing_lock.locked():
+            return
+        # Subtle physical ready signal — "I see you looking at me"
+        with teensy_state_lock:
+            base = teensy_state.get("servoBase", 90)
+            nod = teensy_state.get("servoNod", 115)
+        commands = physical_expression_mgr.get_attention_ready_commands(base, nod)
+
+        def _run_ready():
+            attention_detector.freeze()
+            try:
+                for cmd, delay in commands:
+                    if cmd == "wait":
+                        time.sleep(delay)
+                    else:
+                        teensy_send_command(cmd)
+                        if delay > 0:
+                            time.sleep(delay)
+            finally:
+                attention_detector.unfreeze()
+
+        threading.Thread(target=_run_ready, daemon=True).start()
+        socketio.emit('log', {'message': 'Attention detected — ready signal', 'level': 'info'})
+
+        # Feed attention event into consciousness substrate (somatic warmth)
+        # Runs in its own thread to avoid blocking teensy_poll_loop with Ollama I/O
+        def _record_attention_experience():
+            try:
+                person_id = narrative_engine.get_current_person()
+                consciousness.record_experience({
+                    "situation": "Person is looking directly at Buddy, paying attention",
+                    "intent": "attention_detected",
+                    "strategy": "attention_ready",
+                    "outcome": "looked",
+                    "person_id": person_id,
+                    "ignored_streak_before": narrative_engine.get_ignored_streak(),
+                    "valence_before": 0.0,
+                    "valence_after": 0.0,
+                    "arousal": 0.5,
+                    "what_buddy_said": "",
+                    "scene_description": scene_context.current_description if scene_context.running else "",
+                })
+            except Exception:
+                pass  # Consciousness is optional
+        threading.Thread(target=_record_attention_experience, daemon=True).start()
+
+    attention_detector.on_attentive = _on_attention_detected
+    # VAD _lazy_init already started before poll/wake threads (see above)
+    print("  Attention Detector: active (head pose → 1.5s threshold → listen)")
+    print("  Voice Activity Detector: initializing (Silero VAD or amplitude fallback)")
 
     # Face Tracking Debug Dashboard background thread
     threading.Thread(target=tracking_dashboard_thread, daemon=True, name="tracking-dashboard").start()
