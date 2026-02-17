@@ -2255,14 +2255,14 @@ def wake_word_loop():
                             socketio.emit('status', {'state': 'listening', 'message': 'Listening...'})
                             teensy_send_command("PRESENCE")
                             teensy_send_with_fallback("LISTENING", "LOOK:90,110")
-                            record_and_process()
+                            record_and_process(seed_pcm=pcm)
             except Exception as e:
                 socketio.emit('log', {'message': f'Wake error: {e}', 'level': 'error'})
                 time.sleep(0.1)
     finally:
         if recorder: recorder.stop()
 
-def record_and_process():
+def record_and_process(seed_pcm=None):
     global noise_floor
     # FIX BUG-17: capture local reference to recorder so init_wake_word()
     # (called from config update thread) can't swap it out mid-recording
@@ -2273,6 +2273,15 @@ def record_and_process():
     # FIX BUG-05: removed dead spontaneous_speech_lock (never held elsewhere).
     # Mutual exclusion with spontaneous speech is handled by processing_lock.
     frames, silent_frames, speech_started, pre_speech_count = [], 0, False, 0
+
+    # Pre-seed with the PCM frame that triggered listening (attention path).
+    # Without this, the ~32-128ms of speech that triggered VAD is lost.
+    # Wake word path does NOT seed (the trigger frame is just "Jarvis").
+    if seed_pcm is not None:
+        frames.extend(seed_pcm)
+        amp = max(abs(min(seed_pcm)), abs(max(seed_pcm)))
+        if amp > 300:  # Conservative: if seed had speech, mark it
+            speech_started = True
     sr = 16000
     fps = sr / 512
     silence_needed = int(CONFIG["silence_duration"] * fps)
