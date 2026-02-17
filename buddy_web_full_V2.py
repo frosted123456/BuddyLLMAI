@@ -1371,7 +1371,7 @@ HTML_TEMPLATE = """
         socket.on('image', (d) => { cameraView.innerHTML = '<img src="data:image/jpeg;base64,' + d.base64 + '">'; });
         socket.on('transcript', (d) => { addMessage('user', d.text); });
         socket.on('response', (d) => { addMessage('buddy', d.text); });
-        socket.on('audio', (d) => { audioPlayer.src = 'data:audio/mp3;base64,' + d.base64; audioPlayer.play(); });
+        socket.on('audio', (d) => { audioPlayer.src = 'data:audio/mp3;base64,' + d.base64; audioPlayer.play().catch(e => { log('Audio blocked: ' + e.message, 'warning'); }); });
         socket.on('error', (d) => { log('Error: ' + d.message, 'error'); setStatus('error', d.message); setTimeout(() => setStatus('ready', 'Ready'), 3000); });
         socket.on('log', (d) => { log(d.message, d.level || 'info'); });
         socket.on('audio_level', (d) => { const l = Math.min(100, (d.level / 2000) * 100); audioMeterFill.style.width = l + '%'; audioMeterFill.classList.toggle('loud', d.level > 500); });
@@ -1968,59 +1968,63 @@ def teensy_poll_loop():
     ws_reconnect_count = 0
 
     while True:
-        if teensy_connected:
-            # Debug dashboard test mode: send IDLE to suppress autonomous behaviors
-            with face_tracking_test_mode_lock:
-                is_test = face_tracking_test_mode
-            if is_test:
-                teensy_send_command("IDLE")
+        try:
+            if teensy_connected:
+                # Debug dashboard test mode: send IDLE to suppress autonomous behaviors
+                with face_tracking_test_mode_lock:
+                    is_test = face_tracking_test_mode
+                if is_test:
+                    teensy_send_command("IDLE")
 
-            s = query_teensy_state()
-            if s:
-                socketio.emit('buddy_state', s)
-                ws_reconnect_count = 0  # Reset on success
+                s = query_teensy_state()
+                if s:
+                    socketio.emit('buddy_state', s)
+                    ws_reconnect_count = 0  # Reset on success
 
-                # Feed face tracking into SceneContext
-                if scene_context.running:
-                    vision = get_vision_state()
-                    if vision:
-                        # s is local snapshot — pass servo angles so SceneContext
-                        # knows WHERE in the world the face/scene is
-                        scene_context.update_face_state(
-                            face_detected=vision.get("face_detected", False),
-                            expression=vision.get("face_expression", "neutral"),
-                            servo_base=s.get("servoBase", 90),
-                            servo_nod=s.get("servoNod", 115)
-                        )
+                    # Feed face tracking into SceneContext
+                    if scene_context.running:
+                        vision = get_vision_state()
+                        if vision:
+                            # s is local snapshot — pass servo angles so SceneContext
+                            # knows WHERE in the world the face/scene is
+                            scene_context.update_face_state(
+                                face_detected=vision.get("face_detected", False),
+                                expression=vision.get("face_expression", "neutral"),
+                                servo_base=s.get("servoBase", 90),
+                                servo_nod=s.get("servoNod", 115)
+                            )
 
-                # Spontaneous speech check (skip in test mode)
-                if not is_test and CONFIG.get("spontaneous_speech_enabled", False) and not processing_lock.locked():
-                    check_spontaneous_speech(s)
-            else:
-                teensy_connected = False
-                ws_reconnect_count += 1
-                socketio.emit('teensy_status', {'connected': False, 'port': ''})
+                    # Spontaneous speech check (skip in test mode)
+                    if not is_test and CONFIG.get("spontaneous_speech_enabled", False) and not processing_lock.locked():
+                        check_spontaneous_speech(s)
+                else:
+                    teensy_connected = False
+                    ws_reconnect_count += 1
+                    socketio.emit('teensy_status', {'connected': False, 'port': ''})
 
-                # FIX: reset teensy_state on disconnect so stale values
-                # don't persist across reconnections
-                with teensy_state_lock:
-                    teensy_state.update({
-                        "arousal": 0.5, "valence": 0.0, "dominance": 0.5,
-                        "emotion": "NEUTRAL", "behavior": "IDLE",
-                        "stimulation": 0.5, "social": 0.5, "energy": 0.7,
-                        "safety": 0.8, "novelty": 0.3, "tracking": False,
+                    # FIX: reset teensy_state on disconnect so stale values
+                    # don't persist across reconnections
+                    with teensy_state_lock:
+                        teensy_state.update({
+                            "arousal": 0.5, "valence": 0.0, "dominance": 0.5,
+                            "emotion": "NEUTRAL", "behavior": "IDLE",
+                            "stimulation": 0.5, "social": 0.5, "energy": 0.7,
+                            "safety": 0.8, "novelty": 0.3, "tracking": False,
+                        })
+
+                    # Exponential backoff on reconnection
+                    wait = min(3 * ws_reconnect_count, 30)
+                    socketio.emit('log', {
+                        'message': f'Connection lost, retrying in {wait}s...',
+                        'level': 'warning'
                     })
-
-                # Exponential backoff on reconnection
-                wait = min(3 * ws_reconnect_count, 30)
-                socketio.emit('log', {
-                    'message': f'Connection lost, retrying in {wait}s...',
-                    'level': 'warning'
-                })
-                time.sleep(wait)
+                    time.sleep(wait)
+                    connect_teensy()
+            else:
                 connect_teensy()
-        else:
-            connect_teensy()
+        except Exception as e:
+            print(f"[TEENSY] Poll loop error: {e}\n{traceback.format_exc()}")
+            socketio.emit('log', {'message': f'Poll loop error: {e}', 'level': 'error'})
 
         time.sleep(CONFIG.get("teensy_state_poll_interval", 1.0))
 
@@ -2633,7 +2637,9 @@ def query_ollama(text, img=None, timeout=60, response_length="short"):
 
     # Signal scene loop to yield, then grab the Ollama lock
     _ollama_speech_priority = True
-    _ollama_lock.acquire()
+    if not _ollama_lock.acquire(timeout=15):
+        _ollama_speech_priority = False
+        raise TimeoutError("Ollama lock contention — scene analysis blocking speech")
     try:
         t = threading.Thread(target=_query, daemon=True)
         t.start()
@@ -2755,6 +2761,13 @@ def process_input(text, include_vision):
         print(f"[SPEECH] Querying Ollama (model={CONFIG['ollama_model']}, length={length})...")
         resp = query_ollama(text, img, response_length=length)
         print(f'[SPEECH] Ollama response: "{(resp or "")[:100]}"')
+        if not resp or not resp.strip():
+            print("[SPEECH] Ollama returned empty response — aborting")
+            teensy_send_command("STOP_THINKING")
+            teensy_send_command("IDLE")
+            socketio.emit('response', {'text': '...'})
+            socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
+            return
 
         # Stop thinking animation
         teensy_send_command("STOP_THINKING")  # OK if not implemented
@@ -2846,7 +2859,10 @@ def process_input(text, include_vision):
     finally:
         _processing_lock_acquired_at = 0  # HARDENING: clear tracking
         _processing_lock_owner = ""
-        processing_lock.release()
+        try:
+            processing_lock.release()
+        except RuntimeError:
+            pass  # Already released by watchdog — safe to ignore
 
 # =============================================================================
 # SPONTANEOUS SPEECH ENGINE
@@ -2980,10 +2996,11 @@ def check_spontaneous_speech(state):
         if now - last_spontaneous_utterance < min_gap:
             return
 
+        # Always prune old entries (prevents unbounded growth regardless of phase)
+        one_hour_ago = now - 3600
+        spontaneous_utterance_log[:] = [t for t in spontaneous_utterance_log if t > one_hour_ago]
         # Hourly cap — safety net (only for idle mode; engagement is self-limiting)
         if engagement_phase == "idle":
-            one_hour_ago = now - 3600
-            spontaneous_utterance_log[:] = [t for t in spontaneous_utterance_log if t > one_hour_ago]
             if len(spontaneous_utterance_log) >= CONFIG.get("spontaneous_max_per_hour", 15):
                 return
 
@@ -3247,17 +3264,23 @@ def process_narrative_speech(strategy, saved_state):
         print(f"[SPEECH] Spontaneous: querying Ollama for strategy={strategy}")
         resp = query_ollama(prompt_text, response_length="short")  # Spontaneous stays punchy
         print(f'[SPEECH] Spontaneous Ollama response: "{(resp or "")[:100]}"')
+        if not resp or not resp.strip():
+            print("[SPEECH] Spontaneous: Ollama returned empty — aborting")
+            teensy_send_command("STOP_THINKING")
+            teensy_send_command("IDLE")
+            teensy_send_command("SPOKE")
+            return
         teensy_send_command("STOP_THINKING")
-
-        # FIX: update rate-limiting timestamps AFTER LLM succeeds
-        # (moved from before LLM call — failed calls no longer count)
-        now = time.time()
-        with _spontaneous_log_lock:
-            last_spontaneous_utterance = now
-            spontaneous_utterance_log.append(now)
 
         # ═══ PHASE 3: DELIVERY (speaking + movement) ═══
         clean = execute_buddy_actions(resp)
+        if not clean or not clean.strip():
+            print("[SPEECH] Spontaneous: empty after action processing — aborting")
+            teensy_send_command("STOP_SPEAKING")
+            teensy_send_command("IDLE")
+            teensy_send_command("SPOKE")
+            socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
+            return
         socketio.emit('response', {'text': f'[{strategy}] {clean}'})
 
         # Record in narrative engine + conversation history
@@ -3293,6 +3316,11 @@ def process_narrative_speech(strategy, saved_state):
             socketio.emit('audio', {'base64': audio})
             print(f"[SPEECH] Spontaneous audio sent to browser ({len(audio)} base64 chars)")
             tts_ok = True
+            # FIX: update rate-limiting ONLY after audio was actually delivered
+            now = time.time()
+            with _spontaneous_log_lock:
+                last_spontaneous_utterance = now
+                spontaneous_utterance_log.append(now)
         except Exception as tts_err:
             print(f"[SPEECH] Spontaneous TTS failed: {tts_err}\n{traceback.format_exc()}")
             socketio.emit('log', {'message': f'TTS failed: {tts_err}', 'level': 'error'})
@@ -3301,9 +3329,21 @@ def process_narrative_speech(strategy, saved_state):
 
         speech_duration = max(1.0, min(len(clean) * 0.08, 30.0))
 
+        # FIX: capture speech delivery time for response detection baseline
+        # (prevents closure from seeing reassigned `now` from post-Ollama update)
+        speech_sent_at = time.time()
+
+        # FIX: cancel any previous finish_and_watch before starting a new one
+        global _finish_speaking_cancel
+        _finish_speaking_cancel.set()  # Cancel any previous watcher
+        cancel_event = threading.Event()
+        _finish_speaking_cancel = cancel_event
+
         # ═══ PHASE 4: POST-SPEECH ARC (watching) + RESPONSE DETECTION ═══
         def finish_and_watch():
-            time.sleep(speech_duration)
+            # FIX: use cancellable wait instead of time.sleep
+            if cancel_event.wait(timeout=speech_duration):
+                return  # Cancelled by newer speech
             teensy_send_command("STOP_SPEAKING")
 
             person_present = narrative_engine.is_person_present()
@@ -3348,7 +3388,7 @@ def process_narrative_speech(strategy, saved_state):
                         expr_changed_at = vision.get("expression_changed_at", 0)
 
                         # Expression changed since we spoke = reaction
-                        if expr_changed_at and expr_changed_at > now:
+                        if expr_changed_at and expr_changed_at > speech_sent_at:
                             if expr in ("happy", "smiling"):
                                 response_detected = "smiled"
                             elif expr in ("surprised",):
@@ -3359,13 +3399,13 @@ def process_narrative_speech(strategy, saved_state):
 
                         # Face appeared after it was absent = they turned to look
                         appeared_at = vision.get("face_appeared_at", 0)
-                        if appeared_at and appeared_at > now:
+                        if appeared_at and appeared_at > speech_sent_at:
                             response_detected = "looked"
                             break
                     else:
                         # Person left during our speech
                         left_at = vision.get("person_left_at", 0)
-                        if left_at and left_at > now:
+                        if left_at and left_at > speech_sent_at:
                             response_detected = "left"
                             break
 
@@ -3377,7 +3417,7 @@ def process_narrative_speech(strategy, saved_state):
                 intent_manager.mark_success()
 
                 # Record in person profile
-                response_delay = time.time() - now
+                response_delay = time.time() - speech_sent_at
                 narrative_engine.record_person_response(
                     response_detected, strategy=strategy, delay=response_delay
                 )
@@ -3452,7 +3492,12 @@ def process_narrative_speech(strategy, saved_state):
 
             teensy_send_command("IDLE")
 
-        threading.Thread(target=finish_and_watch, daemon=True).start()
+        if tts_ok:
+            threading.Thread(target=finish_and_watch, daemon=True).start()
+        else:
+            # TTS failed — clean up immediately, don't count as utterance
+            teensy_send_command("STOP_SPEAKING")
+            teensy_send_command("IDLE")
         socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
 
     except Exception as e:
@@ -3470,7 +3515,10 @@ def process_narrative_speech(strategy, saved_state):
     finally:
         _processing_lock_acquired_at = 0  # HARDENING: clear tracking
         _processing_lock_owner = ""
-        processing_lock.release()
+        try:
+            processing_lock.release()
+        except RuntimeError:
+            pass  # Already released by watchdog — safe to ignore
 
 
 def build_narrative_prompt(strategy, state):
@@ -3978,14 +4026,15 @@ def _watchdog_loop():
                         'level': 'error'
                     })
                     try:
-                        _processing_lock_acquired_at = 0
-                        _processing_lock_owner = ""
-                        # FIX: only release if we can verify it's still held
-                        # (prevents RuntimeError if normal path already released)
+                        # FIX: release FIRST, then clear metadata
+                        # (prevents subsequent watchdog cycle from missing a new stuck lock
+                        # because _processing_lock_acquired_at was already cleared to 0)
                         if processing_lock.locked():
                             processing_lock.release()
                     except RuntimeError:
                         pass  # Lock was released between check and release (harmless race)
+                    _processing_lock_acquired_at = 0
+                    _processing_lock_owner = ""
                     # Reset status
                     socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
                     # Reset Teensy animations
@@ -4008,6 +4057,14 @@ def _watchdog_loop():
                 })
                 _transcribing_since_set(0)
                 socketio.emit('status', {'state': 'ready', 'message': 'Ready'})
+
+            # Check 3: _pending_speech stuck past fire time
+            with _pending_speech_lock:
+                if _pending_speech["active"]:
+                    pending_age = now - _pending_speech.get("fire_at", now)
+                    if pending_age > 120:  # 2 minutes past fire time
+                        print(f"[WATCHDOG] _pending_speech stuck for {pending_age:.0f}s — clearing")
+                        _pending_speech["active"] = False
 
             # HARDENING: Status recovery — if nothing is active, ensure Ready
             # Catches any edge case where status got stuck without lock/transcription
